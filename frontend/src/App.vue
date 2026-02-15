@@ -12,6 +12,36 @@ const showSidebar = ref(true);
 const history = ref([]);
 const currentFileId = ref(null);
 
+// 设置弹窗
+const showSettings = ref(false);
+const config = ref({
+  base_url: 'https://api.deepseek.com',  // 不要加 /v1，库会自动添加
+  model: 'deepseek-chat',
+  api_key: ''
+});
+const configLoading = ref(false);
+const configTestResult = ref(null);
+
+// 预设服务商列表
+const providerOptions = [
+  { value: 'https://api.deepseek.com', label: 'DeepSeek (官方)' },
+  { value: 'https://api.openai.com', label: 'OpenAI' },
+  { value: 'https://api.anthropic.com', label: 'Anthropic (Claude)' },
+  { value: 'https://api.moonshot.cn', label: '月之暗面 (Moonshot)' },
+  { value: 'https://dashscope.aliyuncs.com/compatible-mode/v1', label: '阿里云 (DashScope)' }
+];
+
+// 预设模型列表
+const modelOptions = [
+  { value: 'deepseek-chat', label: 'DeepSeek V3 (非思考)' },
+  { value: 'deepseek-reasoner', label: 'DeepSeek R1 (思考)' },
+  { value: 'gpt-4o', label: 'GPT-4o' },
+  { value: 'gpt-4o-mini', label: 'GPT-4o Mini' },
+  { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet' },
+  { value: 'moonshot-v1-8k-vision-preview', label: 'Moonshot V1 8K' },
+  { value: 'qwen-plus', label: '通义千问 Plus' }
+];
+
 // 轮询相关
 const currentTaskId = ref(null);
 const pollTimer = ref(null);
@@ -223,7 +253,60 @@ const formatDate = (dateStr) => {
 
 onMounted(() => {
   loadHistory();
+  loadConfig();
 });
+
+// 加载配置
+const loadConfig = async () => {
+  try {
+    const response = await fetch('/api/config');
+    if (response.ok) {
+      config.value = await response.json();
+    }
+  } catch (err) {
+    console.error('加载配置失败:', err);
+  }
+};
+
+// 保存配置
+const saveConfig = async () => {
+  configLoading.value = true;
+  configTestResult.value = null;
+  try {
+    const response = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config.value)
+    });
+    if (response.ok) {
+      showSettings.value = false;
+      alert('配置已保存');
+    } else {
+      const data = await response.json();
+      alert('保存失败: ' + (data.detail || '未知错误'));
+    }
+  } catch (err) {
+    alert('保存失败: ' + err.message);
+  }
+  configLoading.value = false;
+};
+
+// 测试配置
+const testConfig = async () => {
+  configLoading.value = true;
+  configTestResult.value = null;
+  try {
+    const response = await fetch('/api/config/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config.value)
+    });
+    configTestResult.value = await response.json();
+  } catch (err) {
+    configTestResult.value = { success: false, message: err.message };
+  }
+  configLoading.value = false;
+};
 </script>
 
 <template>
@@ -340,12 +423,24 @@ onMounted(() => {
           </label>
         </div>
         
-        <!-- 右侧：Powered by -->
-        <div class="flex items-center gap-2 text-xs text-slate-400">
-          <span>Powered by</span>
-          <span class="font-medium text-slate-600">IBM Docling</span>
-          <span>+</span>
-          <span class="font-medium text-slate-600">DeepSeek</span>
+        <!-- 右侧：设置按钮 + Powered by -->
+        <div class="flex items-center gap-3">
+          <button 
+            @click="showSettings = true"
+            class="p-1.5 rounded text-slate-500 hover:bg-slate-100"
+            title="设置"
+          >
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+            </svg>
+          </button>
+          <div class="flex items-center gap-2 text-xs text-slate-400">
+            <span>Powered by</span>
+            <span class="font-medium text-slate-600">IBM Docling</span>
+            <span>+</span>
+            <span class="font-medium text-slate-600">DeepSeek</span>
+          </div>
         </div>
       </header>
 
@@ -386,6 +481,99 @@ onMounted(() => {
           <MindMap :markdown="mindmapData" class="h-full" />
         </div>
       </main>
+    </div>
+  </div>
+
+  <!-- 设置弹窗 -->
+  <div v-if="showSettings" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showSettings = false">
+    <div class="bg-white rounded-xl shadow-xl w-full max-w-md mx-4">
+      <!-- 弹窗头部 -->
+      <div class="flex items-center justify-between px-5 py-4 border-b border-slate-200">
+        <h2 class="text-lg font-semibold text-slate-800">LLM 模型设置</h2>
+        <button @click="showSettings = false" class="p-1 rounded text-slate-400 hover:text-slate-600 hover:bg-slate-100">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
+      
+      <!-- 弹窗内容 -->
+      <div class="p-5 space-y-4">
+        <!-- 服务商选择 -->
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1">服务商</label>
+          <select 
+            v-model="config.base_url" 
+            class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+          >
+            <option v-for="opt in providerOptions" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
+          </select>
+        </div>
+        
+        <!-- Base URL (可选自定义) -->
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1">API Base URL</label>
+          <input 
+            v-model="config.base_url" 
+            type="text" 
+            class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            placeholder="https://api.deepseek.com/v1"
+          />
+          <p class="text-xs text-slate-400 mt-1">如需使用其他服务商，请在上方选择或自定义输入</p>
+        </div>
+        
+        <!-- 模型选择 -->
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1">模型</label>
+          <select 
+            v-model="config.model" 
+            class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+          >
+            <option v-for="opt in modelOptions" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
+          </select>
+        </div>
+        
+        <!-- API Key -->
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1">API Key</label>
+          <input 
+            v-model="config.api_key" 
+            type="password" 
+            class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            placeholder="请输入 API Key"
+          />
+        </div>
+        
+        <!-- 测试结果 -->
+        <div v-if="configTestResult" 
+          class="p-3 rounded-lg text-sm"
+          :class="configTestResult.success ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'"
+        >
+          {{ configTestResult.message }}
+        </div>
+      </div>
+      
+      <!-- 弹窗底部按钮 -->
+      <div class="flex items-center justify-end gap-3 px-5 py-4 border-t border-slate-200 bg-slate-50 rounded-b-xl">
+        <button 
+          @click="testConfig" 
+          :disabled="configLoading || !config.api_key"
+          class="px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {{ configLoading ? '测试中...' : '测试连接' }}
+        </button>
+        <button 
+          @click="saveConfig" 
+          :disabled="configLoading || !config.api_key"
+          class="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {{ configLoading ? '保存中...' : '保存' }}
+        </button>
+      </div>
     </div>
   </div>
 </template>

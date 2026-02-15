@@ -197,50 +197,62 @@ watch(() => props.markdown, () => {
 
 <template>
   <div ref="containerRef" class="relative w-full h-full flex flex-col">
-    <!-- 导出按钮 - 右上角悬浮 -->
-    <div class="absolute top-3 right-3 z-20 flex gap-1.5">
-      <button 
-        @click="exportMarkdown"
-        class="px-2.5 py-1.5 text-xs font-medium text-slate-600 bg-white/90 backdrop-blur border border-slate-200 rounded-lg hover:bg-white hover:border-slate-300 transition-all shadow-sm"
-        title="导出 Markdown"
-      >
-        MD
-      </button>
-      <button 
-        @click="exportXMind"
-        class="px-2.5 py-1.5 text-xs font-medium text-slate-600 bg-white/90 backdrop-blur border border-slate-200 rounded-lg hover:bg-white hover:border-slate-300 transition-all shadow-sm"
-        title="导出 XMind"
-      >
-        XM
-      </button>
-      <button 
-        @click="exportPNG"
-        class="px-2.5 py-1.5 text-xs font-medium text-slate-600 bg-white/90 backdrop-blur border border-slate-200 rounded-lg hover:bg-white hover:border-slate-300 transition-all shadow-sm"
-        title="导出 PNG"
-      >
-        PNG
-      </button>
+    <!-- 顶部工具栏 -->
+    <div class="flex-shrink-0 h-12 bg-white border-b border-slate-200 flex items-center justify-between px-3 z-20">
+      <!-- Markmap 工具栏容器 -->
+      <div ref="toolbarRef" class="flex items-center"></div>
+      
+      <!-- 导出按钮组 -->
+      <div class="flex gap-1.5">
+        <button 
+          @click="exportMarkdown"
+          class="px-2.5 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 hover:border-slate-300 transition-all shadow-sm"
+          title="导出 Markdown"
+        >
+          MD
+        </button>
+        <button 
+          @click="exportXMind"
+          class="px-2.5 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 hover:border-slate-300 transition-all shadow-sm"
+          title="导出 XMind"
+        >
+          XM
+        </button>
+        <button 
+          @click="exportPNG"
+          class="px-2.5 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 hover:border-slate-300 transition-all shadow-sm"
+          title="导出 PNG"
+        >
+          PNG
+        </button>
+      </div>
     </div>
     
-    <!-- Markmap 工具栏 -->
-    <div ref="toolbarRef" class="absolute top-3 left-3 z-20"></div>
-    
-    <!-- SVG 容器 -->
-    <svg ref="svgRef" class="w-full h-full outline-none"></svg>
+    <!-- SVG 容器 - 占据剩余空间 -->
+    <div class="flex-grow w-full h-full relative overflow-hidden bg-white">
+      <svg ref="svgRef" class="w-full h-full outline-none block"></svg>
+    </div>
   </div>
 </template>
 
 <style>
 .markmap-toolbar {
-    background: white !important;
-    border: 1px solid #e2e8f0 !important;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
-    border-radius: 8px !important;
-    padding: 4px !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    display: flex !important;
+    gap: 4px !important;
 }
 .markmap-toolbar .mm-toolbar-item {
     color: #64748b !important;
-    border-radius: 4px !important;
+    border-radius: 6px !important;
+    width: 28px !important;
+    height: 28px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    transition: all 0.2s !important;
 }
 .markmap-toolbar .mm-toolbar-item:hover {
     background-color: #f1f5f9 !important;

@@ -11,63 +11,88 @@ from typing import Dict, Any, List
 def parse_markdown_to_tree(markdown: str) -> Dict[str, Any]:
     """
     将 Markdown 转换为树结构
+    核心逻辑：使用栈来维护层级关系
     """
     lines = markdown.strip().split('\n')
     root = {"id": "root", "title": "思维导图", "children": []}
     
-    current_node = root
-    parent_nodes = [root]
+    # stack 存储元组 (level, node)
+    # level 定义：
+    # - Root: 0
+    # - H1 (#): 1
+    # - H2 (##): 2
+    # - ...
+    # - List Item: (父Header Level 或 0) + 1 + 缩进层级
+    stack = [(0, root)]
+    current_header_level = 0
     
     for line in lines:
-        line = line.strip()
-        if not line:
+        stripped = line.strip()
+        if not stripped:
             continue
+
+        # 计算缩进 (假设 2 空格或 1 tab 为一级缩进)
+        raw_indent = len(line) - len(line.lstrip())
+        indent = raw_indent // 2  # 2 space = 1 level
         
-        # 计算缩进级别
-        indent = len(line) - len(line.lstrip())
+        node_text = ""
+        level = 0
         
-        # 确定标题级别
-        if line.startswith('# '):
-            root['title'] = line[2:].strip()
-            continue
-        elif line.startswith('## '):
-            level = 2
-            content = line[3:].strip()
-        elif line.startswith('- '):
-            level = 3
-            content = line[2:].strip()
+        # 识别类型
+        if stripped.startswith('#'):
+            parts = stripped.split(' ', 1)
+            h_mark = parts[0]
+            if all(c == '#' for c in h_mark):
+                # Header
+                level = len(h_mark)
+                node_text = parts[1].strip() if len(parts) > 1 else "Untitled"
+                
+                if level == 1:
+                    root['title'] = node_text
+                    current_header_level = 1
+                    # 清空栈直到 Root，因为 H1 通常是文档标题
+                    stack = [(0, root)]
+                    continue
+                
+                current_header_level = level
+                
+            else:
+                # 非 Header，当作普通文本 -> 列表项
+                node_text = stripped
+                level = current_header_level + 1 + indent
+        
+        elif stripped.startswith(('-', '*', '+')) and stripped[1:2] == ' ':
+            # 列表项
+            node_text = stripped[2:].strip()
+            level = current_header_level + 1 + indent
+            
         else:
-            continue
+            # 普通文本
+            node_text = stripped
+            level = current_header_level + 1 + indent # 视为当前 Header 的子项
+            
+        # 清理文本
+        node_text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', node_text) # 去除链接
+        node_text = re.sub(r'\*\*([^*]+)\*\*', r'\1', node_text)       # 去除加粗
+        node_text = re.sub(r'\*([^*]+)\*', r'\1', node_text)           # 去除斜体
+        node_text = re.sub(r'`([^`]+)`', r'\1', node_text)             # 去除代码块
+            
+        # 栈操作：找到父节点
+        # 弹出所有 Level >= 当前 Level 的节点，剩下的栈顶即为父节点
+        while len(stack) > 1 and stack[-1][0] >= level:
+            stack.pop()
+            
+        parent = stack[-1][1]
         
-        # 清理内容
-        content = re.sub(r'^\d+\.\s*', '', content)
-        content = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', content)
-        content = re.sub(r'\*\*([^*]+)\*\*', r'\1', content)
-        content = re.sub(r'\*([^*]+)\*', r'\1', content)
-        
-        if not content:
-            continue
-        
-        # 创建新节点
         new_node = {
-            "id": f"node_{len(parent_nodes)}_{len(parent_nodes[-1].get('children', []))}",
-            "title": content,
+            "id": f"node_{abs(hash(node_text))}_{len(parent.get('children', []))}", 
+            "title": node_text,
             "children": []
         }
         
-        # 根据缩进添加到正确的父节点
-        # 简单逻辑：添加到最后一个节点
-        if parent_nodes:
-            parent_nodes[-1].setdefault('children', [])
-            parent_nodes[-1]['children'].append(new_node)
+        parent.setdefault('children', []).append(new_node)
+        stack.append((level, new_node))
         
-        # 更新父节点链
-        if level > 2:
-            parent_nodes.append(new_node)
-            # 限制深度
-            if len(parent_nodes) > 5:
-                parent_nodes.pop(1)  # 保持 root
-    
     return root
 
 def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
@@ -87,74 +112,46 @@ def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
     
     collect_ids(tree, all_ids)
     
-    # 构建 XMind content.json - 简化版，兼容 XMind 8
-    content = {
-        "meta": {
-            "generator": "FilesMind",
-            "appName": "FilesMind",
-            "appVersion": "1.0",
-            "platform": "Mac",
-            "creationTime": "2024-01-01T00:00:00.000Z",
-            "creator": {
-                "name": "FilesMind",
-                "email": ""
-            },
-            "theme": "fresh-gray",
-            "language": "zh_CN"
+    # 构造 Root Topic
+    root_topic = {
+        "id": tree.get("id", "root"),
+        "title": tree.get("title", "中心主题"),
+        "children": {
+            "attached": []
         },
-        "rootTopic": {
-            "id": tree.get("id", "root"),
-            "title": tree.get("title", "中心主题"),
-            "children": {
-                "attached": []
-            },
-            "position": "root",
-            "branch": "root",
-            "style": {
-                "properties": {
-                    "fill": "#FFFFFF",
-                    "border-color": "#000000",
-                    "border-width": 1,
-                    "border-style": "solid",
-                    "color": "#000000",
-                    "font-family": "微软雅黑",
-                    "font-size": 18,
-                    "font-weight": "bold",
-                    "text-align": "left",
-                    "text-v-align": "middle"
-                }
+        "structure": "org.xmind.ui.map.unbalanced",  # 默认结构
+        "style": {
+            "properties": {
+                "fill": "#FFFFFF",
+                "border-color": "#000000",
+                "border-width": 1,
+                "border-style": "solid",
+                "color": "#000000",
+                "font-family": "微软雅黑",
+                "font-size": 18,
+                "font-weight": "bold",
+                "text-align": "left",
+                "text-v-align": "middle"
             }
-        },
-        "structure": "org.xmind.ui.map",
-        "theme": "fresh-gray",
-        "firstChildId": all_ids[0] if len(all_ids) > 0 else None,
-        "childId": all_ids[1:] if len(all_ids) > 1 else [],
-        "childDefaultWidth": 0,
-        "childDefaultHeight": 0,
-        "rootTopicLayout": {
-            "layout": "org.xmind.ui.map",
-            "childrenLayout": "org.xmind.ui.map",
-            "alignment": "center",
-            "orientation": "horizontal",
-            "levelSpace": 40,
-            "topicSpacing": 20,
-            "lineColor": "#000000",
-            "lineWidth": 2,
-            "lineStyle": "solid"
-        },
-        "showTopicNumber": False,
-        "showChildIndex": False,
-        "showChildCount": False,
-        "autoLayout": True,
-        "fitMaxWidth": False,
-        "fitMaxHeight": False,
-        "title": filename
+        }
     }
-    
+
     # 添加子主题
     for child in tree.get('children', []):
         topic_node = create_topic_node(child)
-        content["rootTopic"]["children"]["attached"].append(topic_node)
+        root_topic["children"]["attached"].append(topic_node)
+
+    # 1. 构造 Sheet 对象 (原本你是一个大字典，现在把它变成 sheet)
+    sheet_content = {
+        "id": "sheet_1",  # 必须有 ID
+        "class": "sheet", # 必须声明类型
+        "title": filename,
+        "rootTopic": root_topic,
+        "topicPositioning": "fixed", # 推荐加上
+    }
+
+    # 2. 构造 content.json (必须是列表)
+    content = [sheet_content] 
     
     # 生成 manifest.json
     manifest = {
@@ -177,19 +174,17 @@ def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
     
     # 生成 metadata.json
     metadata = {
-        "appName": "XMind",
-        "appVersion": "8.0",
-        "platform": "Mac",
-        "displayTimeZone": "Asia/Shanghai",
-        "calendars": ["gregorian"],
-        "productID": "8",
-        "version": "8"
+        "creator": {
+            "name": "FilesMind",
+            "version": "1.0"
+        }
     }
     
     # 创建 ZIP 文件
     buffer = BytesIO()
     
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # 关键：XMind 要求 content.json 是一个 Sheet 数组
         zf.writestr('content.json', json.dumps(content, ensure_ascii=False, indent=2))
         zf.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
         zf.writestr('metadata.json', json.dumps(metadata, ensure_ascii=False, indent=2))

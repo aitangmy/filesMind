@@ -27,10 +27,47 @@ import shutil
 
 # 导入服务模块
 from parser_service import process_pdf_safely
-from cognitive_engine import generate_mindmap_structure
+from cognitive_engine import generate_mindmap_structure, update_client_config, test_connection, set_model
 from xmind_exporter import generate_xmind_content
 
 app = FastAPI()
+
+# ==================== 启动时加载配置 ====================
+@app.on_event("startup")
+async def startup_event():
+    """启动时加载配置"""
+    config = load_config()
+    if config.get("api_key"):
+        try:
+            update_client_config(config)
+            logger.info("配置已加载并应用到运行时")
+        except Exception as e:
+            logger.warning(f"启动时加载配置失败: {e}")
+    else:
+        logger.info("未配置 API Key，请在设置中配置")
+
+# ==================== 配置管理 ====================
+CONFIG_FILE = "./data/config.json"
+
+def load_config() -> Dict:
+    """加载配置"""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            pass
+    return {
+        "base_url": "https://api.deepseek.com",  # 不要加 /v1，库会自动添加
+        "model": "deepseek-chat",
+        "api_key": ""
+    }
+
+def save_config(config: Dict):
+    """保存配置"""
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
 
 # 配置 CORS
 app.add_middleware(
@@ -71,6 +108,7 @@ class Task:
 
 class FileRecord(BaseModel):
     file_id: str
+    task_id: Optional[str] = None
     filename: str
     file_hash: str
     pdf_path: str
@@ -111,11 +149,12 @@ def check_file_exists(file_hash: str) -> Optional[Dict]:
             return item
     return None
 
-def add_file_record(file_id: str, filename: str, file_hash: str, pdf_path: str, md_path: str, status: str = "processing"):
+def add_file_record(file_id: str, filename: str, file_hash: str, pdf_path: str, md_path: str, status: str = "processing", task_id: str = None):
     """添加文件记录"""
     history = load_history()
     record = {
         "file_id": file_id,
+        "task_id": task_id,
         "filename": filename,
         "file_hash": file_hash,
         "pdf_path": pdf_path,
@@ -173,8 +212,48 @@ def create_task(task_id: str) -> Task:
     return tasks[task_id]
 
 def get_task(task_id: str) -> Optional[Task]:
-    """获取任务状态"""
-    return tasks.get(task_id)
+    """
+    获取任务状态
+    优先从内存获取，如果内存中不存在（如服务重启），尝试从历史记录恢复状态
+    """
+    # 1. 尝试从内存获取
+    if task_id in tasks:
+        return tasks[task_id]
+    
+    # 2. 尝试从历史记录查找
+    history = load_history()
+    for item in history:
+        if item.get('task_id') == task_id:
+            # 重建任务对象
+            restored_task = Task(task_id)
+            status = item.get('status', 'failed')
+            
+            if status == 'completed':
+                restored_task.status = TaskStatus.COMPLETED
+                restored_task.progress = 100
+                restored_task.message = "处理完成（已恢复）"
+                # 尝试加载结果内容
+                if os.path.exists(item.get('md_path', '')):
+                    try:
+                        with open(item['md_path'], 'r', encoding='utf-8') as f:
+                            restored_task.result = f.read()
+                    except:
+                        pass
+            elif status == 'processing':
+                # 关键：如果历史记录是 processing 但内存里没有，说明服务重启了，任务已中断
+                restored_task.status = TaskStatus.FAILED
+                restored_task.progress = 0
+                restored_task.message = "服务已重启，任务被中断。请重新上传。"
+                restored_task.error = "Server restarted"
+                # 顺便更新历史记录状态，避免下次还误判
+                update_file_status(item['file_id'], 'failed')
+            else:
+                restored_task.status = TaskStatus.FAILED
+                restored_task.message = "任务执行失败"
+            
+            return restored_task
+            
+    return None
 
 # ==================== 任务处理 ====================
 
@@ -209,8 +288,40 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         task.progress = 45
         task.message = "正在分块处理内容..."
         
+        # 智能分块：尝试多种分隔符
+        # 1. 先尝试 ## 标题
         chunks = md_content.split("\n## ")
-        chunks = [f"## {c}" for c in chunks if c.strip()]
+        if len(chunks) > 1:
+            chunks = [f"## {c}" for c in chunks if c.strip()]
+        else:
+            # 2. 尝试 # 标题
+            chunks = md_content.split("\n# ")
+            if len(chunks) > 1:
+                chunks = [f"# {c}" for c in chunks if c.strip()]
+            else:
+                # 3. 尝试按数字标题 (1. xxx, 2. xxx)
+                import re
+                # 按 "数字. " 分割
+                parts = re.split(r'\n(\d+\.\s+)', '\n' + md_content)
+                if len(parts) > 1:
+                    chunks = []
+                    for i in range(1, len(parts), 2):
+                        if i+1 < len(parts):
+                            title = parts[i].strip()
+                            content = parts[i+1].strip()
+                            chunks.append(f"# {title}\n{content}")
+                else:
+                    # 4. 最后按换行分段（每 3000 字符为一个块）
+                    chunks = []
+                    current_chunk = ""
+                    for line in md_content.split('\n'):
+                        current_chunk += line + '\n'
+                        if len(current_chunk) > 3000:
+                            if current_chunk.strip():
+                                chunks.append(current_chunk.strip())
+                            current_chunk = ""
+                    if current_chunk.strip():
+                        chunks.append(current_chunk.strip())
         
         task.progress = 50
         task.message = f"已分块，共 {len(chunks)} 个章节"
@@ -337,7 +448,7 @@ async def upload_document(file: UploadFile = File(...)):
     
     # 创建文件记录
     md_path = os.path.join(MD_DIR, f"{file_id}.md")
-    add_file_record(file_id, file.filename, file_hash, pdf_path, md_path, "processing")
+    add_file_record(file_id, file.filename, file_hash, pdf_path, md_path, "processing", task_id=task_id)
     
     # 创建任务
     task = create_task(task_id)
@@ -478,3 +589,41 @@ async def export_xmind_from_content(request: Request):
 async def health_check():
     """健康检查"""
     return {"status": "ok", "tasks_count": len(tasks)}
+
+# ==================== 设置 API ====================
+@app.get("/config")
+async def get_config():
+    """获取当前配置"""
+    config = load_config()
+    # 不暴露完整的 api_key
+    config["api_key"] = "***" if config.get("api_key") else ""
+    return config
+
+@app.post("/config")
+async def set_config(config: Dict):
+    """保存配置"""
+    # 如果 API Key 是掩码，则保留原有 Key
+    if config.get("api_key") == "***":
+        existing_config = load_config()
+        config["api_key"] = existing_config.get("api_key", "")
+        
+    save_config(config)
+    # 更新运行时配置
+    update_client_config(config)
+    set_model(config.get("model", "deepseek-chat"))
+    return {"message": "配置已保存"}
+
+@app.post("/config/test")
+async def test_config(request: Request):
+    """测试配置"""
+    request_data = await request.json()
+    
+    # 如果 API Key 是掩码，则使用原有 Key 进行测试
+    if request_data.get("api_key") == "***":
+        existing_config = load_config()
+        # 只有当原有配置中有 Key 时才替换
+        if existing_config.get("api_key"):
+            request_data["api_key"] = existing_config.get("api_key")
+            
+    result = await test_connection(request_data)
+    return result

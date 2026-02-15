@@ -2,10 +2,29 @@ import sys
 import gc
 import logging
 import os
+import ssl
+import urllib.request
 from pathlib import Path
 
 # 配置 HuggingFace 镜像（解决国内网络访问问题）
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HOME"] = os.path.expanduser("~/.cache/huggingface")
+os.environ["TRANSFORMERS_CACHE"] = os.path.expanduser("~/.cache/huggingface/transformers")
+os.environ["HF_HUB_OFFLINE"] = "0"
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+
+# 配置 SSL 证书（解决部分环境 SSL 问题）
+import certifi
+os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+os.environ["CURL_CA_BUNDLE"] = certifi.where()
+
+# 尝试禁用 SSL 验证（仅作为备选）
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
 
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
