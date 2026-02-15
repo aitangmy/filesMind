@@ -17,13 +17,15 @@ const showSettings = ref(false);
 const config = ref({
   base_url: 'https://api.deepseek.com',  // 不要加 /v1，库会自动添加
   model: 'deepseek-chat',
-  api_key: ''
+  api_key: '',
+  account_type: 'free'  // 新增：账户类型 (free/paid)
 });
 const configLoading = ref(false);
 const configTestResult = ref(null);
 
 // 预设服务商列表
 const providerOptions = [
+  { value: 'https://api.minimaxi.com/v1', label: 'MiniMax' },
   { value: 'https://api.deepseek.com', label: 'DeepSeek (官方)' },
   { value: 'https://api.openai.com', label: 'OpenAI' },
   { value: 'https://api.anthropic.com', label: 'Anthropic (Claude)' },
@@ -33,6 +35,7 @@ const providerOptions = [
 
 // 预设模型列表
 const modelOptions = [
+  { value: 'MiniMax-M2.5', label: 'MiniMax 2.5' },
   { value: 'deepseek-chat', label: 'DeepSeek V3 (非思考)' },
   { value: 'deepseek-reasoner', label: 'DeepSeek R1 (思考)' },
   { value: 'gpt-4o', label: 'GPT-4o' },
@@ -41,6 +44,13 @@ const modelOptions = [
   { value: 'moonshot-v1-8k-vision-preview', label: 'Moonshot V1 8K' },
   { value: 'qwen-plus', label: '通义千问 Plus' }
 ];
+
+// 检测是否为 MiniMax 2.5 系列模型
+const isMiniMax25 = (model) => {
+  if (!model) return false;
+  const minimaxModels = ['MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'abab6.5s-chat', 'abab6.5g-chat'];
+  return minimaxModels.some(m => model.toLowerCase().includes(m.toLowerCase()));
+};
 
 // 轮询相关
 const currentTaskId = ref(null);
@@ -546,6 +556,19 @@ const testConfig = async () => {
             class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
             placeholder="请输入 API Key"
           />
+        </div>
+
+        <!-- 账户类型 (仅 MiniMax 2.5 需要) -->
+        <div v-if="isMiniMax25(config.model)">
+          <label class="block text-sm font-medium text-slate-700 mb-1">账户类型</label>
+          <select 
+            v-model="config.account_type" 
+            class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+          >
+            <option value="free">免费用户 (20 RPM)</option>
+            <option value="paid">充值用户 (500 RPM)</option>
+          </select>
+          <p class="text-xs text-slate-400 mt-1">选择账户类型以适配 API 速率限制</p>
         </div>
         
         <!-- 测试结果 -->

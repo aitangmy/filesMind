@@ -9,14 +9,10 @@ import logging
 import hashlib
 import json
 from datetime import datetime
-from dotenv import load_dotenv
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("FilesMind")
-
-# Load environment variables first
-load_dotenv()
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +23,7 @@ import shutil
 
 # 导入服务模块
 from parser_service import process_pdf_safely
-from cognitive_engine import generate_mindmap_structure, update_client_config, test_connection, set_model
+from cognitive_engine import generate_mindmap_structure, update_client_config, test_connection, set_model, set_account_type
 from xmind_exporter import generate_xmind_content
 
 app = FastAPI()
@@ -40,6 +36,8 @@ async def startup_event():
     if config.get("api_key"):
         try:
             update_client_config(config)
+            # 设置账户类型
+            set_account_type(config.get("account_type", "free"))
             logger.info("配置已加载并应用到运行时")
         except Exception as e:
             logger.warning(f"启动时加载配置失败: {e}")
@@ -58,9 +56,10 @@ def load_config() -> Dict:
         except:
             pass
     return {
-        "base_url": "https://api.deepseek.com",  # 不要加 /v1，库会自动添加
-        "model": "deepseek-chat",
-        "api_key": ""
+        "base_url": "https://api.minimaxi.com/v1",
+        "model": "MiniMax-M2.5",
+        "api_key": "",
+        "account_type": "free"
     }
 
 def save_config(config: Dict):
@@ -606,24 +605,35 @@ async def set_config(config: Dict):
     if config.get("api_key") == "***":
         existing_config = load_config()
         config["api_key"] = existing_config.get("api_key", "")
-        
+    
+    # 确保 account_type 存在
+    if "account_type" not in config:
+        existing_config = load_config()
+        config["account_type"] = existing_config.get("account_type", "free")
+    
     save_config(config)
     # 更新运行时配置
     update_client_config(config)
     set_model(config.get("model", "deepseek-chat"))
+    # 设置账户类型
+    set_account_type(config.get("account_type", "free"))
     return {"message": "配置已保存"}
 
 @app.post("/config/test")
 async def test_config(request: Request):
     """测试配置"""
-    request_data = await request.json()
-    
-    # 如果 API Key 是掩码，则使用原有 Key 进行测试
-    if request_data.get("api_key") == "***":
-        existing_config = load_config()
-        # 只有当原有配置中有 Key 时才替换
-        if existing_config.get("api_key"):
-            request_data["api_key"] = existing_config.get("api_key")
-            
-    result = await test_connection(request_data)
-    return result
+    try:
+        request_data = await request.json()
+        
+        # 如果 API Key 是掩码，则使用原有 Key 进行测试
+        if request_data.get("api_key") == "***":
+            existing_config = load_config()
+            # 只有当原有配置中有 Key 时才替换
+            if existing_config.get("api_key"):
+                request_data["api_key"] = existing_config.get("api_key")
+                
+        result = await test_connection(request_data)
+        return result
+    except Exception as e:
+        logger.error(f"测试配置出错: {e}")
+        return {"success": False, "message": f"服务器内部错误: {str(e)}"}

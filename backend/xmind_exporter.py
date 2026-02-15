@@ -11,33 +11,33 @@ from typing import Dict, Any, List
 def parse_markdown_to_tree(markdown: str) -> Dict[str, Any]:
     """
     将 Markdown 转换为树结构
-    核心逻辑：使用栈来维护层级关系
+    修改：修复分层结构问题 - 正确处理多层级缩进列表
+
+    核心逻辑：
+    1. 使用栈来维护层级关系
+    2. Level 基于缩进计算：level = (空格数 // 2) + 1
+       - 无缩进的列表项 (-): level 1
+       - 缩进 2 空格 (  -): level 2
+       - 缩进 4 空格 (    -): level 3
+    3. Header (#) 作为独立层级，H1 设置根节点标题
     """
     lines = markdown.strip().split('\n')
     root = {"id": "root", "title": "思维导图", "children": []}
-    
+
     # stack 存储元组 (level, node)
-    # level 定义：
-    # - Root: 0
-    # - H1 (#): 1
-    # - H2 (##): 2
-    # - ...
-    # - List Item: (父Header Level 或 0) + 1 + 缩进层级
     stack = [(0, root)]
-    current_header_level = 0
-    
+
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
 
-        # 计算缩进 (假设 2 空格或 1 tab 为一级缩进)
+        # 计算缩进 (2 空格 = 1 级)
         raw_indent = len(line) - len(line.lstrip())
-        indent = raw_indent // 2  # 2 space = 1 level
-        
+
         node_text = ""
         level = 0
-        
+
         # 识别类型
         if stripped.startswith('#'):
             parts = stripped.split(' ', 1)
@@ -46,53 +46,51 @@ def parse_markdown_to_tree(markdown: str) -> Dict[str, Any]:
                 # Header
                 level = len(h_mark)
                 node_text = parts[1].strip() if len(parts) > 1 else "Untitled"
-                
+
+                # H1 作为根节点标题
                 if level == 1:
                     root['title'] = node_text
-                    current_header_level = 1
-                    # 清空栈直到 Root，因为 H1 通常是文档标题
                     stack = [(0, root)]
                     continue
-                
-                current_header_level = level
-                
+
+                # 其他 Header 添加到结构中
             else:
                 # 非 Header，当作普通文本 -> 列表项
                 node_text = stripped
-                level = current_header_level + 1 + indent
-        
+                level = (raw_indent // 2) + 1
+
         elif stripped.startswith(('-', '*', '+')) and stripped[1:2] == ' ':
-            # 列表项
+            # 列表项 - 关键修复：level 仅基于缩进计算
             node_text = stripped[2:].strip()
-            level = current_header_level + 1 + indent
-            
+            level = (raw_indent // 2) + 1
+
         else:
-            # 普通文本
+            # 普通文本，按缩进处理
             node_text = stripped
-            level = current_header_level + 1 + indent # 视为当前 Header 的子项
-            
+            level = (raw_indent // 2) + 1
+
         # 清理文本
         node_text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', node_text) # 去除链接
         node_text = re.sub(r'\*\*([^*]+)\*\*', r'\1', node_text)       # 去除加粗
         node_text = re.sub(r'\*([^*]+)\*', r'\1', node_text)           # 去除斜体
         node_text = re.sub(r'`([^`]+)`', r'\1', node_text)             # 去除代码块
-            
+
         # 栈操作：找到父节点
         # 弹出所有 Level >= 当前 Level 的节点，剩下的栈顶即为父节点
         while len(stack) > 1 and stack[-1][0] >= level:
             stack.pop()
-            
+
         parent = stack[-1][1]
-        
+
         new_node = {
-            "id": f"node_{abs(hash(node_text))}_{len(parent.get('children', []))}", 
+            "id": f"node_{abs(hash(node_text))}_{len(parent.get('children', []))}",
             "title": node_text,
             "children": []
         }
-        
+
         parent.setdefault('children', []).append(new_node)
         stack.append((level, new_node))
-        
+
     return root
 
 def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
