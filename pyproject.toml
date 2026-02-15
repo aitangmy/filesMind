@@ -1,0 +1,16 @@
+[project]
+name = "filesmind"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "docling>=2.73.1",
+    "fastapi[standard]>=0.115.0",
+    "openai>=2.21.0",
+    "python-dotenv>=1.2.1",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+    "uvicorn>=0.40.0",
+    "python-multipart>=0.0.20",
+]
