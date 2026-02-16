@@ -2,6 +2,9 @@ import sys
 import gc
 import logging
 import os
+# 解决 Windows 下 OpenMP 多重加载冲突 (OMP: Error #15)
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import ssl
 import urllib.request
 from pathlib import Path
@@ -52,17 +55,22 @@ def get_optimal_device():
 
 def get_optimized_converter():
     """
-    针对 Mac Mini 24GB 的配置：
-    1. 启用 MPS 加速 (利用 GPU/NPU)
-    2. 关闭不必要的视觉增强以节省内存
+    智能设备配置：
+    - Mac (MPS): 禁用公式识别以兼容 MPS，优化内存
+    - Windows/Linux (CUDA): 启用全功能加速
+    - CPU: 降级运行
     """
     # 自动检测最佳设备
     device = get_optimal_device()
     
+    # 动态设置线程数 (保留 2 个核心给系统/其他任务)
+    cpu_count = os.cpu_count() or 4
+    num_threads = max(4, cpu_count - 2)
+
     # 配置加速选项
     accel_options = AcceleratorOptions(
-        num_threads=8,  # M4/M2 性能核数量
-        device=device    # 自动选择 MPS/CPU
+        num_threads=num_threads,
+        device=device
     )
 
     pipeline_opts = PdfPipelineOptions()
@@ -70,11 +78,23 @@ def get_optimized_converter():
     pipeline_opts.do_ocr = True
     pipeline_opts.do_table_structure = True
     
-    # 内存优化：24GB 内存如果不关这些，处理 200页+ 文档会触发 Swap
+    # 默认关闭高消耗功能以节省内存
     pipeline_opts.do_picture_classification = False 
     pipeline_opts.do_code_enrichment = False
-    # 关闭公式识别以启用 MPS 加速（公式识别会禁用 MPS）
-    pipeline_opts.do_formula_enrichment = False
+
+    # 针对不同硬件的特性配置
+    if device == AcceleratorDevice.CUDA:
+        # NVIDIA GPU (3060Ti 等): 支持完整功能
+        logger.info(f"配置 CUDA 加速: 启用公式识别, 线程数={num_threads}")
+        pipeline_opts.do_formula_enrichment = True
+    elif device == AcceleratorDevice.MPS:
+        # Apple Silicon: 关闭公式识别以启用 MPS 加速（目前 MPS 对部分算子支持不全）
+        logger.info(f"配置 MPS 加速: 禁用公式识别以确保存定性, 线程数={num_threads}")
+        pipeline_opts.do_formula_enrichment = False
+    else:
+        # CPU 模式
+        logger.info(f"配置 CPU 模式: 禁用公式识别以提升速度, 线程数={num_threads}")
+        pipeline_opts.do_formula_enrichment = False
 
     converter = DocumentConverter(
         format_options={

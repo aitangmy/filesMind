@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-DOCX Engine - OpenXML Document Compilation Toolkit
+OpenXML Document Build System
 
-Invoke: python docx_engine.py {doctor|render|audit|preview} [options]
+Central command-line interface for document compilation and validation.
 
-Architecture:
-- Single orchestration point - no scattered scripts
-- Runtime detection with graceful fallbacks
-- Self-locating via module path resolution
-- Mandatory output verification
+Usage:
+    python docx_engine.py {doctor|render|audit|preview|order} [options]
 
-Commands:
-  doctor          Environment diagnostics and setup
-  render [name]   Build and generate document
-  audit FILE      Validate existing document
-  preview FILE    Quick content preview (pandoc)
+Design goals:
+- Unified entry point for all document operations
+- Automatic runtime detection with fallback provisioning
+- Self-contained module path resolution
+- Mandatory post-generation verification
 """
 
 import os
@@ -27,25 +24,21 @@ import zipfile
 from pathlib import Path
 from typing import Optional, Tuple
 
-# Module path resolution
 SCRIPT_LOCATION = Path(__file__).parent.resolve()
-ENGINE_DIR = SCRIPT_LOCATION / "engine"
 
-# Import diagnostics system
 sys.path.insert(0, str(SCRIPT_LOCATION))
 from diagnostics.compiler import CompilerDiagnostics
 
 
 def resolve_project_home() -> Path:
-    """Determine active workspace from environment or working directory.
+    """Identify the active workspace directory.
 
-    This MUST resolve to the user's working directory (or PROJECT_HOME),
-    never the skill installation directory. All build intermediates and
-    outputs are placed here.
+    Returns the user's working directory or PROJECT_HOME environment variable.
+    Build artifacts and outputs are placed here. Raises an error if this
+    would resolve to the skill installation directory.
     """
     env_path = os.environ.get("PROJECT_HOME")
     home = Path(env_path) if env_path else Path.cwd()
-    # Guard: never write build artifacts into the skill directory itself
     if home.resolve() == SCRIPT_LOCATION.resolve():
         raise RuntimeError(
             f"project_home resolved to the skill directory ({SCRIPT_LOCATION}). "
@@ -55,20 +48,17 @@ def resolve_project_home() -> Path:
 
 
 def resolve_staging_area() -> Path:
-    """Staging directory for intermediate build files (under project home)."""
+    """Return the path for intermediate build files."""
     return resolve_project_home() / ".docx_workspace"
 
 
 def resolve_artifact_dir() -> Path:
-    """Final output directory for deliverables (under project home)."""
+    """Return the path for final document outputs."""
     return resolve_project_home() / "output"
 
 
-# Runtime Detection
-# ============================================================================
-
 def locate_dotnet_binary() -> Optional[Path]:
-    """Search for dotnet runtime in common locations."""
+    """Scan common installation paths for the dotnet executable."""
     os_type = platform.system()
     search_paths = ["dotnet"]
 
@@ -97,10 +87,11 @@ def locate_dotnet_binary() -> Optional[Path]:
 
 
 def assess_runtime_health() -> Tuple[str, Optional[Path], Optional[str]]:
-    """
-    Evaluate dotnet installation status.
-    Returns: (status, binary_path, version_string)
-    status: 'ready' | 'outdated' | 'corrupted' | 'absent'
+    """Check the state of the dotnet installation.
+
+    Returns:
+        Tuple of (status, binary_path, version_string) where status is one of:
+        'ready', 'outdated', 'corrupted', or 'absent'
     """
     binary = locate_dotnet_binary()
     if not binary:
@@ -124,7 +115,11 @@ def assess_runtime_health() -> Tuple[str, Optional[Path], Optional[str]]:
 
 
 def provision_dotnet() -> Optional[Path]:
-    """Download and install .NET SDK. Returns binary path on success."""
+    """Download and install .NET SDK automatically.
+
+    Returns:
+        Path to the installed binary, or None on failure.
+    """
     os_type = platform.system()
     print("  Acquiring .NET SDK...")
 
@@ -178,7 +173,10 @@ def provision_dotnet() -> Optional[Path]:
 
 
 def guarantee_dotnet() -> Path:
-    """Ensure dotnet availability, installing if necessary. Exits on failure."""
+    """Ensure dotnet is available, installing if needed.
+
+    Exits the process if installation fails.
+    """
     status, binary, ver = assess_runtime_health()
 
     if status == "ready":
@@ -207,14 +205,14 @@ def guarantee_dotnet() -> Path:
 
 
 def audit_python_dependencies() -> dict:
-    """Inventory Python dependency status."""
+    """Check availability of optional Python packages."""
     inventory = {}
 
     try:
         import lxml
         inventory["lxml"] = ("available", getattr(lxml, "__version__", "?"))
     except ImportError:
-        inventory["lxml"] = ("missing", None)
+        inventory["lxml"] = ("optional", None)
 
     pandoc_binary = shutil.which("pandoc")
     if pandoc_binary:
@@ -237,113 +235,35 @@ def audit_python_dependencies() -> dict:
     return inventory
 
 
-def guarantee_lxml():
-    """Install lxml if absent."""
-    try:
-        import lxml
-        return True
-    except ImportError:
-        print("o lxml not detected, installing...")
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "lxml"],
-                check=True, capture_output=True
-            )
-            print("  + lxml installed")
-            return True
-        except subprocess.CalledProcessError:
-            print("  - lxml installation failed")
-            print("    Manual: pip install lxml")
-            return False
-
-
-# Workspace Management
-# ============================================================================
-
-def extract_runtime_version(binary: Path) -> Optional[int]:
-    """Parse major version number from dotnet."""
-    try:
-        proc = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=10)
-        if proc.returncode == 0:
-            return int(proc.stdout.strip().split(".")[0])
-    except Exception:
-        pass
-    return None
-
-
-def reconcile_project_framework(proj_path: Path, binary: Path) -> bool:
-    """Adjust csproj TargetFramework to match installed runtime."""
-    major = extract_runtime_version(binary)
-    if not major or major < 6:
-        return False
-
-    try:
-        import re
-        content = proj_path.read_text(encoding="utf-8")
-        match = re.search(r"<TargetFramework>net(\d+)\.0</TargetFramework>", content)
-        if match:
-            current = int(match.group(1))
-            if current != major:
-                updated = re.sub(
-                    r"<TargetFramework>net\d+\.0</TargetFramework>",
-                    f"<TargetFramework>net{major}.0</TargetFramework>",
-                    content
-                )
-                proj_path.write_text(updated, encoding="utf-8")
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def prepare_workspace(runtime: Optional[Path] = None):
-    """Initialize workspace directories and seed templates."""
+def prepare_workspace():
+    """Ensure workspace output directories exist."""
     staging = resolve_staging_area()
     output = resolve_artifact_dir()
 
     staging.mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
 
-    blueprints_dir = SCRIPT_LOCATION / "blueprints"
-
-    proj_src = blueprints_dir / "DocumentFoundry.csproj"
-    proj_dst = staging / "DocumentFoundry.csproj"
-    if not proj_dst.exists() and proj_src.exists():
-        shutil.copy2(proj_src, proj_dst)
-
-    entry_src = blueprints_dir / "Launcher.cs"
-    entry_dst = staging / "Launcher.cs"
-    if not entry_dst.exists() and entry_src.exists():
-        shutil.copy2(entry_src, entry_dst)
-
-    if runtime and proj_dst.exists():
-        if reconcile_project_framework(proj_dst, runtime):
-            major = extract_runtime_version(runtime)
-            print(f"  (adjusted TargetFramework to net{major}.0)")
-
-
-# Verification Pipeline
-# ============================================================================
 
 def execute_verification(document_path: Path, runtime: Path) -> bool:
-    """Run full verification suite on generated document."""
-    # Phase 1: Python-based structural validation
-    auditor_script = SCRIPT_LOCATION / "quality" / "auditor.py"
+    """Run the complete verification pipeline on a generated document."""
+    from check.pipeline import ValidationPipeline
+    from check.report import Gravity
+
     try:
-        proc = subprocess.run(
-            [sys.executable, str(auditor_script), str(document_path)],
-            capture_output=True, text=True
-        )
-        print(proc.stdout, end="")
-        if proc.stderr:
-            print(proc.stderr, end="", file=sys.stderr)
-        if proc.returncode != 0:
+        report = ValidationPipeline.standard().run(document_path)
+        for issue in report.issues:
+            prefix = {
+                Gravity.BLOCKER: "!!",
+                Gravity.WARNING: " !",
+                Gravity.HINT: "  ",
+            }.get(issue.gravity, "  ")
+            print(f"  {prefix} [{issue.gravity.value}] {issue.location}: {issue.summary}")
+        if report.has_blockers():
             return False
     except Exception as exc:
         print(f"Verification exception: {exc}")
         return False
 
-    # Phase 2: OpenXML schema validation
     validator_dll = SCRIPT_LOCATION / "validator" / "DocxChecker.dll"
     if validator_dll.exists():
         try:
@@ -364,7 +284,7 @@ def execute_verification(document_path: Path, runtime: Path) -> bool:
 
 
 def extract_document_metrics(document_path: Path) -> dict:
-    """Gather document statistics using pandoc if available."""
+    """Collect statistics about the document using pandoc."""
     metrics = {"characters": 0, "tokens": 0, "media_count": 0, "has_markup": False, "has_annotations": False}
 
     if not shutil.which("pandoc"):
@@ -388,17 +308,14 @@ def extract_document_metrics(document_path: Path) -> dict:
             if "word/document.xml" in entries:
                 doc_xml = archive.read("word/document.xml").decode("utf-8", errors="ignore")
                 metrics["has_markup"] = "<w:ins" in doc_xml or "<w:del" in doc_xml
-    except Exception:
-        pass
+    except (subprocess.SubprocessError, zipfile.BadZipFile, OSError, UnicodeDecodeError):
+        return metrics
 
     return metrics
 
 
-# Command Handlers
-# ============================================================================
-
 def action_doctor():
-    """Environment diagnostics and setup (combines status + setup)."""
+    """Run environment diagnostics and automatic setup."""
     print("=== Environment Diagnostics ===")
     print()
 
@@ -423,8 +340,7 @@ def action_doctor():
         print(f"  {icon} {name}{ver_str}{suffix}")
     print()
 
-    # Auto-setup if needed
-    needs_setup = status != "ready" or deps.get("lxml", ("missing", None))[0] == "missing"
+    needs_setup = status != "ready"
 
     if needs_setup:
         print("=== Provisioning Dependencies ===")
@@ -432,40 +348,40 @@ def action_doctor():
         ver_proc = subprocess.run([str(runtime), '--version'], capture_output=True, text=True)
         print(f"  + dotnet {ver_proc.stdout.strip()}")
 
-        if not guarantee_lxml():
-            sys.exit(1)
-
         print()
         print("=== Preparing Workspace ===")
-        prepare_workspace(runtime)
+        prepare_workspace()
         print(f"  + {resolve_staging_area()}")
     else:
         staging = resolve_staging_area()
         if not staging.exists():
             print("=== Preparing Workspace ===")
-            prepare_workspace(binary)
+            prepare_workspace()
             print(f"  + {staging}")
         else:
             print("Workspace:")
             print(f"  + {staging}")
-            if (staging / "Launcher.cs").exists():
-                print("    Launcher.cs present")
+            print(f"  + project {SCRIPT_LOCATION / 'src' / 'DocForge.csproj'}")
 
     print()
     print("Ready!")
-    print(f"  Edit:   {resolve_staging_area() / 'Launcher.cs'}")
     print(f"  Render: python {Path(__file__).name} render")
+    print(f"  Preset: python {Path(__file__).name} render output.docx tech")
+    print(f"  Template: dotnet run --project \"{SCRIPT_LOCATION / 'src' / 'DocForge.csproj'}\" -- from-template template.docx output.docx")
     print(f"  Output: {resolve_artifact_dir()}/")
 
 
-def action_render(target_name: Optional[str] = None):
-    """Build and validate document."""
-    runtime = guarantee_dotnet()
-    if not guarantee_lxml():
+def action_render(target_name: Optional[str] = None, preset: str = "tech"):
+    """Compile source and generate a validated document from a preset template."""
+    preset = preset.lower()
+    if preset not in {"tech", "academic"}:
+        print(f"- Unsupported preset: {preset}")
+        print("  Available presets: tech, academic")
         sys.exit(1)
-    prepare_workspace(runtime)
 
-    staging = resolve_staging_area()
+    runtime = guarantee_dotnet()
+    prepare_workspace()
+
     output_dir = resolve_artifact_dir()
 
     if target_name:
@@ -478,10 +394,10 @@ def action_render(target_name: Optional[str] = None):
     target.parent.mkdir(parents=True, exist_ok=True)
 
     print(">> Compiling...")
-    proj_file = staging / "DocumentFoundry.csproj"
+    proj_file = SCRIPT_LOCATION / "src" / "DocForge.csproj"
     proc = subprocess.run(
         [str(runtime), "build", str(proj_file), "--verbosity", "quiet"],
-        capture_output=True, text=True, cwd=str(staging)
+        capture_output=True, text=True, cwd=str(SCRIPT_LOCATION)
     )
 
     if proc.returncode != 0:
@@ -499,9 +415,24 @@ def action_render(target_name: Optional[str] = None):
     print("  + Compiled")
 
     print(">> Generating...")
+    run_env = os.environ.copy()
+    run_env.setdefault("DOTNET_ROLL_FORWARD", "LatestMajor")
     proc = subprocess.run(
-        [str(runtime), "run", "--no-build", "--", str(target)],
-        capture_output=True, text=True, cwd=str(staging)
+        [
+            str(runtime),
+            "run",
+            "--project",
+            str(proj_file),
+            "--no-build",
+            "--",
+            preset,
+            str(target),
+            str(resolve_artifact_dir()),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(SCRIPT_LOCATION),
+        env=run_env,
     )
 
     if proc.returncode != 0:
@@ -514,7 +445,7 @@ def action_render(target_name: Optional[str] = None):
 
     if not target.exists():
         print(f"!! Output missing: {target}")
-        print("  Verify Launcher.cs output path")
+        print("  Verify preset run arguments and project mode")
         sys.exit(1)
     print("  + Generated")
 
@@ -534,7 +465,7 @@ def action_render(target_name: Optional[str] = None):
 
     metrics = extract_document_metrics(target)
     if metrics["characters"] > 0:
-        media_note = "" if metrics["media_count"] > 0 else " - verify AddInlineImage() calls"
+        media_note = "" if metrics["media_count"] > 0 else " - verify image embedding path"
         print(f"  >> {metrics['characters']} chars, {metrics['tokens']} words, {metrics['media_count']} images{media_note}")
         print(f"  >> Structural check passed. Content review: pandoc \"{target}\" -t plain")
         if metrics["has_markup"] or metrics["has_annotations"]:
@@ -545,10 +476,8 @@ def action_render(target_name: Optional[str] = None):
 
 
 def action_audit(document_path: str):
-    """Validate existing document."""
+    """Validate an existing document file."""
     runtime = guarantee_dotnet()
-    if not guarantee_lxml():
-        sys.exit(1)
 
     path = Path(document_path)
     if not path.exists():
@@ -563,7 +492,7 @@ def action_audit(document_path: str):
 
 
 def action_preview(document_path: str):
-    """Quick content preview using pandoc."""
+    """Display document text content using pandoc."""
     path = Path(document_path)
     if not path.exists():
         print(f"- Not found: {path}")
@@ -587,8 +516,50 @@ def action_preview(document_path: str):
         sys.exit(1)
 
 
+def action_order(container_name: Optional[str] = None, profile: str = "repair"):
+    """Inspect layered assembly order for OOXML containers."""
+    from spec.ooxml_order import (
+        build_container_orders,
+        explain_container,
+        get_phase_plan,
+        known_profiles,
+    )
+
+    profiles = known_profiles()
+    if container_name in profiles and profile == "repair":
+        profile = container_name
+        container_name = None
+
+    if profile not in profiles:
+        print(f"- Unknown order profile: {profile}")
+        print(f"  Available profiles: {', '.join(profiles)}")
+        sys.exit(1)
+
+    orders = build_container_orders(profile)
+    if not container_name:
+        print("Known containers:")
+        for name in sorted(orders):
+            print(f"  - {explain_container(name, profile=profile)}")
+        return
+
+    sequence = orders.get(container_name)
+    if sequence is None:
+        print(f"- Unknown container: {container_name}")
+        print(f"  Available: {', '.join(sorted(orders))}")
+        sys.exit(1)
+
+    print(explain_container(container_name, profile=profile))
+    phases = get_phase_plan(container_name, profile=profile) or ()
+    for phase in phases:
+        joined = ", ".join(phase.elements)
+        print(f"  [{phase.level}:{phase.name}] {joined}")
+    print("  [flattened]")
+    for idx, elem in enumerate(sequence, start=1):
+        print(f"    {idx:>2}. {elem}")
+
+
 def show_usage():
-    """Display command reference."""
+    """Print command reference."""
     staging = resolve_staging_area()
     output = resolve_artifact_dir()
 
@@ -600,24 +571,28 @@ IMPORTANT: Run from the user's working directory, not the skill directory.
 
 Commands:
   doctor          Environment diagnostics and auto-setup
-  render [name]   Build, execute, validate (default: output/document.docx)
+  render [name] [preset]   Build, execute, validate preset document (default preset: tech)
   audit FILE      Validate existing document
   preview FILE    Quick content preview (requires pandoc)
+  order [name] [profile]  Show OOXML layered order (profiles: minimal/repair/compat/strict)
 
 Paths:
   Skill:     {SCRIPT_LOCATION}
-  Workspace: {staging}  (edit Launcher.cs here)
+  Workspace: {staging}
   Output:    {output}  (final deliverables)
 
 Creation Workflow:
   1. python docx_engine.py doctor
-  2. Edit {staging / 'Launcher.cs'}
-  3. python docx_engine.py render report.docx
+  2. python docx_engine.py render report.docx tech
 
 Modification Workflow:
-  1. Analyze uploaded .docx structure
-  2. Edit {staging / 'Launcher.cs'}
-  3. python docx_engine.py render modified.docx
+  1. Analyze requirements
+  2. python docx_engine.py render modified.docx academic
+
+Template-Driven Workflow (when user provides a template):
+  1. Keep the template as source of truth (no preset structure injection)
+  2. Run: dotnet run --project "{SCRIPT_LOCATION / 'src' / 'DocForge.csproj'}" -- from-template template.docx output.docx
+  3. Run: python docx_engine.py audit output.docx
 """
     print(usage.strip())
 
@@ -633,7 +608,8 @@ def main():
         action_doctor()
     elif command == "render":
         target = sys.argv[2] if len(sys.argv) > 2 else None
-        action_render(target)
+        preset = sys.argv[3] if len(sys.argv) > 3 else "tech"
+        action_render(target, preset)
     elif command == "audit":
         if len(sys.argv) < 3:
             print("Usage: python docx_engine.py audit <document.docx>")
@@ -644,6 +620,11 @@ def main():
             print("Usage: python docx_engine.py preview <document.docx>")
             sys.exit(1)
         action_preview(sys.argv[2])
+    elif command == "order":
+        action_order(
+            container_name=sys.argv[2] if len(sys.argv) > 2 else None,
+            profile=sys.argv[3] if len(sys.argv) > 3 else "repair",
+        )
     else:
         print(f"Unknown command: {command}")
         print("Run 'python docx_engine.py help' for reference")

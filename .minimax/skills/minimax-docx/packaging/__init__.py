@@ -1,5 +1,5 @@
 """
-Packaging - OPC-compliant document packaging.
+Packaging - OPC archive assembly with semantic part ordering.
 """
 
 from .opc import OPCPackager

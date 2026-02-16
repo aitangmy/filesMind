@@ -4,6 +4,7 @@
 """
 import asyncio
 import os
+import re
 import atexit
 from openai import AsyncOpenAI
 
@@ -223,51 +224,41 @@ atexit.register(cleanup)
 TASK_TIMEOUT = 600  # 10分钟，与 DeepSeek 文档一致
 
 SYSTEM_PROMPT = """
-You are a professional Knowledge Architect. Your task is to extract a structured Mind Map from technical documentation.
-Your output MUST be a valid Markdown list with proper hierarchical nesting.
+You are a professional Knowledge Architect. Your task is to extract a comprehensive, structured Mind Map from a large document section.
+The input text is a significant portion of a document (e.g., multiple pages).
 
 CRITICAL RULES:
-1. Use ONLY Markdown list syntax starting with "- " (dash followed by space).
-2. Use EXACTLY 2 spaces per indentation level to show hierarchy.
-3. NEVER use Markdown headers (#) in your output - use only list items.
-4. Start your response DIRECTLY with the first list item - no intro text, no "Here is the mind map:" prefix.
-5. Hierarchy depth should be reasonable (max 4 levels).
-6. Focus on "Concepts", "Relations", and "Key Data".
-7. Remove all conversational fillers and explanations.
-8. If the chunk is empty or irrelevant, return nothing.
+1. **Structure**: Identify the main hierarchy. Use Markdown headers (##, ###) for sections and subsections.
+   - Start with Level 2 headers (##) for the main topics in this section.
+   - Use Level 3 (###) and Level 4 (####) for deeper nesting.
+2. **Content**: Use Markdown lists (-) for details under headers.
+   - Do NOT just list keywords. Use complete, meaningful phrases.
+   - Capture ALL key concepts, definitions, data points, and relationships.
+   - Depth is good. Do not over-summarize.
+3. **Format**:
+   - output MUST be valid Markdown.
+   - No "Here is the mind map" preamble.
+   - Use standard indentation (2 spaces).
 
-Example correct output:
-- Main Category
-  - Subcategory 1
-    - Detail item A
-    - Detail item B
-  - Subcategory 2
-    - Detail item C
-
-WRONG examples (DO NOT do this):
-✗ Here is the mind map: - Category
-✗ # Category
-  - Subcategory
-✗ Category (missing dash)
-✗ - Category (tab indentation - use spaces only)
+Example Output:
+## Main Section Title
+### Subsection 1.1
+- Key Concept A
+  - Definition: ...
+  - Example: ...
+### Subsection 1.2
+- Key Concept B
+  - Data point: 85% growth
 """
 
 async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_info: dict = None):
     """
-    处理单个文本块
-    修改：修复分层结构问题 - 保持 AI 生成的多层级缩进
+    处理单个文本块 (Large Chunk Optimized)
     """
-    # 提取章节标题（第一行）
+    # 提取章节标题（第一行）仅作为元数据，不强制使用
     lines = text_chunk.strip().split('\n')
-    title = lines[0] if lines else f"章节 {chunk_id + 1}"
-
-    # 清理标题（去掉 # 符号，保留文字）
+    title = lines[0] if lines else f"Section {chunk_id + 1}"
     title = title.strip().lstrip('#').strip()
-    if not title:
-        title = f"章节 {chunk_id + 1}"
-
-    # 提取内容（去掉标题行，只保留内容部分给 AI 处理）
-    content = '\n'.join(lines[1:]) if len(lines) > 1 else text_chunk
 
     semaphore = get_semaphore()
     async with semaphore:
@@ -280,61 +271,66 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
                 model=get_model(),
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Convert the following section into a hierarchical Markdown mind map structure:\n\n{content}"}
+                    {"role": "user", "content": f"Analyze and structure the following text into a detailed Markdown mind map:\n\n{text_chunk}"}
                 ],
-                # 数据抽取/分析场景，使用 1.0
-                temperature=1.0,
-                max_tokens=2000
+                # 提高温度以增加多样性，但保持结构
+                temperature=0.3,
+                max_tokens=4096  # 增加输出长度限制
             )
 
             ai_content = response.choices[0].message.content
 
-            # 关键修改：保持 AI 生成的多层级结构
-            # 不要在 AI 内容前添加固定的缩进，而是保持其原有的层级关系
+            # 验证结果并处理
             if ai_content and ai_content.strip():
-                # 将标题作为第一级节点，AI 生成的内容作为其子节点
-                # 保持 AI 内容的缩进格式，只在整个内容前加 2 空格
-                ai_lines = ai_content.strip().split('\n')
-                indented_lines = []
-                for line in ai_lines:
-                    # 只对非空行添加缩进，空行保持原样
-                    if line.strip():
-                        # 保留原有缩进，并额外添加 2 空格使其成为 title 的子项
-                        indented_lines.append('  ' + line)
-                    # 空行直接跳过，不添加到结果中
-                result = f"- {title}\n" + '\n'.join(indented_lines)
+                # 强制降级 Level 1 标题 -> Level 2
+                # 避免 AI 只有 # Title 的情况破坏整体结构
+                # 替换开头的 # (Space) 为 ## (Space)
+                ai_content = re.sub(r'(^|\n)#\s', r'\1## ', ai_content)
+                
+                # 检查 AI 是否生成了标题 (## 或 ###...)
+                # 如果 AI 输出是纯列表（没有 headers），我们需要补一个标题
+                if not re.search(r'^#{2,6}\s', ai_content, re.MULTILINE):
+                    result = f"## {title}\n{ai_content}"
+                else:
+                    # AI 生成了结构，直接使用
+                    result = ai_content
             else:
-                result = f"- {title}"
+                result = f"## {title}\n- (No content extracted)"
 
             # 更新进度（如果有 task 对象）
             if task and process_info:
                 completed = process_info['completed'] + 1
                 total = process_info['total']
                 process_info['completed'] = completed
-
-                # 计算进度：50% -> 95%
-                # progress = base (50) + (completed / total) * range (45)
                 progress = 50 + int((completed / total) * 45)
                 task.progress = min(95, progress)
-                task.message = f"AI 正在处理章节 {completed}/{total}..."
+                task.message = f"AI 正在深入分析章节 {completed}/{total}..."
 
             return chunk_id, result
 
         except Exception as e:
             print(f"Error processing chunk {chunk_id}: {e}")
             await asyncio.sleep(1)
-            return chunk_id, None
+            # 失败时至少保留原文标题
+            return chunk_id, f"## {title}\n- Error extracting content"
 
 async def generate_root_summary(full_markdown: str):
     """
-    生成根节点摘要
+    生成根节点摘要 - 基于全文档结构
     """
     try:
+        # 1. 提取大纲 (Table of Contents) 而不是截断文本
+        # 提取所有 headers
+        toc_lines = [line for line in full_markdown.split('\n') if line.strip().startswith('#')]
+        toc_content = "\n".join(toc_lines)
+        
+        # 如果 TOC 太长，再进行截断（但保留了结构概览）
+        if len(toc_content) > 15000:
+             toc_content = toc_content[:15000] + "\n...(truncated)..."
+
         client = get_client()
         model = get_model()
         
-        # 如果当前是 deepseek-chat，且支持 deepseek-reasoner，可以特殊处理
-        # 但为了通用性，默认使用当前选定的模型
         target_model = model
         if "deepseek" in model and "chat" in model:
             target_model = "deepseek-reasoner"
@@ -342,31 +338,16 @@ async def generate_root_summary(full_markdown: str):
         response = await client.chat.completions.create(
             model=target_model,
             messages=[
-                {"role": "system", "content": "You are an expert at synthesizing complex information into a single root node and main branches for a Mind Map."},
-                {"role": "user", "content": f"Based on the following detailed branches, generate a Root Node and the top-level structure (Level 1 only).\n\nbranches:\n{full_markdown[:4000]}..."}
+                {"role": "system", "content": "You are an expert Knowledge Architect."},
+                {"role": "user", "content": f"Based on the following document outline (Table of Contents), generate a single Root Node title (Level 1 #) and a high-level summary structure if needed.\n\nOutline:\n{toc_content}"}
             ],
-            # 数据抽取/分析场景，使用 1.0
-            temperature=1.0,
+            temperature=0.3,
             max_tokens=1000
         )
         return response.choices[0].message.content
     except Exception as e:
         print(f"Error generating root summary: {e}")
-        # 如果特殊模型失败，回退到主模型
-        try:
-            client = get_client()
-            response = await client.chat.completions.create(
-                model=get_model(),
-                messages=[
-                    {"role": "system", "content": "You are an expert at synthesizing complex information into a single root node and main branches for a Mind Map."},
-                    {"role": "user", "content": f"Based on the following detailed branches, generate a Root Node and the top-level structure (Level 1 only).\n\nbranches:\n{full_markdown[:4000]}..."}
-                ],
-                temperature=1.0,
-                max_tokens=1000
-            )
-            return response.choices[0].message.content
-        except:
-            return "# Document Analysis"
+        return "# Document Analysis"
 
 async def generate_mindmap_structure(chunks, task=None):
     """
@@ -405,7 +386,8 @@ async def generate_mindmap_structure(chunks, task=None):
     if not branch_contents:
         return "# No valid content extracted"
     
-    full_branches = "\n".join(branch_contents)
+    # 使用双换行分隔不同章节，保持结构清晰
+    full_branches = "\n\n".join(branch_contents)
     
     # ==================== REDUCE Phase ====================
     if task:
@@ -413,9 +395,12 @@ async def generate_mindmap_structure(chunks, task=None):
     
     try:
         root_structure = await generate_root_summary(full_branches)
-        final_output = f"{root_structure}\n\n{full_branches}"
+        # 确保根节点只有一个 #，章节使用 ##
+        # 先去掉 AI 输出中可能存在的多余 # 
+        clean_branches = full_branches.replace('\n# ', '\n## ')
+        final_output = f"{root_structure}\n\n{clean_branches}"
     except Exception as e:
         print(f"Reduce phase error: {e}")
-        final_output = f"# Generated Knowledge Graph\n{full_branches}"
+        final_output = f"# 知识图谱\n\n{full_branches}"
     
     return final_output

@@ -1,29 +1,26 @@
 """
-compiler.py - Roslyn diagnostic analyzer with online documentation lookup.
+C# Compiler Diagnostic Analyzer
 
-Provides contextual suggestions for C# compiler errors by:
-1. Parsing structured MSBuild/Roslyn diagnostic output
-2. Categorizing errors by their diagnostic ID prefix
-3. Generating fix suggestions based on error semantics
+Parses Roslyn/MSBuild compiler output and generates actionable fix suggestions.
+Understands the structure of C# diagnostic messages and provides contextual
+guidance based on error semantics.
 
-Design Principle:
-  Rather than maintaining a static mapping of error patterns to messages,
-  this module understands the structure of Roslyn diagnostics and generates
-  suggestions dynamically based on error context.
+The analyzer categorizes errors by their diagnostic ID prefix and applies
+pattern matching on message content to generate relevant suggestions.
 
-Reference: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/compiler-messages/
+See: https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/compiler-messages/
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Iterator
 
 
 class DiagnosticSeverity(Enum):
-    """MSBuild diagnostic severity levels."""
+    """Compiler diagnostic severity levels from MSBuild."""
     ERROR = "error"
     WARNING = "warning"
     INFO = "info"
@@ -31,24 +28,33 @@ class DiagnosticSeverity(Enum):
 
 @dataclass
 class RoslynDiagnostic:
-    """Parsed Roslyn/MSBuild diagnostic entry."""
-    id: str                          # e.g., "CS0246"
+    """Represents a parsed compiler diagnostic entry.
+
+    Attributes:
+        id: Diagnostic identifier (e.g., "CS0246")
+        severity: Error, warning, or informational
+        message: The compiler's message text
+        file_path: Source file where the issue occurred
+        line: Line number in source file
+        column: Column number in source file
+    """
+    id: str
     severity: DiagnosticSeverity
-    message: str                     # Original compiler message
+    message: str
     file_path: str = ""
     line: int = 0
     column: int = 0
 
     @property
     def category(self) -> str:
-        """Derive category from diagnostic ID prefix.
+        """Derive error category from the diagnostic ID.
 
-        Roslyn diagnostic IDs follow patterns:
-        - CS0xxx: Language/syntax errors
-        - CS1xxx: Compiler errors
+        C# diagnostic IDs follow numbering conventions:
+        - CS0xxx: Core language and syntax errors
+        - CS1xxx: Compiler processing errors
         - CS2xxx: Compiler warnings
         - CS7xxx: Language feature errors
-        - CS8xxx: Nullable reference warnings
+        - CS8xxx: Nullable reference analysis
         """
         if not self.id.startswith("CS"):
             return "other"
@@ -58,36 +64,40 @@ class RoslynDiagnostic:
             return "other"
 
         if num < 1000:
-            return "language"      # Basic language errors
+            return "language"
         elif num < 2000:
-            return "compilation"   # Compilation process errors
+            return "compilation"
         elif num < 3000:
-            return "semantic"      # Semantic warnings
+            return "semantic"
         elif num < 8000:
-            return "feature"       # Language feature errors
+            return "feature"
         else:
-            return "nullable"      # Nullable analysis
+            return "nullable"
 
 
 class DiagnosticParser:
-    """Parser for MSBuild diagnostic output."""
+    """Extracts diagnostic entries from MSBuild output text."""
 
-    # MSBuild error format: file(line,col): error CSxxxx: message
     _MSBUILD_PATTERN = re.compile(
         r"^(?P<file>[^(]+)\((?P<line>\d+),(?P<col>\d+)\):\s*"
         r"(?P<sev>error|warning|info)\s+(?P<id>CS\d+):\s*(?P<msg>.+)$",
         re.MULTILINE
     )
 
-    # Simple format: error CSxxxx: message
     _SIMPLE_PATTERN = re.compile(
         r"^(?P<sev>error|warning|info)\s+(?P<id>CS\d+):\s*(?P<msg>.+)$",
         re.MULTILINE
     )
 
     def parse(self, output: str) -> Iterator[RoslynDiagnostic]:
-        """Parse compiler output into diagnostic objects."""
-        # Try MSBuild format first
+        """Extract diagnostic entries from compiler output text.
+
+        Args:
+            output: Raw compiler output string
+
+        Yields:
+            RoslynDiagnostic instances for each found diagnostic
+        """
         for m in self._MSBUILD_PATTERN.finditer(output):
             yield RoslynDiagnostic(
                 id=m.group("id"),
@@ -98,7 +108,6 @@ class DiagnosticParser:
                 column=int(m.group("col")),
             )
 
-        # Also check simple format
         for m in self._SIMPLE_PATTERN.finditer(output):
             yield RoslynDiagnostic(
                 id=m.group("id"),
@@ -109,35 +118,46 @@ class DiagnosticParser:
 
 @dataclass
 class FixSuggestion:
-    """Actionable fix suggestion for a diagnostic."""
+    """A proposed fix for a compiler diagnostic.
+
+    Attributes:
+        diagnostic_id: The compiler error code
+        title: Brief description of the fix
+        description: Detailed explanation
+        code_action: Optional code snippet demonstrating the fix
+    """
     diagnostic_id: str
     title: str
     description: str
-    code_action: str | None = None  # Optional code snippet
+    code_action: str | None = None
 
 
 class SuggestionEngine:
-    """Generate fix suggestions based on diagnostic semantics.
+    """Generates fix suggestions based on diagnostic content.
 
-    Uses pattern matching on the diagnostic message content rather than
-    maintaining a static ID-to-message mapping.
+    Analyzes message text patterns rather than relying on a static
+    mapping from error codes to suggestions.
     """
 
     def suggest(self, diag: RoslynDiagnostic) -> FixSuggestion | None:
-        """Generate a fix suggestion for a diagnostic."""
-        # Dispatch by category
+        """Create a fix suggestion for the given diagnostic.
+
+        Args:
+            diag: Parsed diagnostic entry
+
+        Returns:
+            FixSuggestion if applicable, otherwise None
+        """
         handler = getattr(self, f"_suggest_{diag.category}", None)
         if handler:
             return handler(diag)
         return self._generic_suggestion(diag)
 
     def _suggest_language(self, diag: RoslynDiagnostic) -> FixSuggestion | None:
-        """Handle CS0xxx language errors."""
+        """Handle basic language errors (CS0xxx)."""
         msg = diag.message.lower()
 
-        # Type not found - analyze the type name for OpenXML hints
         if "type or namespace" in msg and "could not be found" in msg:
-            # Extract the missing type name
             type_match = re.search(r"'(\w+)'", diag.message)
             if type_match:
                 type_name = type_match.group(1)
@@ -150,7 +170,6 @@ class SuggestionEngine:
                         code_action=f"using {ns};",
                     )
 
-        # Implicit conversion error - common with OpenXML ID types
         if "cannot implicitly convert" in msg:
             if "string" in msg:
                 return FixSuggestion(
@@ -163,10 +182,9 @@ class SuggestionEngine:
         return None
 
     def _suggest_compilation(self, diag: RoslynDiagnostic) -> FixSuggestion | None:
-        """Handle CS1xxx compilation errors."""
+        """Handle compiler processing errors (CS1xxx)."""
         msg = diag.message.lower()
 
-        # Escape sequence errors
         if "unrecognized escape" in msg or "escape sequence" in msg:
             return FixSuggestion(
                 diagnostic_id=diag.id,
@@ -175,7 +193,6 @@ class SuggestionEngine:
                 code_action='@"your\\path"',
             )
 
-        # Newline in constant
         if "newline in constant" in msg:
             return FixSuggestion(
                 diagnostic_id=diag.id,
@@ -187,8 +204,7 @@ class SuggestionEngine:
         return None
 
     def _suggest_feature(self, diag: RoslynDiagnostic) -> FixSuggestion | None:
-        """Handle CS7xxx/CS8xxx feature and nullable errors."""
-        # Generic nullable suggestion
+        """Handle language feature and nullable errors (CS7xxx/CS8xxx)."""
         if "nullable" in diag.message.lower():
             return FixSuggestion(
                 diagnostic_id=diag.id,
@@ -198,7 +214,7 @@ class SuggestionEngine:
         return None
 
     def _generic_suggestion(self, diag: RoslynDiagnostic) -> FixSuggestion:
-        """Fallback suggestion with documentation link."""
+        """Provide a fallback suggestion with documentation reference."""
         return FixSuggestion(
             diagnostic_id=diag.id,
             title=f"See documentation for {diag.id}",
@@ -206,19 +222,16 @@ class SuggestionEngine:
         )
 
     def _infer_namespace(self, type_name: str) -> str | None:
-        """Infer the likely namespace for an OpenXML type."""
-        # Document structure types
+        """Guess the namespace for common OpenXML types."""
         if type_name in ("Body", "Paragraph", "Run", "Text", "Table",
                          "TableRow", "TableCell", "SectionProperties",
                          "ParagraphProperties", "RunProperties"):
             return "DocumentFormat.OpenXml.Wordprocessing"
 
-        # Package types
         if type_name in ("WordprocessingDocument", "MainDocumentPart",
                          "StyleDefinitionsPart", "NumberingDefinitionsPart"):
             return "DocumentFormat.OpenXml.Packaging"
 
-        # Drawing types
         if type_name in ("Drawing", "Inline", "Anchor"):
             return "DocumentFormat.OpenXml.Drawing.Wordprocessing"
 
@@ -226,9 +239,9 @@ class SuggestionEngine:
 
 
 class CompilerDiagnostics:
-    """Main entry point for compiler output analysis.
+    """Primary interface for compiler output analysis.
 
-    Combines parsing and suggestion generation into a simple API.
+    Combines parsing and suggestion generation into a single API.
     """
 
     def __init__(self):
@@ -236,9 +249,15 @@ class CompilerDiagnostics:
         self._engine = SuggestionEngine()
 
     def analyze(self, compiler_output: str) -> list[FixSuggestion]:
-        """Analyze compiler output and return fix suggestions.
+        """Process compiler output and return fix suggestions.
 
-        Returns a list of actionable suggestions, deduplicated by diagnostic ID.
+        Deduplicates suggestions by diagnostic ID to avoid repetition.
+
+        Args:
+            compiler_output: Raw text from the compiler
+
+        Returns:
+            List of actionable suggestions
         """
         seen_ids: set[str] = set()
         suggestions: list[FixSuggestion] = []
@@ -255,7 +274,14 @@ class CompilerDiagnostics:
         return suggestions
 
     def format_suggestions(self, suggestions: list[FixSuggestion]) -> str:
-        """Format suggestions as human-readable text."""
+        """Render suggestions as human-readable text.
+
+        Args:
+            suggestions: List of suggestions to format
+
+        Returns:
+            Formatted string output
+        """
         if not suggestions:
             return "No actionable suggestions."
 

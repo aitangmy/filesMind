@@ -1,7 +1,7 @@
 """
-Diagnostics - Intelligent compilation error analysis.
+Diagnostics - C# compiler output analysis and fix suggestions.
 """
 
-from .compiler import CompilerDiagnostics, Suggestion
+from .compiler import CompilerDiagnostics, FixSuggestion
 
-__all__ = ["CompilerDiagnostics", "Suggestion"]
+__all__ = ["CompilerDiagnostics", "FixSuggestion"]

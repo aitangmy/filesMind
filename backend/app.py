@@ -1,6 +1,6 @@
-"""
-FilesMind 后端服务
-支持异步任务处理、进度追踪和文件历史管理
+﻿"""
+FilesMind ��˷���
+֧���첽�����������׷�ٺ��ļ���ʷ����
 """
 import os
 import uuid
@@ -9,8 +9,9 @@ import logging
 import hashlib
 import json
 from datetime import datetime
+import re
 
-# 配置日志
+# ������־
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("FilesMind")
 
@@ -21,34 +22,122 @@ from pydantic import BaseModel
 from typing import Optional, Dict, List
 import shutil
 
-# 导入服务模块
+# �������ģ��
 from parser_service import process_pdf_safely
 from cognitive_engine import generate_mindmap_structure, update_client_config, test_connection, set_model, set_account_type
 from xmind_exporter import generate_xmind_content
 
+
+
+# ==================== 智能分块函数 ====================
+def parse_markdown_chunks(md_content: str) -> list:
+    """
+    智能分块：基于大小和结构的动态分块
+    目标：将文档合并为较大的语义块（约15k字符），减少碎片化，提升AI上下文理解能力。
+    """
+    if not md_content or not md_content.strip():
+        return []
+
+    # 目标块大小（字符数）- 约 5k-8k tokens，适配长窗口模型
+    TARGET_CHUNK_SIZE = 15000 
+    
+    # 1. 预处理：按行分割
+    lines = md_content.split('\n')
+    
+    chunks = []
+    current_chunk_lines = []
+    current_size = 0
+    
+    # 标题识别正则
+    header_pattern = re.compile(r'^(#{1,3}\s|第[零一二三四五六七八九十百]+章|\d+(\.\d+)*\s)')
+
+    for line in lines:
+        is_header = header_pattern.match(line.strip())
+        line_len = len(line) + 1 # +1 for newline
+        
+        # 决定是否切分：
+        # 1. 当前块已经足够大
+        # 2. 并且当前行是标题（避免在段落中间切断）
+        # 3. 或者当前块实在太大了（超过2倍目标），强制切分
+        if (current_size >= TARGET_CHUNK_SIZE and is_header) or (current_size >= TARGET_CHUNK_SIZE * 2):
+            if current_chunk_lines:
+                chunks.append('\n'.join(current_chunk_lines))
+                current_chunk_lines = []
+                current_size = 0
+        
+        current_chunk_lines.append(line)
+        current_size += line_len
+    
+    # 添加最后一个块
+    if current_chunk_lines:
+        chunks.append('\n'.join(current_chunk_lines))
+    
+    # 如果只有一个块，且看起来没有按结构分割（原文档可能缺乏清晰标题），尝试强制长度分割
+    if len(chunks) == 1 and len(md_content) > TARGET_CHUNK_SIZE * 1.5:
+        logger.info("文档结构不清晰，启用备用长度分块")
+        return fallback_chunking(md_content, TARGET_CHUNK_SIZE)
+    
+    logger.info(f"智能分块完成，共 {len(chunks)} 个章节 (Target: {TARGET_CHUNK_SIZE} chars)")
+    return chunks
+
+
+def fallback_chunking(md_content: str, chunk_size: int = 15000) -> list:
+    """备用分块方案：按字符长度均分，尽量在段落处分割"""
+    if len(md_content) <= chunk_size:
+        return [md_content] if md_content.strip() else []
+    
+    chunks = []
+    # 按双换行（段落）分割
+    paragraphs = md_content.split('\n\n')
+    current_chunk = ""
+    
+    for para in paragraphs:
+        # 如果加上这段会超长
+        if len(current_chunk) + len(para) > chunk_size:
+            # 如果当前块不为空，先保存当前块
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+            
+            # 如果单个段落本身就超长，强制切分
+            if len(para) > chunk_size:
+                # 递归切分超长段落
+                sub_chunks = [para[i:i+chunk_size] for i in range(0, len(para), chunk_size)]
+                chunks.extend(sub_chunks)
+            else:
+                current_chunk = para + "\n\n"
+        else:
+            current_chunk += para + "\n\n"
+    
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    return chunks
+
+
 app = FastAPI()
 
-# ==================== 启动时加载配置 ====================
+# ==================== ���ʱ�������� ====================
 @app.on_event("startup")
 async def startup_event():
-    """启动时加载配置"""
+    """���ʱ��������"""
     config = load_config()
     if config.get("api_key"):
         try:
             update_client_config(config)
-            # 设置账户类型
+            # �����˻�����
             set_account_type(config.get("account_type", "free"))
-            logger.info("配置已加载并应用到运行时")
+            logger.info("�����Ѽ��ز�Ӧ�õ�����ʱ")
         except Exception as e:
-            logger.warning(f"启动时加载配置失败: {e}")
+            logger.warning(f"���ʱ��������ʧ��: {e}")
     else:
-        logger.info("未配置 API Key，请在设置中配置")
+        logger.info("δ���� API Key����������������")
 
-# ==================== 配置管理 ====================
+# ==================== ���ù��� ====================
 CONFIG_FILE = "./data/config.json"
 
 def load_config() -> Dict:
-    """加载配置"""
+    """��������"""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -63,12 +152,12 @@ def load_config() -> Dict:
     }
 
 def save_config(config: Dict):
-    """保存配置"""
+    """��������"""
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-# 配置 CORS
+# ���� CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -77,18 +166,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================== 配置 ====================
-# 文件存储目录
+# ==================== ���� ====================
+# �ļ��洢Ŀ¼
 DATA_DIR = "./data"
 PDF_DIR = os.path.join(DATA_DIR, "pdfs")
 MD_DIR = os.path.join(DATA_DIR, "mds")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 
-# 确保目录存在
+# ȷ��Ŀ¼����
 os.makedirs(PDF_DIR, exist_ok=True)
 os.makedirs(MD_DIR, exist_ok=True)
 
-# ==================== 数据模型 ====================
+# ==================== ����ģ�� ====================
 
 class TaskStatus(str):
     PENDING = "pending"
@@ -101,7 +190,7 @@ class Task:
         self.task_id = task_id
         self.status = TaskStatus.PENDING
         self.progress = 0
-        self.message = "等待处理..."
+        self.message = "�ȴ�����..."
         self.result = None
         self.error = None
 
@@ -115,10 +204,10 @@ class FileRecord(BaseModel):
     created_at: str
     status: str  # "completed", "processing", "failed"
 
-# ==================== 历史记录管理 ====================
+# ==================== ��ʷ��¼���� ====================
 
 def load_history() -> List[Dict]:
-    """加载历史记录"""
+    """������ʷ��¼"""
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
@@ -128,12 +217,12 @@ def load_history() -> List[Dict]:
     return []
 
 def save_history(history: List[Dict]):
-    """保存历史记录"""
+    """������ʷ��¼"""
     with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 def get_file_hash(file_path: str) -> str:
-    """计算文件 MD5 Hash"""
+    """�����ļ� MD5 Hash"""
     hash_md5 = hashlib.md5()
     with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):
@@ -141,7 +230,7 @@ def get_file_hash(file_path: str) -> str:
     return hash_md5.hexdigest()
 
 def check_file_exists(file_hash: str) -> Optional[Dict]:
-    """检查文件是否已存在"""
+    """����ļ��Ƿ��Ѵ���"""
     history = load_history()
     for item in history:
         if item.get('file_hash') == file_hash and item.get('status') == 'completed':
@@ -149,7 +238,7 @@ def check_file_exists(file_hash: str) -> Optional[Dict]:
     return None
 
 def add_file_record(file_id: str, filename: str, file_hash: str, pdf_path: str, md_path: str, status: str = "processing", task_id: str = None):
-    """添加文件记录"""
+    """����ļ���¼"""
     history = load_history()
     record = {
         "file_id": file_id,
@@ -166,7 +255,7 @@ def add_file_record(file_id: str, filename: str, file_hash: str, pdf_path: str, 
     return record
 
 def update_file_status(file_id: str, status: str, md_path: str = None):
-    """更新文件状态"""
+    """�����ļ�״̬"""
     history = load_history()
     for item in history:
         if item.get('file_id') == file_id:
@@ -177,13 +266,13 @@ def update_file_status(file_id: str, status: str, md_path: str = None):
     save_history(history)
 
 def delete_file_record(file_id: str) -> bool:
-    """删除文件记录"""
+    """ɾ���ļ���¼"""
     history = load_history()
     new_history = []
     deleted = False
     for item in history:
         if item.get('file_id') == file_id:
-            # 删除文件
+            # ɾ���ļ�
             if os.path.exists(item.get('pdf_path', '')):
                 try:
                     os.remove(item['pdf_path'])
@@ -200,38 +289,38 @@ def delete_file_record(file_id: str) -> bool:
     save_history(new_history)
     return deleted
 
-# ==================== 任务管理 ====================
+# ==================== ������� ====================
 
 tasks: Dict[str, Task] = {}
 
 def create_task(task_id: str) -> Task:
-    """创建新任务"""
+    """����������"""
     tasks[task_id] = Task(task_id)
-    logger.info(f"任务已创建: {task_id}, 当前任务数: {len(tasks)}")
+    logger.info(f"�����Ѵ���: {task_id}, ��ǰ������: {len(tasks)}")
     return tasks[task_id]
 
 def get_task(task_id: str) -> Optional[Task]:
     """
-    获取任务状态
-    优先从内存获取，如果内存中不存在（如服务重启），尝试从历史记录恢复状态
+    ��ȡ����״̬
+    ���ȴ��ڴ��ȡ������ڴ��в����ڣ����������������Դ���ʷ��¼�ָ�״̬
     """
-    # 1. 尝试从内存获取
+    # 1. ���Դ��ڴ��ȡ
     if task_id in tasks:
         return tasks[task_id]
     
-    # 2. 尝试从历史记录查找
+    # 2. ���Դ���ʷ��¼����
     history = load_history()
     for item in history:
         if item.get('task_id') == task_id:
-            # 重建任务对象
+            # �ؽ��������
             restored_task = Task(task_id)
             status = item.get('status', 'failed')
             
             if status == 'completed':
                 restored_task.status = TaskStatus.COMPLETED
                 restored_task.progress = 100
-                restored_task.message = "处理完成（已恢复）"
-                # 尝试加载结果内容
+                restored_task.message = "������ɣ��ѻָ���"
+                # ���Լ��ؽ������
                 if os.path.exists(item.get('md_path', '')):
                     try:
                         with open(item['md_path'], 'r', encoding='utf-8') as f:
@@ -239,92 +328,58 @@ def get_task(task_id: str) -> Optional[Task]:
                     except:
                         pass
             elif status == 'processing':
-                # 关键：如果历史记录是 processing 但内存里没有，说明服务重启了，任务已中断
+                # �ؼ��������ʷ��¼�� processing ���ڴ���û�У�˵�����������ˣ��������ж�
                 restored_task.status = TaskStatus.FAILED
                 restored_task.progress = 0
-                restored_task.message = "服务已重启，任务被中断。请重新上传。"
+                restored_task.message = "����������������жϡ��������ϴ���"
                 restored_task.error = "Server restarted"
-                # 顺便更新历史记录状态，避免下次还误判
+                # ˳�������ʷ��¼״̬�������´λ�����
                 update_file_status(item['file_id'], 'failed')
             else:
                 restored_task.status = TaskStatus.FAILED
-                restored_task.message = "任务执行失败"
+                restored_task.message = "����ִ��ʧ��"
             
             return restored_task
             
     return None
 
-# ==================== 任务处理 ====================
+# ==================== ������ ====================
 
 async def process_document_task(task_id: str, file_location: str, file_id: str, original_filename: str):
     """
-    异步处理文档任务
+    �첽�����ĵ�����
     """
-    logger.info(f"开始处理任务: {task_id}")
+    logger.info(f"��ʼ��������: {task_id}")
     task = get_task(task_id)
     
     if not task:
-        logger.error(f"任务不存在: {task_id}")
+        logger.error(f"���񲻴���: {task_id}")
         return
 
     try:
-        # 阶段1: PDF 解析 (0-40%)
+        # �׶�1: PDF ���� (0-40%)
         task.status = TaskStatus.PROCESSING
         task.progress = 5
-        task.message = "正在解析 PDF 文档..."
-        logger.info(f"任务 {task_id}: 开始解析 PDF")
+        task.message = "���ڽ��� PDF �ĵ�..."
+        logger.info(f"���� {task_id}: ��ʼ���� PDF")
         
         md_content = process_pdf_safely(file_location)
         
         if not md_content:
-            raise Exception("PDF 解析失败")
+            raise Exception("PDF ����ʧ��")
         
         task.progress = 40
-        task.message = "文档解析完成，正在生成思维导图..."
-        logger.info(f"任务 {task_id}: PDF 解析完成")
-
+        task.message = "�ĵ�������ɣ���������˼ά��ͼ..."
+        logger.info(f"���� {task_id}: PDF �������")
         # 阶段2: 文本分块 (40-50%)
         task.progress = 45
         task.message = "正在分块处理内容..."
         
-        # 智能分块：尝试多种分隔符
-        # 1. 先尝试 ## 标题
-        chunks = md_content.split("\n## ")
-        if len(chunks) > 1:
-            chunks = [f"## {c}" for c in chunks if c.strip()]
-        else:
-            # 2. 尝试 # 标题
-            chunks = md_content.split("\n# ")
-            if len(chunks) > 1:
-                chunks = [f"# {c}" for c in chunks if c.strip()]
-            else:
-                # 3. 尝试按数字标题 (1. xxx, 2. xxx)
-                import re
-                # 按 "数字. " 分割
-                parts = re.split(r'\n(\d+\.\s+)', '\n' + md_content)
-                if len(parts) > 1:
-                    chunks = []
-                    for i in range(1, len(parts), 2):
-                        if i+1 < len(parts):
-                            title = parts[i].strip()
-                            content = parts[i+1].strip()
-                            chunks.append(f"# {title}\n{content}")
-                else:
-                    # 4. 最后按换行分段（每 3000 字符为一个块）
-                    chunks = []
-                    current_chunk = ""
-                    for line in md_content.split('\n'):
-                        current_chunk += line + '\n'
-                        if len(current_chunk) > 3000:
-                            if current_chunk.strip():
-                                chunks.append(current_chunk.strip())
-                            current_chunk = ""
-                    if current_chunk.strip():
-                        chunks.append(current_chunk.strip())
+        # 使用智能分块函数，保留章节标题
+        chunks = parse_markdown_chunks(md_content)
         
         task.progress = 50
         task.message = f"已分块，共 {len(chunks)} 个章节"
-        logger.info(f"任务 {task_id}: 分块完成，共 {len(chunks)} 个章节")
 
         # 阶段3: DeepSeek AI 处理 (50-95%)
         task.progress = 50
@@ -333,40 +388,40 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         mindmap_md = await generate_mindmap_structure(chunks, task)
         
         if not mindmap_md:
-            raise Exception("AI 生成失败")
+            raise Exception("AI ����ʧ��")
         
-        # 保存 MD 文件
+        # ���� MD �ļ�
         md_path = os.path.join(MD_DIR, f"{file_id}.md")
         with open(md_path, 'w', encoding='utf-8') as f:
             f.write(mindmap_md)
         
-        # 更新文件记录状态
+        # �����ļ���¼״̬
         update_file_status(file_id, 'completed', md_path)
         
-        # 阶段4: 完成
+        # �׶�4: ���
         task.status = TaskStatus.COMPLETED
         task.progress = 100
-        task.message = "处理完成！"
+        task.message = "������ɣ�"
         task.result = mindmap_md
-        logger.info(f"任务 {task_id}: 处理完成")
+        logger.info(f"���� {task_id}: �������")
 
     except Exception as e:
-        logger.error(f"任务 {task_id} 处理失败: {e}")
+        logger.error(f"���� {task_id} ����ʧ��: {e}")
         task.status = TaskStatus.FAILED
         task.error = str(e)
-        task.message = f"处理失败: {str(e)}"
+        task.message = f"����ʧ��: {str(e)}"
         update_file_status(file_id, 'failed')
 
     finally:
-        # 清理临时文件
+        # ������ʱ�ļ�
         if os.path.exists(file_location):
             try:
                 os.remove(file_location)
-                logger.info(f"临时文件已清理: {file_location}")
+                logger.info(f"��ʱ�ļ�������: {file_location}")
             except Exception as e:
-                logger.warning(f"清理临时文件失败: {e}")
+                logger.warning(f"������ʱ�ļ�ʧ��: {e}")
 
-# ==================== API 路由 ====================
+# ==================== API ·�� ====================
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -395,84 +450,84 @@ class HistoryItem(BaseModel):
 @app.post("/upload", response_model=UploadResponse)
 async def upload_document(file: UploadFile = File(...)):
     """
-    上传文档并创建异步任务
+    �ϴ��ĵ��������첽����
     """
-    # 生成唯一 ID
+    # ����Ψһ ID
     file_id = str(uuid.uuid4())
     task_id = str(uuid.uuid4())
     
-    logger.info(f"收到上传请求: {file_id}, 文件名: {file.filename}")
+    logger.info(f"�յ��ϴ�����: {file_id}, �ļ���: {file.filename}")
     
-    # 保存文件
+    # �����ļ�
     temp_file = os.path.join(DATA_DIR, "temp", f"{file_id}_{file.filename}")
     os.makedirs(os.path.dirname(temp_file), exist_ok=True)
     
     try:
         with open(temp_file, "wb+") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        logger.info(f"文件已保存: {temp_file}")
+        logger.info(f"�ļ��ѱ���: {temp_file}")
     except Exception as e:
-        logger.error(f"文件保存失败: {e}")
-        raise HTTPException(status_code=500, detail=f"文件保存失败: {str(e)}")
+        logger.error(f"�ļ�����ʧ��: {e}")
+        raise HTTPException(status_code=500, detail=f"�ļ�����ʧ��: {str(e)}")
     
-    # 计算文件 Hash
+    # �����ļ� Hash
     file_hash = get_file_hash(temp_file)
-    logger.info(f"文件 Hash: {file_hash}")
+    logger.info(f"�ļ� Hash: {file_hash}")
     
-    # 检查是否重复
+    # ����Ƿ��ظ�
     existing = check_file_exists(file_hash)
     if existing:
-        # 删除临时文件
+        # ɾ����ʱ�ļ�
         os.remove(temp_file)
         
-        # 读取已存在的 MD
+        # ��ȡ�Ѵ��ڵ� MD
         existing_md = ""
         if os.path.exists(existing['md_path']):
             with open(existing['md_path'], 'r', encoding='utf-8') as f:
                 existing_md = f.read()
         
-        logger.info(f"检测到重复文件: {file.filename}")
+        logger.info(f"��⵽�ظ��ļ�: {file.filename}")
         return UploadResponse(
             task_id=task_id,
             file_id=existing['file_id'],
             status="completed",
-            message="文件已存在，直接加载",
+            message="�ļ��Ѵ��ڣ�ֱ�Ӽ���",
             is_duplicate=True,
             existing_md=existing_md
         )
     
-    # 移动到正式目录
+    # �ƶ�����ʽĿ¼
     pdf_path = os.path.join(PDF_DIR, f"{file_id}_{file.filename}")
     shutil.move(temp_file, pdf_path)
     
-    # 创建文件记录
+    # �����ļ���¼
     md_path = os.path.join(MD_DIR, f"{file_id}.md")
     add_file_record(file_id, file.filename, file_hash, pdf_path, md_path, "processing", task_id=task_id)
     
-    # 创建任务
+    # ��������
     task = create_task(task_id)
     
-    # 创建后台任务
+    # ������̨����
     asyncio.create_task(process_document_task(task_id, pdf_path, file_id, file.filename))
-    logger.info(f"后台任务已创建: {task_id}")
+    logger.info(f"��̨�����Ѵ���: {task_id}")
     
     return UploadResponse(
         task_id=task_id,
         file_id=file_id,
         status="processing",
-        message="任务已创建，正在处理..."
+        message="�����Ѵ��������ڴ���..."
     )
 
 @app.get("/task/{task_id}", response_model=TaskResponse)
 async def get_task_status(task_id: str):
     """
-    获取任务状态（用于前端轮询）
+    ��ȡ����״̬������ǰ����ѯ��
     """
     task = get_task(task_id)
     
     if not task:
-        logger.warning(f"任务不存在: {task_id}")
-        raise HTTPException(status_code=404, detail="任务不存在")
+        logger.warning(f"���񲻴���: {task_id}")
+        raise HTTPException(status_code=404, detail="���񲻴���")
     
     return TaskResponse(
         task_id=task.task_id,
@@ -486,10 +541,10 @@ async def get_task_status(task_id: str):
 @app.get("/history", response_model=List[HistoryItem])
 async def get_history():
     """
-    获取文件历史列表
+    ��ȡ�ļ���ʷ�б�
     """
     history = load_history()
-    # 只返回需要的字段
+    # ֻ������Ҫ���ֶ�
     return [
         HistoryItem(
             file_id=item['file_id'],
@@ -505,37 +560,37 @@ async def get_history():
 @app.get("/file/{file_id}")
 async def get_file_content(file_id: str):
     """
-    获取文件的 MD 内容
+    ��ȡ�ļ��� MD ����
     """
     history = load_history()
     for item in history:
         if item['file_id'] == file_id:
             if item['status'] != 'completed':
-                raise HTTPException(status_code=400, detail="文件尚未处理完成")
+                raise HTTPException(status_code=400, detail="�ļ���δ�������")
             
             if not os.path.exists(item['md_path']):
-                raise HTTPException(status_code=404, detail="文件不存在")
+                raise HTTPException(status_code=404, detail="�ļ�������")
             
             with open(item['md_path'], 'r', encoding='utf-8') as f:
                 content = f.read()
             
             return {"content": content, "filename": item['filename']}
     
-    raise HTTPException(status_code=404, detail="文件记录不存在")
+    raise HTTPException(status_code=404, detail="�ļ���¼������")
 
 @app.delete("/file/{file_id}")
 async def delete_file(file_id: str):
     """
-    删除文件记录
+    ɾ���ļ���¼
     """
     if delete_file_record(file_id):
-        return {"message": "文件已删除"}
-    raise HTTPException(status_code=404, detail="文件不存在")
+        return {"message": "�ļ���ɾ��"}
+    raise HTTPException(status_code=404, detail="�ļ�������")
 
 @app.get("/export/xmind/{file_id}")
 async def export_xmind(file_id: str):
     """
-    导出 XMind 格式
+    ���� XMind ��ʽ
     """
     from fastapi.responses import Response
     
@@ -543,15 +598,15 @@ async def export_xmind(file_id: str):
     for item in history:
         if item['file_id'] == file_id:
             if item['status'] != 'completed':
-                raise HTTPException(status_code=400, detail="文件尚未处理完成")
+                raise HTTPException(status_code=400, detail="�ļ���δ�������")
             
             if not os.path.exists(item['md_path']):
-                raise HTTPException(status_code=404, detail="文件不存在")
+                raise HTTPException(status_code=404, detail="�ļ�������")
             
             with open(item['md_path'], 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            # 生成 XMind
+            # ���� XMind
             xmind_data = generate_xmind_content(content, item['filename'])
             
             filename = item['filename'].replace('.pdf', '') + '.xmind'
@@ -562,19 +617,19 @@ async def export_xmind(file_id: str):
                 headers={"Content-Disposition": f"attachment; filename={filename}"}
             )
     
-    raise HTTPException(status_code=404, detail="文件记录不存在")
+    raise HTTPException(status_code=404, detail="�ļ���¼������")
 
 @app.post("/export/xmind")
 async def export_xmind_from_content(request: Request):
     """
-    直接从 Markdown 内容导出 XMind
+    ֱ�Ӵ� Markdown ���ݵ��� XMind
     """
     request_data = await request.json()
     content = request_data.get('content', '')
     filename = request_data.get('filename', 'mindmap')
     
     if not content:
-        raise HTTPException(status_code=400, detail="内容不能为空")
+        raise HTTPException(status_code=400, detail="���ݲ���Ϊ��")
     
     xmind_data = generate_xmind_content(content, filename)
     
@@ -586,54 +641,55 @@ async def export_xmind_from_content(request: Request):
 
 @app.get("/health")
 async def health_check():
-    """健康检查"""
+    """�������"""
     return {"status": "ok", "tasks_count": len(tasks)}
 
-# ==================== 设置 API ====================
+# ==================== ���� API ====================
 @app.get("/config")
 async def get_config():
-    """获取当前配置"""
+    """��ȡ��ǰ����"""
     config = load_config()
-    # 不暴露完整的 api_key
+    # ����¶������ api_key
     config["api_key"] = "***" if config.get("api_key") else ""
     return config
 
 @app.post("/config")
 async def set_config(config: Dict):
-    """保存配置"""
-    # 如果 API Key 是掩码，则保留原有 Key
+    """��������"""
+    # ��� API Key �����룬����ԭ�� Key
     if config.get("api_key") == "***":
         existing_config = load_config()
         config["api_key"] = existing_config.get("api_key", "")
     
-    # 确保 account_type 存在
+    # ȷ�� account_type ����
     if "account_type" not in config:
         existing_config = load_config()
         config["account_type"] = existing_config.get("account_type", "free")
     
     save_config(config)
-    # 更新运行时配置
+    # ��������ʱ����
     update_client_config(config)
     set_model(config.get("model", "deepseek-chat"))
-    # 设置账户类型
+    # �����˻�����
     set_account_type(config.get("account_type", "free"))
-    return {"message": "配置已保存"}
+    return {"message": "�����ѱ���"}
 
 @app.post("/config/test")
 async def test_config(request: Request):
-    """测试配置"""
+    """��������"""
     try:
         request_data = await request.json()
         
-        # 如果 API Key 是掩码，则使用原有 Key 进行测试
+        # ��� API Key �����룬��ʹ��ԭ�� Key ���в���
         if request_data.get("api_key") == "***":
             existing_config = load_config()
-            # 只有当原有配置中有 Key 时才替换
+            # ֻ�е�ԭ���������� Key ʱ���滻
             if existing_config.get("api_key"):
                 request_data["api_key"] = existing_config.get("api_key")
                 
         result = await test_connection(request_data)
         return result
     except Exception as e:
-        logger.error(f"测试配置出错: {e}")
-        return {"success": False, "message": f"服务器内部错误: {str(e)}"}
+        logger.error(f"�������ó���: {e}")
+        return {"success": False, "message": f"�������ڲ�����: {str(e)}"}
+
