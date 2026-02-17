@@ -384,17 +384,7 @@ async def generate_root_summary(full_markdown: str):
         print(f"Error generating root summary: {e}")
         return "# Document Analysis"
 
-async def generate_mindmap_structure(chunks, task=None):
-    """
-    Map-Reduce 实现 - 优化版
-    - MAP: 并发处理各个章节
-    - REDUCE: 智能合并，确保层级结构正确，避免扁平化
 
-    关键修复：
-    1. 不再简单拼接，而是确保每个 chunk 的输出都遵循统一的层级规范
-    2. 移除可能导致层级混乱的 header 替换逻辑
-    3. 确保章节间的结构清晰分离
-    """
 async def extract_global_outline(full_text: str) -> dict:
     """
     Pass 1: 提取全局目录骨架
