@@ -32,14 +32,17 @@ def parse_markdown_to_tree(markdown: str) -> Dict[str, Any]:
        - H2 (##): level 2 (主分支)
        - H3 (###): level 3 (子分支)
        - H4 (####): level 4 (细节)
-       - 列表项：基于缩进，无缩进列表项 level=2，每缩进 2 空格增加 1 级
-    3. 关键修复：所有节点统一使用栈管理，标题和列表项都能正确嵌套
+       - 列表项：基于最近标题的 level + 1 + indent，确保相对于父标题定位
+    3. 关键修复：列表项 level 基于 last_header_level 而非 stack top，防止层级漂移
     """
     lines = markdown.strip().split('\n')
     root = {"id": "root", "title": "思维导图", "children": []}
 
     # stack 存储元组 (level, node, is_header)
     stack = [(0, root, False)]
+    
+    # 跟踪最近一个标题的级别，用于列表项定位
+    last_header_level = 1  # 默认 H1 (root)
 
     for line in lines:
         stripped = line.strip()
@@ -68,11 +71,13 @@ def parse_markdown_to_tree(markdown: str) -> Dict[str, Any]:
                 if h_mark == '#':
                     root['title'] = node_text
                     stack = [(0, root, False)]
+                    last_header_level = 1
                     continue
 
                 # H2-H6: level = header 数量
                 level = len(h_mark)
                 is_header = True
+                last_header_level = level  # 更新最近标题级别
 
                 # 清理文本
                 node_text = clean_node_text(node_text)
@@ -83,18 +88,20 @@ def parse_markdown_to_tree(markdown: str) -> Dict[str, Any]:
             if next_char == ' ' or next_char == '':
                 # 提取列表内容
                 node_text = stripped.lstrip('-*+').lstrip()
-                # 列表的 level = 基础级别 + 缩进级别
-                # 无缩进的列表项 level=2（与 H2 同级或作为当前标题的子节点）
-                # 每缩进 2 空格增加 1 级
+                # 关键修复：基于 last_header_level 而非 stack top 定位
+                # 无缩进列表项 = last_header_level + 1（作为当前标题的子节点）
+                # 每缩进 2 空格再增加 1 级
                 indent_level = raw_indent // 2
-                level = 2 + indent_level
+                level = last_header_level + 1 + indent_level
             else:
                 node_text = stripped
-                level = 2 + (raw_indent // 2)
+                indent_level = raw_indent // 2
+                level = last_header_level + 1 + indent_level
         else:
             # 普通文本行，按缩进处理
             node_text = stripped
-            level = 2 + (raw_indent // 2)
+            indent_level = raw_indent // 2
+            level = last_header_level + 1 + indent_level
 
         # 如果节点文本为空，跳过
         if not node_text:

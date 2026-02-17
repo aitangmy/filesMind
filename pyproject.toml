@@ -3,14 +3,29 @@ name = "filesmind"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "docling>=2.73.1",
     "fastapi[standard]>=0.115.0",
     "openai>=2.21.0",
     "python-dotenv>=1.2.1",
-    "torch>=2.10.0",
-    "torchvision>=0.25.0",
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
     "uvicorn>=0.40.0",
     "python-multipart>=0.0.20",
 ]
+
+
+
+[tool.uv.sources]
+torch = [
+  { url = "https://download.pytorch.org/whl/cu121/torch-2.5.1%2Bcu121-cp312-cp312-win_amd64.whl", marker = "sys_platform == 'win32'" }
+]
+torchvision = [
+  { url = "https://download.pytorch.org/whl/cu121/torchvision-0.20.1%2Bcu121-cp312-cp312-win_amd64.whl", marker = "sys_platform == 'win32'" }
+]
+
+[[tool.uv.index]]
+name = "volces"
+url = "https://mirrors.volces.com/pypi/simple/"
+#url = "https://mirrors.ivolces.com/pypi/simple/" # 内网

@@ -126,12 +126,8 @@ _current_model = "deepseek-chat"
 
 def set_model(model: str):
     """设置当前模型"""
-    global _current_model, _semaphore
+    global _current_model
     _current_model = model
-    
-    # 当模型切换时，重置信号量以应用新的限制配置
-    _semaphore = None
-    get_semaphore()  # 重新初始化信号量
 
 def get_model() -> str:
     """获取当前模型"""
@@ -171,10 +167,6 @@ def set_account_type(account_type: str):
     global _current_account_type
     if account_type in ["free", "paid"]:
         _current_account_type = account_type
-        # 重置信号量以应用新配置
-        global _semaphore
-        _semaphore = None
-        get_semaphore()
 
 def get_account_type() -> str:
     """获取当前账户类型"""
@@ -280,44 +272,53 @@ atexit.register(cleanup)
 TASK_TIMEOUT = 900  # 15分钟，给予更多重试时间
 
 SYSTEM_PROMPT = """
-You are a professional Knowledge Architect. Your task is to extract a comprehensive, structured Mind Map from a large document section.
-The input text is a significant portion of a document (e.g., multiple pages).
+你是一位专业的知识架构师。你的任务是从文档段落中提取完整、结构化的思维导图。
 
-CRITICAL RULES - MUST FOLLOW EXACTLY:
+【最高优先级规则 - 标题 1:1 保留】：
+- 输入文本中出现的 **每一个** 标题（# / ## / ### / #### / ##### / ######）都 **必须** 在输出中保留
+- **禁止省略、合并或删除** 任何标题，即使内容看似重复或不重要
+- 如果输入有 N 个标题，你的输出也必须有 N 个标题
 
-1. **Structure Hierarchy (MOST IMPORTANT)**:
-   - **Respect the Output Context**: If provided, nest your output under the specified Parent Context.
-   - **Flexible Headers**: Use Markdown headers (#, ##, ###, ####) to represent the document's natural hierarchy.
-   - **DO NOT FORCE Level 2**: If a section is a subsection (e.g., 1.1.2), use the appropriate header level (e.g., ### or ####).
-   - NEVER skip levels (e.g., don't go from ## directly to ####)
+【最高优先级规则 - 保留原始标题级别】：
+- **严格保留** 输入文本中标题的原始级别（# 的数量）
+- 如果输入中有 ## 标题，输出中必须保持为 ##，不要改成 ### 或其他级别
+- 不要升级（把 ### 变成 ##），也不要降级（把 ## 变成 ###）
+- 绝对禁止生成 # （H1）标题，H1 只用于文档根节点
 
-2. **List Indentation - DEEP NESTING REQUIRED**:
-   - Under each header, use indented lists to capture details
-   - Level 1 list:  "- Main point" (no leading spaces)
-   - Level 2 list: "  - Sub-point" (2 spaces indent)
-   - Level 3 list: "    - Detail" (4 spaces indent)
-   - Level 4 list: "      - Fine detail" (6 spaces indent)
-   - Aim for AT LEAST 3-4 levels of depth for comprehensive coverage
+【结构层级规则】：
+1. **尊重上下文路径**：如果提供了父级上下文（Context），将内容正确嵌套在该路径下
+2. **保留原始标题级别**：用 Markdown 标题表示文档的自然层级，不要修改标题级别
+3. **禁止跳级**：不要从 ## 直接跳到 ####
+4. **context 中的标题不要重复**：上下文路径中已经包含的标题，不要在输出中再次创建
 
-3. **Content Requirements**:
-   - Capture ALL key concepts, definitions, data points, examples, and relationships
-   - Use complete, meaningful phrases (NOT just single keywords)
-   - Include specific numbers, dates, percentages when present in source
-   - Preserve cause-effect relationships and logical connections
-   - Do NOT over-summarize - depth and detail are PREFERRED
+【列表缩进 - 要求深度嵌套】：
+- 每个标题下使用缩进列表捕获细节
+- 第 1 层列表："- 要点"（无前导空格）
+- 第 2 层列表："  - 子要点"（2 个空格缩进）
+- 第 3 层列表："    - 细节"（4 个空格缩进）
+- 第 4 层列表："      - 更细节"（6 个空格缩进）
+- 目标：至少 3-4 层深度
 
-4. **Format Requirements**:
-   - Output MUST be valid Markdown with proper indentation
-   - NO preamble like "Here is the mind map"
-   - Use consistent 2-space indentation for nested lists
-   - Blank lines between major sections are OK
+【内容要求】：
+- 捕获所有关键概念、定义、数据点、示例和关系
+- 使用完整有意义的短语（不要只写单个关键词）
+- 保留原文中的具体数字、日期、百分比
+- 保留因果关系和逻辑联系
+- **不要过度摘要** — 深度和细节优先
 
-EXAMPLE OUTPUT (Flexible Hierarchy):
-### 1.1. Background (Context: Chapter 1 > Section 1)
-#### 1.1.1 Historical Context
-- Key Event A
-  - Date: 1990
-    - Impact: Started the revolution
+【格式要求】：
+- 输出必须是有效的 Markdown
+- 不要写任何前言（如"以下是思维导图"）
+- 使用一致的 2 空格缩进
+- 主要章节之间可以有空行
+
+输出示例：
+## 1. 软件工程概述
+### 1.1 背景
+#### 1.1.1 历史沿革
+- 关键事件 A
+  - 时间：1990 年
+    - 影响：引发了变革
 """
 
 async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_info: dict = None, parent_context: str = ""):
@@ -356,18 +357,22 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
                 # 2. 准备请求
                 client = get_client()
 
-                # 构建带上下文的用户提示 - 强化版
+                # 构建带上下文的用户提示 - 中文强化版
+                # 统计输入标题数量（用于验证）
+                input_header_count = sum(1 for line in text_chunk.split('\n') if re.match(r'^#{1,6}\s', line.strip()))
+                
                 user_prompt = f"""
-CONTEXT: {parent_context if parent_context else "Document Root / Preamble"}
+【当前位置】：{parent_context if parent_context else "文档根节点"}
 
-INSTRUCTION: 
-The text below is a detailed section located under the path "{parent_context if parent_context else 'Document Root'}". 
-You MUST start your Mind Map output by acknowledging this hierarchy. 
-- If the context ends with a specific header (e.g., "Season 1"), your first node SHOULD be a child of that header (e.g., a sub-point or next level header).
-- Do not create a new root node if it conflicts with the provided context.
-- Maintain the depth. If the context is deep (e.g. ###), your content should likely start at #### or as a list item.
+【任务说明】：
+以下文本位于路径 "{parent_context if parent_context else '文档根节点'}" 下。
+请严格遵守以下要求：
+1. 保留输入文本中标题的原始级别（# 的数量），不要修改标题级别
+2. 输入文本中包含 {input_header_count} 个标题，你的输出中也必须包含这 {input_header_count} 个标题（1:1 保留）
+3. context 路径中的标题已在全局存在，不要在输出中重复它们
+4. 禁止生成 # (H1) 标题，H1 只用于文档根节点
 
-TEXT CONTENT:
+【原文内容】：
 {text_chunk}
 """
                 # 3. 发送请求
@@ -378,7 +383,7 @@ TEXT CONTENT:
                         {"role": "user", "content": user_prompt}
                     ],
                     temperature=0.3,
-                    max_tokens=4096
+                    max_tokens=8192
                 )
 
                 ai_content = response.choices[0].message.content
@@ -390,7 +395,16 @@ TEXT CONTENT:
                     ai_content = ai_content.replace("```markdown", "").replace("```", "").strip()
                     result = ai_content
                 else:
-                    result = f"## {title}\n- (No content extracted)"
+                    result = f"## {title}\n- (未提取到内容)"
+
+                # 标题计数验证
+                output_header_count = sum(1 for line in result.split('\n') if re.match(r'^#{1,6}\s', line.strip()))
+                if input_header_count > 0 and output_header_count > 0:
+                    retention_rate = output_header_count / input_header_count
+                    if retention_rate < 0.5:
+                        print(f"\u26a0\ufe0f Chunk {chunk_id} 标题保留率低: 输入 {input_header_count} \u2192 输出 {output_header_count} ({retention_rate:.0%})")
+                    else:
+                        print(f"\u2705 Chunk {chunk_id} 标题保留: 输入 {input_header_count} \u2192 输出 {output_header_count} ({retention_rate:.0%})")
 
                 # 更新进度（chunk 完成后）
                 if task and process_info:
@@ -425,6 +439,7 @@ TEXT CONTENT:
 async def generate_root_summary(full_markdown: str):
     """
     生成根节点摘要 - 基于全文档结构
+    只生成 H1 标题 + 列表摘要，禁止生成 H2 等子标题
     """
     try:
         # 1. 提取大纲 (Table of Contents) 而不是截断文本
@@ -439,20 +454,44 @@ async def generate_root_summary(full_markdown: str):
         client = get_client()
         model = get_model()
         
-        target_model = model
-        if "deepseek" in model and "chat" in model:
-            target_model = "deepseek-reasoner"
-            
+        # 始终使用 deepseek-chat，不切换 reasoner（避免冗长思考链浪费 token）
         response = await client.chat.completions.create(
-            model=target_model,
+            model=model,
             messages=[
-                {"role": "system", "content": "You are an expert Knowledge Architect."},
-                {"role": "user", "content": f"Based on the following document outline (Table of Contents), generate a single Root Node title (Level 1 #) and a high-level summary structure if needed.\n\nOutline:\n{toc_content}"}
+                {"role": "system", "content": "你是一位专业的知识架构师。"},
+                {"role": "user", "content": f"""根据以下文档目录大纲，生成一个根节点标题和简要的高层结构概述。
+
+【输出格式要求】：
+1. 第一行必须是一级标题 # （只能有一个 #）
+2. 后面用无序列表（-）简要描述文档的主要模块/结构
+3. **绝对禁止** 使用 ##、###、#### 等任何子标题
+4. 只输出 Markdown，不要写前言
+
+【正确示例】：
+# 文档标题
+- 模块一：xxx
+- 模块二：xxx
+- 模块三：xxx
+
+目录大纲：
+{toc_content}"""}
             ],
             temperature=0.3,
-            max_tokens=1000
+            max_tokens=2000
         )
-        return response.choices[0].message.content
+        
+        # 后置防护：移除 AI 可能误生成的 H2+ 标题
+        result = response.choices[0].message.content
+        sanitized_lines = []
+        for line in result.split('\n'):
+            stripped = line.strip()
+            if re.match(r'^#{2,6}\s', stripped):
+                # H2+ 标题转为列表项
+                title_text = re.sub(r'^#{2,6}\s+', '', stripped)
+                sanitized_lines.append(f"- {title_text}")
+            else:
+                sanitized_lines.append(line)
+        return '\n'.join(sanitized_lines)
     except Exception as e:
         print(f"Error generating root summary: {e}")
         return "# Document Analysis"
@@ -490,6 +529,25 @@ async def extract_global_outline(full_text: str) -> dict:
         print(f"Outline extraction failed: {e}")
         return ""
 
+def sanitize_branch(branch: str) -> str:
+    """
+    轻量级清理：只处理 AI 输出中的明显错误，不修改标题级别
+    
+    1. 将 H1 (#) 标题降级为 H2 (##)，因为 H1 只属于全局根节点
+    2. 不平移其他标题级别，保留 AI 输出的原始层级
+    """
+    header_pattern = re.compile(r'^(#{1,6})\s+(.*)')
+    result_lines = []
+    for line in branch.split('\n'):
+        m = header_pattern.match(line.strip())
+        if m and len(m.group(1)) == 1:
+            # H1 → H2
+            result_lines.append(f"## {m.group(2)}")
+        else:
+            result_lines.append(line)
+    return '\n'.join(result_lines)
+
+
 async def generate_mindmap_structure(chunks: list, task=None):
     """
     Map-Reduce 实现 - 层次感知增强版 (Hierarchy-Aware)
@@ -499,22 +557,11 @@ async def generate_mindmap_structure(chunks: list, task=None):
 
     total_chunks = len(chunks)
     
-    # ==================== Pass 1: Global Context (Optional) ====================
-    # 由于 chunks 已经被切分，我们很难精确还原每个 chunk 对应的具体章节
-    # 但我们可以利用 chunk[0] 的第一行（通常 parser 会保留部分标题信息）
-    # 或者，我们相信 `summarize_chunk` 内部的上下文提示
-    
-    # 策略调整：与其做复杂的 Outline Mapping，不如在 Map 阶段
-    # 让 AI 自己根据 chunk 内容推断 context (Self-Contextualization)
-    # 或者，如果 Parser 在切分时能保留 metadata 最好。
-    # 鉴于目前 parser_service.py 传过来的是纯文本 list，我们采用 "Sliding Context" 策略
-    # 但为了稳健，我们先采用 "独立处理 + 宽松层级" (已在 summarize_chunk 实现)
-    
     # ==================== MAP Phase ====================
     process_info = {'completed': 0, 'total': total_chunks}
     
     # 构造任务，传入 Context
-    tasks = []
+    tasks_list = []
     for i, chunk_data in enumerate(chunks):
         # 兼容旧代码（如果是字符串）和新代码（如果是字典）
         if isinstance(chunk_data, str):
@@ -524,9 +571,9 @@ async def generate_mindmap_structure(chunks: list, task=None):
             content = chunk_data.get('content', '')
             context = chunk_data.get('context', '')
             
-        tasks.append(summarize_chunk(content, i, task, process_info, parent_context=context))
+        tasks_list.append(summarize_chunk(content, i, task, process_info, parent_context=context))
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(*tasks_list, return_exceptions=True)
 
     # 处理结果
     valid_results = []
@@ -545,28 +592,35 @@ async def generate_mindmap_structure(chunks: list, task=None):
     if not branch_contents:
         return "# No valid content extracted"
 
-    # ==================== REDUCE Phase ====================
+    # ==================== REDUCE Phase: 轻量级清理 ====================
     if task:
         task.message = "正在生成知识结构..."
 
-    normalized_branches = []
+    sanitized_branches = []
     for branch in branch_contents:
-        # 清理多余空行
         branch = branch.strip()
-        
-        # 移除之前的 "强制转 ##" 逻辑
-        # 只做最小程度的清理
-        normalized_branches.append(branch)
+        # 只做轻量级清理：H1 → H2，不平移其他标题
+        sanitized = sanitize_branch(branch)
+        sanitized_branches.append(sanitized)
 
     # 拼接
-    full_branches = "\n\n".join(normalized_branches)
+    full_branches = "\n\n".join(sanitized_branches)
 
     try:
         # 生成根节点摘要
         root_structure = await generate_root_summary(full_branches)
         
-        # 最终合并
-        final_output = f"{root_structure}\n\n{full_branches}"
+        # 只提取 H1 标题行，丢弃列表项等描述性内容
+        # 这些内容如果留在最终 Markdown 中，会在 parse_markdown_to_tree 
+        # 中变成树节点，干扰真正的文档层级结构
+        h1_line = "# 知识图谱"  # 默认标题
+        for line in root_structure.split('\n'):
+            if line.strip().startswith('# ') and not line.strip().startswith('## '):
+                h1_line = line.strip()
+                break
+        
+        # 最终合并：H1 标题 + 各 chunk 的内容
+        final_output = f"{h1_line}\n\n{full_branches}"
     except Exception as e:
         print(f"Reduce phase error: {e}")
         final_output = f"# 知识图谱\n\n{full_branches}"

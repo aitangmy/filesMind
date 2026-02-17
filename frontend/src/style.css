@@ -87,7 +87,7 @@ body {
 }
 
 .card-hover:hover {
-    @apply shadow-medium;
+    box-shadow: 0 4px 25px rgba(0, 0, 0, 0.06), 0 2px 8px rgba(0, 0, 0, 0.03);
     transform: translateY(-2px);
 }
 

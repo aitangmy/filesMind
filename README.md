@@ -97,14 +97,23 @@ sequenceDiagram
 ```bash
 cd backend
 
-# 安装依赖
-pip install -r requirements.txt
+# 使用 uv 快速初始化并安装依赖
+# 如果未安装 uv: pip install uv
+uv sync
 
 # (可选) 配置环境变量
 cp .env.example .env
 
-# 启动服务
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
+# 使用 uv 启动服务 (无需手动激活虚拟环境)
+uv run uvicorn app:app --reload --host 0.0.0.0 --port 8000
+
+### GPU 加速 (Windows/Linux)
+
+如果您的设备有 NVIDIA 显卡，请在执行 `uv sync` 后手动安装 GPU 版本的 PyTorch：
+
+```bash
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
 ```
 
 2. 前端启动 (Frontend)

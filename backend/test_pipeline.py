@@ -83,10 +83,11 @@ async def test_generated_files():
         async def mock_create_side_effect(*args, **kwargs):
             messages = kwargs.get('messages', [])
             user_content = messages[-1]['content']
-            # Extract text content from user prompt
-            start_index = user_content.find("TEXT CONTENT:\n")
+            # Extract text content from user prompt (updated to match new Chinese prompt)
+            start_marker = "【原文内容】：\n"
+            start_index = user_content.find(start_marker)
             if start_index != -1:
-                input_text = user_content[start_index + len("TEXT CONTENT:\n"):]
+                input_text = user_content[start_index + len(start_marker):]
                 # Simulate AI preserving headers
                 return MagicMock(choices=[MagicMock(message=MagicMock(content=input_text))])
             return MagicMock(choices=[MagicMock(message=MagicMock(content="# Summary"))])

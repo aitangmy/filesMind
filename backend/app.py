@@ -30,6 +30,20 @@ from xmind_exporter import generate_xmind_content
 
 
 
+# ==================== 辅助函数 ====================
+def count_headers(text: str) -> Dict[str, int]:
+    """统计 Markdown 文本中各级标题数量"""
+    counts = {"h1": 0, "h2": 0, "h3": 0, "h4": 0, "h5": 0, "h6": 0, "total": 0}
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            match = re.match(r'^(#{1,6})\s', stripped)
+            if match:
+                level = len(match.group(1))
+                counts[f"h{level}"] += 1
+                counts["total"] += 1
+    return counts
+
 # ==================== 智能分块函数 ====================
 def parse_markdown_chunks(md_content: str) -> List[Dict]:
     """
@@ -43,7 +57,7 @@ def parse_markdown_chunks(md_content: str) -> List[Dict]:
     if not md_content or not md_content.strip():
         return []
 
-    TARGET_CHUNK_SIZE = 15000
+    TARGET_CHUNK_SIZE = 6000
     lines = md_content.split('\n')
     
     chunks = []
@@ -114,9 +128,15 @@ def parse_markdown_chunks(md_content: str) -> List[Dict]:
                      # 如果是 [H1]，source=[]，context="" -> Fallback to H1
                      context_str = header_stack[0]['text']
 
+                # 计算 context 深度和建议的起始标题级别
+                context_depth = len(context_source) if context_source else (1 if header_stack else 0)
+                expected_start_level = min(context_depth + 2, 6)  # H1=root, context占用后续级别
+
                 chunks.append({
                     "content": '\n'.join(current_chunk_lines),
-                    "context": context_str
+                    "context": context_str,
+                    "context_depth": context_depth,
+                    "expected_start_level": expected_start_level
                 })
                 current_chunk_lines = []
                 current_size = 0
@@ -127,12 +147,25 @@ def parse_markdown_chunks(md_content: str) -> List[Dict]:
     # 处理最后一个块
     if current_chunk_lines:
         context_str = " > ".join([h['text'] for h in header_stack])
+        context_depth = len(header_stack)
+        expected_start_level = min(context_depth + 2, 6)
         chunks.append({
             "content": '\n'.join(current_chunk_lines),
-            "context": context_str
+            "context": context_str,
+            "context_depth": context_depth,
+            "expected_start_level": expected_start_level
         })
 
+    # 标题统计日志
+    total_headers = count_headers(md_content)
     logger.info(f"智能分块完成，共 {len(chunks)} 个章节 (Target: {TARGET_CHUNK_SIZE} chars)")
+    logger.info(f"原文标题统计: H1={total_headers['h1']}, H2={total_headers['h2']}, H3={total_headers['h3']}, H4={total_headers['h4']}, H5={total_headers['h5']}, H6={total_headers['h6']}, 总计={total_headers['total']}")
+    for i, chunk in enumerate(chunks):
+        chunk_headers = count_headers(chunk.get('content', ''))
+        ctx = chunk.get('context', 'N/A')
+        esl = chunk.get('expected_start_level', '?')
+        if chunk_headers['total'] > 0:
+            logger.info(f"Chunk {i}: {chunk_headers['total']} 个标题 (H2={chunk_headers['h2']}, H3={chunk_headers['h3']}, H4={chunk_headers['h4']}) | Context=[{ctx[:40]}] | StartLevel=H{esl}")
     return chunks
 
 
