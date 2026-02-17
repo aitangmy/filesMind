@@ -227,28 +227,56 @@ SYSTEM_PROMPT = """
 You are a professional Knowledge Architect. Your task is to extract a comprehensive, structured Mind Map from a large document section.
 The input text is a significant portion of a document (e.g., multiple pages).
 
-CRITICAL RULES:
-1. **Structure**: Identify the main hierarchy. Use Markdown headers (##, ###) for sections and subsections.
-   - Start with Level 2 headers (##) for the main topics in this section.
-   - Use Level 3 (###) and Level 4 (####) for deeper nesting.
-2. **Content**: Use Markdown lists (-) for details under headers.
-   - Do NOT just list keywords. Use complete, meaningful phrases.
-   - Capture ALL key concepts, definitions, data points, and relationships.
-   - Depth is good. Do not over-summarize.
-3. **Format**:
-   - output MUST be valid Markdown.
-   - No "Here is the mind map" preamble.
-   - Use standard indentation (2 spaces).
+CRITICAL RULES - MUST FOLLOW EXACTLY:
 
-Example Output:
+1. **Structure Hierarchy (MOST IMPORTANT)**:
+   - ALWAYS use Level 2 headers (##) for main topics - NEVER use Level 1 (#)
+   - Use Level 3 (###) for subsections under each main topic
+   - Use Level 4 (####) for finer details when needed
+   - NEVER skip levels (e.g., don't go from ## directly to ####)
+
+2. **List Indentation - DEEP NESTING REQUIRED**:
+   - Under each header, use indented lists to capture details
+   - Level 1 list:  "- Main point" (no leading spaces)
+   - Level 2 list: "  - Sub-point" (2 spaces indent)
+   - Level 3 list: "    - Detail" (4 spaces indent)
+   - Level 4 list: "      - Fine detail" (6 spaces indent)
+   - Aim for AT LEAST 3-4 levels of depth for comprehensive coverage
+
+3. **Content Requirements**:
+   - Capture ALL key concepts, definitions, data points, examples, and relationships
+   - Use complete, meaningful phrases (NOT just single keywords)
+   - Include specific numbers, dates, percentages when present in source
+   - Preserve cause-effect relationships and logical connections
+   - Do NOT over-summarize - depth and detail are PREFERRED
+
+4. **Format Requirements**:
+   - Output MUST be valid Markdown with proper indentation
+   - NO preamble like "Here is the mind map"
+   - Use consistent 2-space indentation for nested lists
+   - Blank lines between major sections are OK
+
+EXAMPLE OUTPUT (FOLLOW THIS STRUCTURE):
 ## Main Section Title
 ### Subsection 1.1
 - Key Concept A
-  - Definition: ...
-  - Example: ...
+  - Definition: Precise definition here
+    - Supporting detail 1
+    - Supporting detail 2
+  - Example: Concrete example
+    - Data point: 85% growth rate
+    - Context: When and where
 ### Subsection 1.2
 - Key Concept B
-  - Data point: 85% growth
+  - Aspect 1: Detailed explanation
+    - Evidence: Research findings
+    - Implication: What this means
+  - Aspect 2: Another angle
+    - Counter-argument: Alternative view
+    - Resolution: Synthesis
+
+WARNING: Shallow structures (only ## headers with flat lists) will result in INCORRECT mind maps.
+Always create DEEP, multi-level nested structures to preserve the full knowledge hierarchy.
 """
 
 async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_info: dict = None):
@@ -351,24 +379,29 @@ async def generate_root_summary(full_markdown: str):
 
 async def generate_mindmap_structure(chunks, task=None):
     """
-    Map-Reduce 实现
+    Map-Reduce 实现 - 优化版
     - MAP: 并发处理各个章节
-    - REDUCE: 汇总生成最终结构
+    - REDUCE: 智能合并，确保层级结构正确，避免扁平化
+
+    关键修复：
+    1. 不再简单拼接，而是确保每个 chunk 的输出都遵循统一的层级规范
+    2. 移除可能导致层级混乱的 header 替换逻辑
+    3. 确保章节间的结构清晰分离
     """
     if not chunks:
         return "# Empty Document"
-    
+
     total_chunks = len(chunks)
-    
+
     # ==================== MAP Phase ====================
     # 共享进度信息
     process_info = {'completed': 0, 'total': total_chunks}
-    
+
     tasks = [summarize_chunk(chunk, i, task, process_info) for i, chunk in enumerate(chunks)]
-    
+
     # 并发执行（受 semaphore 控制）
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     # 处理结果
     valid_results = []
     for i, result in enumerate(results):
@@ -378,29 +411,39 @@ async def generate_mindmap_structure(chunks, task=None):
         chunk_id, content = result
         if content and content.strip():
             valid_results.append((chunk_id, content))
-    
+
     # 排序保持顺序
     sorted_results = sorted(valid_results, key=lambda x: x[0])
     branch_contents = [r[1] for r in sorted_results]
-    
+
     if not branch_contents:
         return "# No valid content extracted"
-    
-    # 使用双换行分隔不同章节，保持结构清晰
-    full_branches = "\n\n".join(branch_contents)
-    
+
     # ==================== REDUCE Phase ====================
     if task:
         task.message = "正在生成知识结构..."
-    
+
+    # 关键修复：不再简单拼接，而是规范化每个 chunk 的层级
+    normalized_branches = []
+    for i, branch in enumerate(branch_contents):
+        # 确保每个分支都以 ## 或更低级别的 header 开始
+        # 去除开头的 ### 或更高级别，统一为 ## 开始
+        branch = branch.lstrip()
+
+        # 如果 branch 以 # 开头但不是 ##，转换为 ##
+        if branch.startswith('# ') or branch.startswith('#\n'):
+            branch = branch.replace('# ', '## ', 1).replace('#\n', '##\n', 1)
+
+        normalized_branches.append(branch)
+
+    # 使用双换行分隔不同章节，保持结构清晰
+    full_branches = "\n\n".join(normalized_branches)
+
     try:
         root_structure = await generate_root_summary(full_branches)
-        # 确保根节点只有一个 #，章节使用 ##
-        # 先去掉 AI 输出中可能存在的多余 # 
-        clean_branches = full_branches.replace('\n# ', '\n## ')
-        final_output = f"{root_structure}\n\n{clean_branches}"
+        final_output = f"{root_structure}\n\n{full_branches}"
     except Exception as e:
         print(f"Reduce phase error: {e}")
         final_output = f"# 知识图谱\n\n{full_branches}"
-    
+
     return final_output
