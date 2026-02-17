@@ -296,12 +296,20 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
 
             client = get_client()
 
-            # 构建带上下文的用户提示
-            user_prompt = f"Analyze and structure the following text into a detailed Markdown mind map.\n"
-            if parent_context:
-                user_prompt += f"\nCONTEXT: This text belongs to: {parent_context}\nPlease ensure the output hierarchy reflects this nesting (e.g., start with ### if under a ## section)."
-            
-            user_prompt += f"\n\nTEXT CONTENT:\n{text_chunk}"
+            # 构建带上下文的用户提示 - 强化版
+            user_prompt = f"""
+CONTEXT: {parent_context if parent_context else "Document Root / Preamble"}
+
+INSTRUCTION: 
+The text below is a detailed section located under the path "{parent_context if parent_context else 'Document Root'}". 
+You MUST start your Mind Map output by acknowledging this hierarchy. 
+- If the context ends with a specific header (e.g., "Season 1"), your first node SHOULD be a child of that header (e.g., a sub-point or next level header).
+- Do not create a new root node if it conflicts with the provided context.
+- Maintain the depth. If the context is deep (e.g. ###), your content should likely start at #### or as a list item.
+
+TEXT CONTENT:
+{text_chunk}
+"""
 
             response = await client.chat.completions.create(
                 model=get_model(),
@@ -318,9 +326,6 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
 
             # 验证结果并处理
             if ai_content and ai_content.strip():
-                # 移除强制降级 Level 1 -> Level 2 的逻辑
-                # 移除强制补充标题的逻辑 (AI 现在会根据 Context 生成)
-                
                 # 简单清理：如果 AI 仍然输出了 Markdown 代码块标记
                 ai_content = ai_content.replace("```markdown", "").replace("```", "").strip()
                 result = ai_content
@@ -445,9 +450,18 @@ async def generate_mindmap_structure(chunks: list, task=None):
     # ==================== MAP Phase ====================
     process_info = {'completed': 0, 'total': total_chunks}
     
-    # 构造任务，暂时不传入精确的 parent_context，依赖 AI 对内容的理解
-    # (后续优化：Parser 应该返回 (text, metadata) 元组)
-    tasks = [summarize_chunk(chunk, i, task, process_info) for i, chunk in enumerate(chunks)]
+    # 构造任务，传入 Context
+    tasks = []
+    for i, chunk_data in enumerate(chunks):
+        # 兼容旧代码（如果是字符串）和新代码（如果是字典）
+        if isinstance(chunk_data, str):
+            content = chunk_data
+            context = ""
+        else:
+            content = chunk_data.get('content', '')
+            context = chunk_data.get('context', '')
+            
+        tasks.append(summarize_chunk(content, i, task, process_info, parent_context=context))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 

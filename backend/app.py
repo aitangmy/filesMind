@@ -31,60 +31,106 @@ from xmind_exporter import generate_xmind_content
 
 
 # ==================== 智能分块函数 ====================
-def parse_markdown_chunks(md_content: str) -> list:
+def parse_markdown_chunks(md_content: str) -> List[Dict]:
     """
     智能分块：基于大小和结构的动态分块
     目标：将文档合并为较大的语义块（约 15k 字符），减少碎片化，提升 AI 上下文理解能力。
-
+    
     关键修复：
-    1. 确保分块时在标题处切分，避免在段落中间切断
-    2. 每个块保留完整的层级上下文（父标题）
-    3. 避免碎片化导致的层级丢失
+    1. 引入标题栈 (Header Stack) 维护层级上下文
+    2. 返回结构改为 List[Dict] 以携带 context
     """
     if not md_content or not md_content.strip():
         return []
 
-    # 目标块大小（字符数）- 约 5k-8k tokens，适配长窗口模型
     TARGET_CHUNK_SIZE = 15000
-
-    # 1. 预处理：按行分割
     lines = md_content.split('\n')
-
+    
     chunks = []
     current_chunk_lines = []
     current_size = 0
-
-    # 标题识别正则（更精确的匹配）
+    
+    # 核心：维护标题栈 [{'level': 1, 'text': 'Chapter 1'}, ...]
+    header_stack = [] 
     header_pattern = re.compile(r'^(#{1,6})\s+(.*)')
 
     for line in lines:
         stripped = line.strip()
         header_match = header_pattern.match(stripped)
-        is_header = header_match is not None
+        
+        # --- 1. 维护上下文栈 ---
+        if header_match:
+            level = len(header_match.group(1))
+            text = header_match.group(2).strip()
+            
+            # 弹出所有级别 >= 当前级别的标题（保持层级树的正确性）
+            while header_stack and header_stack[-1]['level'] >= level:
+                header_stack.pop()
+            
+            header_stack.append({'level': level, 'text': text})
 
-        line_len = len(line) + 1  # +1 for newline
-
-        # 决定是否切分：
-        # 1. 当前块已经足够大
-        # 2. 并且当前行是标题（避免在段落中间切断）
+        # --- 2. 决定是否切分 ---
+        line_len = len(line) + 1 # +1 for newline
+        
+        # 触发切分的条件：
+        # 1. 大小超标 
+        # 2. 且当前行是标题（尽量在章节处切断）
         # 3. 或者当前块实在太大了（超过 2 倍目标），强制切分
-        if (current_size >= TARGET_CHUNK_SIZE and is_header) or (current_size >= TARGET_CHUNK_SIZE * 2):
+        flag_split_at_header = (current_size >= TARGET_CHUNK_SIZE and header_match)
+        flag_force_split = (current_size >= TARGET_CHUNK_SIZE * 2)
+
+        if flag_split_at_header or flag_force_split:
             if current_chunk_lines:
-                chunks.append('\n'.join(current_chunk_lines))
+                # 生成当前块的 Context String
+                # 策略调整：
+                # 如果是 Header 触发的切分，stack 包含了新 Header，Context 应为新 Header 的父级 (stack[:-1])
+                # 如果是强制切分，stack 是当前上下文，Context 应为完整 stack (stack[:]) 以保留当前位置
+                
+                # 用户原始逻辑使用 stack[:-1]，我们在此微调以增强鲁棒性：
+                # 但遵循用户的 Draft 代码为主，此处稍微优化 'split reason' 判断
+                
+                use_parent_context = True if header_match else False
+                
+                eff_stack = header_stack[:-1] if (use_parent_context and len(header_stack) > 1) else header_stack
+                # 注意 user code: context_str = " > ".join([h['text'] for h in header_stack[:-1]]) if len(header_stack) > 1 else ""
+                # if not context_str...
+                
+                # 采用用户提供的稳健逻辑 (Original User Code Path)
+                # 使用切分时刻的 stack (包含了新头)。
+                # 之前块的 Context: 理论上是新头之前的状态。
+                # 但如果我们已经 update 了 stack...
+                # User Code update stack BEFORE split check.
+                # So header_stack includes the NEW header.
+                # The Previous Chunk (which we are saving now) ENDS right before this new header.
+                # So its context is indeed best described by the PARENT of the new header (if siblings).
+                # Example: Old=1.1, New=1.2. Stack=[1, 1.2]. Context=[1]. Chunk 1.1 -> under 1. Correct.
+                
+                context_source = header_stack[:-1] if len(header_stack) > 1 else []
+                context_str = " > ".join([h['text'] for h in context_source])
+                
+                if not context_str and header_stack:
+                     # 顶层或者是只有一级
+                     # 注意：如果是 [H1, H2]，source=[H1]，context="H1"
+                     # 如果是 [H1]，source=[]，context="" -> Fallback to H1
+                     context_str = header_stack[0]['text']
+
+                chunks.append({
+                    "content": '\n'.join(current_chunk_lines),
+                    "context": context_str
+                })
                 current_chunk_lines = []
                 current_size = 0
-
+        
         current_chunk_lines.append(line)
         current_size += line_len
 
-    # 添加最后一个块
+    # 处理最后一个块
     if current_chunk_lines:
-        chunks.append('\n'.join(current_chunk_lines))
-
-    # 如果只有一个块，且看起来没有按结构分割（原文档可能缺乏清晰标题），尝试强制长度分割
-    if len(chunks) == 1 and len(md_content) > TARGET_CHUNK_SIZE * 1.5:
-        logger.info("文档结构不清晰，启用备用长度分块")
-        return fallback_chunking(md_content, TARGET_CHUNK_SIZE)
+        context_str = " > ".join([h['text'] for h in header_stack])
+        chunks.append({
+            "content": '\n'.join(current_chunk_lines),
+            "context": context_str
+        })
 
     logger.info(f"智能分块完成，共 {len(chunks)} 个章节 (Target: {TARGET_CHUNK_SIZE} chars)")
     return chunks
@@ -393,6 +439,12 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
 
         # 使用智能分块函数，保留章节标题
         chunks = parse_markdown_chunks(md_content)
+
+        # DEBUG: Visual Inspection of Contexts
+        for i, chunk in enumerate(chunks[:5]):
+            ctx = chunk.get('context', 'N/A')
+            content_preview = chunk.get('content', '')[:30].replace('\n', ' ')
+            logger.info(f"Chunk {i} Context: [{ctx}] | Content: {content_preview}...")
 
         task.progress = 50
         task.message = f"已分块，共 {len(chunks)} 个章节"
