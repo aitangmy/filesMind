@@ -53,12 +53,13 @@ def get_optimal_device():
         logger.warning("未检测到 GPU 加速，将使用 CPU")
         return AcceleratorDevice.CPU
 
-def get_optimized_converter():
+def get_optimized_converter(do_ocr: bool = True):
     """
     智能设备配置：
     - Mac (MPS): 禁用公式识别以兼容 MPS，优化内存
     - Windows/Linux (CUDA): 启用全功能加速
     - CPU: 降级运行
+    :param do_ocr: 是否开启 OCR (默认开启，处理纯文本 PDF 可关闭以提升速度)
     """
     # 自动检测最佳设备
     device = get_optimal_device()
@@ -75,7 +76,7 @@ def get_optimized_converter():
 
     pipeline_opts = PdfPipelineOptions()
     pipeline_opts.accelerator_options = accel_options
-    pipeline_opts.do_ocr = True
+    pipeline_opts.do_ocr = do_ocr
     pipeline_opts.do_table_structure = True
     
     # 默认关闭高消耗功能以节省内存
@@ -103,16 +104,17 @@ def get_optimized_converter():
     )
     return converter
 
-def process_pdf_safely(file_path: str, output_dir: str = "./output"):
+def process_pdf_safely(file_path: str, output_dir: str = "./output", do_ocr: bool = True):
     """
     分块处理逻辑，防止 OOM
+    :param do_ocr: 是否开启 OCR (建议纯文本 PDF 关闭)
     """
     file_path = Path(file_path)
     try:
         device = get_optimal_device()
-        logger.info(f"开始解析: {file_path} on {device} Backend")
+        logger.info(f"开始解析: {file_path} on {device} Backend (OCR={do_ocr})")
         
-        converter = get_optimized_converter()
+        converter = get_optimized_converter(do_ocr=do_ocr)
         result = converter.convert(file_path)
         
         # 导出 Markdown

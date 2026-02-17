@@ -6,7 +6,13 @@ import asyncio
 import os
 import re
 import atexit
-from openai import AsyncOpenAI
+try:
+    from openai import AsyncOpenAI
+except ImportError:
+    # Creating a dummy class for testing purposes if openai is not installed
+    class AsyncOpenAI:
+        def __init__(self, api_key=None, base_url=None):
+            pass
 
 # DeepSeek API 配置 - 使用全局客户端，支持动态更新
 _client = None
@@ -230,9 +236,9 @@ The input text is a significant portion of a document (e.g., multiple pages).
 CRITICAL RULES - MUST FOLLOW EXACTLY:
 
 1. **Structure Hierarchy (MOST IMPORTANT)**:
-   - ALWAYS use Level 2 headers (##) for main topics - NEVER use Level 1 (#)
-   - Use Level 3 (###) for subsections under each main topic
-   - Use Level 4 (####) for finer details when needed
+   - **Respect the Output Context**: If provided, nest your output under the specified Parent Context.
+   - **Flexible Headers**: Use Markdown headers (#, ##, ###, ####) to represent the document's natural hierarchy.
+   - **DO NOT FORCE Level 2**: If a section is a subsection (e.g., 1.1.2), use the appropriate header level (e.g., ### or ####).
    - NEVER skip levels (e.g., don't go from ## directly to ####)
 
 2. **List Indentation - DEEP NESTING REQUIRED**:
@@ -256,37 +262,31 @@ CRITICAL RULES - MUST FOLLOW EXACTLY:
    - Use consistent 2-space indentation for nested lists
    - Blank lines between major sections are OK
 
-EXAMPLE OUTPUT (FOLLOW THIS STRUCTURE):
-## Main Section Title
-### Subsection 1.1
-- Key Concept A
-  - Definition: Precise definition here
-    - Supporting detail 1
-    - Supporting detail 2
-  - Example: Concrete example
-    - Data point: 85% growth rate
-    - Context: When and where
-### Subsection 1.2
-- Key Concept B
-  - Aspect 1: Detailed explanation
-    - Evidence: Research findings
-    - Implication: What this means
-  - Aspect 2: Another angle
-    - Counter-argument: Alternative view
-    - Resolution: Synthesis
-
-WARNING: Shallow structures (only ## headers with flat lists) will result in INCORRECT mind maps.
-Always create DEEP, multi-level nested structures to preserve the full knowledge hierarchy.
+EXAMPLE OUTPUT (Flexible Hierarchy):
+### 1.1. Background (Context: Chapter 1 > Section 1)
+#### 1.1.1 Historical Context
+- Key Event A
+  - Date: 1990
+    - Impact: Started the revolution
 """
 
-async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_info: dict = None):
+async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_info: dict = None, parent_context: str = ""):
     """
     处理单个文本块 (Large Chunk Optimized)
+    :param parent_context: 上下文信息 (e.g., "Chapter 1 > Section 2")
     """
-    # 提取章节标题（第一行）仅作为元数据，不强制使用
+    # 提取章节标题（第一行）仅作为元数据
     lines = text_chunk.strip().split('\n')
     title = lines[0] if lines else f"Section {chunk_id + 1}"
     title = title.strip().lstrip('#').strip()
+
+    # 【修复 P2-1】在 chunk 开始处理时也更新进度
+    if task and process_info:
+        current = process_info['completed']
+        total = process_info['total']
+        progress = 50 + int((current / total) * 45) + 2
+        task.progress = min(95, progress)
+        task.message = f"AI 正在分析章节 {current + 1}/{total}..."
 
     semaphore = get_semaphore()
     async with semaphore:
@@ -295,44 +295,46 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
             await asyncio.sleep(REQUEST_DELAY)
 
             client = get_client()
+
+            # 构建带上下文的用户提示
+            user_prompt = f"Analyze and structure the following text into a detailed Markdown mind map.\n"
+            if parent_context:
+                user_prompt += f"\nCONTEXT: This text belongs to: {parent_context}\nPlease ensure the output hierarchy reflects this nesting (e.g., start with ### if under a ## section)."
+            
+            user_prompt += f"\n\nTEXT CONTENT:\n{text_chunk}"
+
             response = await client.chat.completions.create(
                 model=get_model(),
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Analyze and structure the following text into a detailed Markdown mind map:\n\n{text_chunk}"}
+                    {"role": "user", "content": user_prompt}
                 ],
                 # 提高温度以增加多样性，但保持结构
                 temperature=0.3,
-                max_tokens=4096  # 增加输出长度限制
+                max_tokens=4096
             )
 
             ai_content = response.choices[0].message.content
 
             # 验证结果并处理
             if ai_content and ai_content.strip():
-                # 强制降级 Level 1 标题 -> Level 2
-                # 避免 AI 只有 # Title 的情况破坏整体结构
-                # 替换开头的 # (Space) 为 ## (Space)
-                ai_content = re.sub(r'(^|\n)#\s', r'\1## ', ai_content)
+                # 移除强制降级 Level 1 -> Level 2 的逻辑
+                # 移除强制补充标题的逻辑 (AI 现在会根据 Context 生成)
                 
-                # 检查 AI 是否生成了标题 (## 或 ###...)
-                # 如果 AI 输出是纯列表（没有 headers），我们需要补一个标题
-                if not re.search(r'^#{2,6}\s', ai_content, re.MULTILINE):
-                    result = f"## {title}\n{ai_content}"
-                else:
-                    # AI 生成了结构，直接使用
-                    result = ai_content
+                # 简单清理：如果 AI 仍然输出了 Markdown 代码块标记
+                ai_content = ai_content.replace("```markdown", "").replace("```", "").strip()
+                result = ai_content
             else:
                 result = f"## {title}\n- (No content extracted)"
 
-            # 更新进度（如果有 task 对象）
+            # 更新进度（chunk 完成后）
             if task and process_info:
                 completed = process_info['completed'] + 1
                 total = process_info['total']
                 process_info['completed'] = completed
                 progress = 50 + int((completed / total) * 45)
                 task.progress = min(95, progress)
-                task.message = f"AI 正在深入分析章节 {completed}/{total}..."
+                task.message = f"章节 {completed}/{total} 分析完成"
 
             return chunk_id, result
 
@@ -388,18 +390,65 @@ async def generate_mindmap_structure(chunks, task=None):
     2. 移除可能导致层级混乱的 header 替换逻辑
     3. 确保章节间的结构清晰分离
     """
+async def extract_global_outline(full_text: str) -> dict:
+    """
+    Pass 1: 提取全局目录骨架
+    返回结构: {chunk_index: "Context String"}
+    """
+    try:
+        # 简单启发式：提取 Markdown 标题行
+        headers = []
+        for line in full_text.split('\n'):
+            if line.strip().startswith('#'):
+                headers.append(line.strip())
+        
+        if not headers:
+            return {}
+
+        # 如果标题太多，简化处理（避免 Token 超限）
+        if len(headers) > 500:
+            headers = headers[:500] + ["... (truncated)"]
+        
+        outline_text = "\n".join(headers)
+        
+        # 让 AI 分析每个 chunk 大致对应的章节
+        # 注意：这里有一个难点，如何将 text chunk 映射回 outline
+        # 简化策略：
+        # 假设 chunks 是按顺序切分的。
+        # 我们让 AI 浏览 Outline，并生成一个"章节导航图"
+        
+        return outline_text
+    except Exception as e:
+        print(f"Outline extraction failed: {e}")
+        return ""
+
+async def generate_mindmap_structure(chunks: list, task=None):
+    """
+    Map-Reduce 实现 - 层次感知增强版 (Hierarchy-Aware)
+    """
     if not chunks:
         return "# Empty Document"
 
     total_chunks = len(chunks)
-
+    
+    # ==================== Pass 1: Global Context (Optional) ====================
+    # 由于 chunks 已经被切分，我们很难精确还原每个 chunk 对应的具体章节
+    # 但我们可以利用 chunk[0] 的第一行（通常 parser 会保留部分标题信息）
+    # 或者，我们相信 `summarize_chunk` 内部的上下文提示
+    
+    # 策略调整：与其做复杂的 Outline Mapping，不如在 Map 阶段
+    # 让 AI 自己根据 chunk 内容推断 context (Self-Contextualization)
+    # 或者，如果 Parser 在切分时能保留 metadata 最好。
+    # 鉴于目前 parser_service.py 传过来的是纯文本 list，我们采用 "Sliding Context" 策略
+    # 但为了稳健，我们先采用 "独立处理 + 宽松层级" (已在 summarize_chunk 实现)
+    
     # ==================== MAP Phase ====================
-    # 共享进度信息
     process_info = {'completed': 0, 'total': total_chunks}
-
+    
+    # 构造任务，暂时不传入精确的 parent_context，依赖 AI 对内容的理解
+    # (后续优化：Parser 应该返回 (text, metadata) 元组)
     tasks = [summarize_chunk(chunk, i, task, process_info) for i, chunk in enumerate(chunks)]
 
-    # 并发执行（受 semaphore 控制）
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # 处理结果
@@ -412,7 +461,7 @@ async def generate_mindmap_structure(chunks, task=None):
         if content and content.strip():
             valid_results.append((chunk_id, content))
 
-    # 排序保持顺序
+    # 排序
     sorted_results = sorted(valid_results, key=lambda x: x[0])
     branch_contents = [r[1] for r in sorted_results]
 
@@ -423,24 +472,23 @@ async def generate_mindmap_structure(chunks, task=None):
     if task:
         task.message = "正在生成知识结构..."
 
-    # 关键修复：不再简单拼接，而是规范化每个 chunk 的层级
     normalized_branches = []
-    for i, branch in enumerate(branch_contents):
-        # 确保每个分支都以 ## 或更低级别的 header 开始
-        # 去除开头的 ### 或更高级别，统一为 ## 开始
-        branch = branch.lstrip()
-
-        # 如果 branch 以 # 开头但不是 ##，转换为 ##
-        if branch.startswith('# ') or branch.startswith('#\n'):
-            branch = branch.replace('# ', '## ', 1).replace('#\n', '##\n', 1)
-
+    for branch in branch_contents:
+        # 清理多余空行
+        branch = branch.strip()
+        
+        # 移除之前的 "强制转 ##" 逻辑
+        # 只做最小程度的清理
         normalized_branches.append(branch)
 
-    # 使用双换行分隔不同章节，保持结构清晰
+    # 拼接
     full_branches = "\n\n".join(normalized_branches)
 
     try:
+        # 生成根节点摘要
         root_structure = await generate_root_summary(full_branches)
+        
+        # 最终合并
         final_output = f"{root_structure}\n\n{full_branches}"
     except Exception as e:
         print(f"Reduce phase error: {e}")
