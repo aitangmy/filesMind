@@ -189,7 +189,9 @@ async def startup_event():
         logger.info("未配置 API Key，请在前端设置")
 
 # ==================== 配置管理 ====================
-CONFIG_FILE = "./data/config.json"
+# 使用绝对路径，确保在任何目录启动都能找到配置
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "data", "config.json")
 
 def load_config() -> Dict:
     """加载配置"""
@@ -222,8 +224,9 @@ app.add_middleware(
 )
 
 # ==================== 目录定义 ====================
-# 文件存储目录
-DATA_DIR = "./data"
+# 文件存储目录 - 使用绝对路径
+# BASE_DIR 已在配置管理部分定义
+DATA_DIR = os.path.join(BASE_DIR, "data")
 PDF_DIR = os.path.join(DATA_DIR, "pdfs")
 MD_DIR = os.path.join(DATA_DIR, "mds")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")

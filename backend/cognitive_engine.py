@@ -181,53 +181,103 @@ def get_account_type() -> str:
     return _current_account_type
 
 
-# ==================== 付费版优化配置 ====================
-# DeepSeek 付费版不限制并发
-# 建议值：10-15（根据实际情况调整）
+import time
 
-# 使用 asyncio 的信号量（而非 multiprocessing）
+# ==================== API 策略配置 (Optimization Strategies) ====================
+MODEL_STRATEGIES = {
+    # DeepSeek: 高并发 + 指数退避 (Adaptive Concurrency)
+    "deepseek": {
+        "type": "adaptive",
+        "initial_concurrency": 20,
+        "min_concurrency": 2,
+        "backoff_base": 2,      # 指数退避基数
+        "max_retries": 5,       # 最大重试次数
+        "base_delay": 1.0       # 初始重试延迟 (秒)
+    },
+    # MiniMax: 严格限流 (Strict Rate Limiting)
+    "minimax": {
+        "type": "static",
+        "rpm": 120,            # 默认 RPM (每分钟请求数)
+        "concurrency": 10      # 限制最大并发数，防止瞬间堆积
+    }
+}
+
+class RateLimiter:
+    """
+    令牌桶/漏桶算法实现的简易限流器
+    确保请求间隔满足 RPM 限制
+    """
+    def __init__(self, rpm):
+        self.interval = 60.0 / rpm
+        self.last_request_time = 0
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self.lock:
+            now = time.time()
+            # 计算自上次请求以来经过的时间
+            elapsed = now - self.last_request_time
+            
+            # 如果经过时间小于最小间隔，则等待
+            if elapsed < self.interval:
+                wait_time = self.interval - elapsed
+                await asyncio.sleep(wait_time)
+            
+            self.last_request_time = time.time()
+
+# 全局限流器和信号量
+_rate_limiter = None
 _semaphore = None
-REQUEST_DELAY = 0.3
 
-def get_semaphore():
-    """获取或创建信号量（延迟初始化），根据模型类型动态调整"""
-    global _semaphore
+def get_strategy(model_name: str) -> dict:
+    """根据模型名称获取策略"""
+    if "deepseek" in model_name.lower():
+        return MODEL_STRATEGIES["deepseek"]
+    else:
+        # 默认为 MiniMax 策略 (涵盖 minimax, abab 等)
+        return MODEL_STRATEGIES["minimax"]
+
+def get_rate_limiter():
+    """获取或初始化限流器和信号量"""
+    global _rate_limiter, _semaphore
+    
     if _semaphore is None:
-        current_model = get_model()
+        model = get_model()
+        strategy = get_strategy(model)
         
-        # MiniMax 2.5 模型：限制并发以符合速率限制
-        if is_minimax_2_5_model(current_model):
-            # 根据 MiniMax 2.5 速率限制和账户类型设置
+        if strategy["type"] == "static": # MiniMax
+            # 获取账户类型以调整 RPM
             account_type = get_account_type()
-            rate_limit = MINIMAX_2_5_RATE_LIMITS.get(account_type, MINIMAX_2_5_RATE_LIMITS["free"])
-            rpm = rate_limit["rpm"]
-            
-            # 并发设置：免费用户 2（留有余量），付费用户 10
-            # 确保并发 * 延迟时间 <= 60秒 / RPM
+            # 免费版更严格
             if account_type == "free":
-                concurrency = 2  # 20 RPM，设置为 2
-                global REQUEST_DELAY
-                REQUEST_DELAY = 0.5  # 增加请求间隔
+                rpm = 20  # 极度保守
+                concurrency = 2
             else:
-                concurrency = 10  # 500 RPM，可设置较高并发
-                REQUEST_DELAY = 0.3
+                rpm = strategy["rpm"] # 默认 120
+                concurrency = strategy["concurrency"]
             
+            _rate_limiter = RateLimiter(rpm)
             _semaphore = asyncio.Semaphore(concurrency)
-            print(f"检测到 MiniMax 2.5 模型，账户类型: {account_type}, 并发限制: {concurrency}, 请求间隔: {REQUEST_DELAY}s")
-        else:
-            # 其他模型使用默认配置
-            _semaphore = asyncio.Semaphore(10)
-    return _semaphore
+            print(f"策略应用: MiniMax (Strict Limit), RPM={rpm}, Concurrency={concurrency}")
+            
+        else: # DeepSeek (Adaptive)
+            # DeepSeek 不需要严格的 RateLimiter，只需信号量控制并发
+            _rate_limiter = None 
+            concurrency = strategy["initial_concurrency"]
+            _semaphore = asyncio.Semaphore(concurrency)
+            print(f"策略应用: DeepSeek (Adaptive), Start Concurrency={concurrency}")
+            
+    return _semaphore, _rate_limiter
 
-# 清理函数
 def cleanup():
-    global _semaphore
+    global _semaphore, _rate_limiter
     _semaphore = None
+    _rate_limiter = None
 
 atexit.register(cleanup)
 
 # 任务超时配置
-TASK_TIMEOUT = 600  # 10分钟，与 DeepSeek 文档一致
+TASK_TIMEOUT = 900  # 15分钟，给予更多重试时间
 
 SYSTEM_PROMPT = """
 You are a professional Knowledge Architect. Your task is to extract a comprehensive, structured Mind Map from a large document section.
@@ -288,16 +338,26 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
         task.progress = min(95, progress)
         task.message = f"AI 正在分析章节 {current + 1}/{total}..."
 
-    semaphore = get_semaphore()
+    # 获取策略组件
+    semaphore, rate_limiter = get_rate_limiter()
+    model = get_model()
+    strategy = get_strategy(model)
+    
+    max_retries = strategy.get("max_retries", 3) if strategy["type"] == "adaptive" else 1
+    base_delay = strategy.get("base_delay", 1.0)
+
     async with semaphore:
-        try:
-            # 添加延迟，避免瞬间过高并发
-            await asyncio.sleep(REQUEST_DELAY)
+        for attempt in range(max_retries + 1):
+            try:
+                # 1. 严格限流 (MiniMax)
+                if rate_limiter:
+                    await rate_limiter.acquire()
+                
+                # 2. 准备请求
+                client = get_client()
 
-            client = get_client()
-
-            # 构建带上下文的用户提示 - 强化版
-            user_prompt = f"""
+                # 构建带上下文的用户提示 - 强化版
+                user_prompt = f"""
 CONTEXT: {parent_context if parent_context else "Document Root / Preamble"}
 
 INSTRUCTION: 
@@ -310,44 +370,57 @@ You MUST start your Mind Map output by acknowledging this hierarchy.
 TEXT CONTENT:
 {text_chunk}
 """
+                # 3. 发送请求
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=4096
+                )
 
-            response = await client.chat.completions.create(
-                model=get_model(),
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt}
-                ],
-                # 提高温度以增加多样性，但保持结构
-                temperature=0.3,
-                max_tokens=4096
-            )
+                ai_content = response.choices[0].message.content
 
-            ai_content = response.choices[0].message.content
+                # 验证结果并处理
+                result = ""
+                if ai_content and ai_content.strip():
+                    # 简单清理：如果 AI 仍然输出了 Markdown 代码块标记
+                    ai_content = ai_content.replace("```markdown", "").replace("```", "").strip()
+                    result = ai_content
+                else:
+                    result = f"## {title}\n- (No content extracted)"
 
-            # 验证结果并处理
-            if ai_content and ai_content.strip():
-                # 简单清理：如果 AI 仍然输出了 Markdown 代码块标记
-                ai_content = ai_content.replace("```markdown", "").replace("```", "").strip()
-                result = ai_content
-            else:
-                result = f"## {title}\n- (No content extracted)"
+                # 更新进度（chunk 完成后）
+                if task and process_info:
+                    completed = process_info['completed'] + 1
+                    total = process_info['total']
+                    process_info['completed'] = completed
+                    progress = 50 + int((completed / total) * 45)
+                    task.progress = min(95, progress)
+                    task.message = f"章节 {completed}/{total} 分析完成"
 
-            # 更新进度（chunk 完成后）
-            if task and process_info:
-                completed = process_info['completed'] + 1
-                total = process_info['total']
-                process_info['completed'] = completed
-                progress = 50 + int((completed / total) * 45)
-                task.progress = min(95, progress)
-                task.message = f"章节 {completed}/{total} 分析完成"
+                return chunk_id, result
 
-            return chunk_id, result
-
-        except Exception as e:
-            print(f"Error processing chunk {chunk_id}: {e}")
-            await asyncio.sleep(1)
-            # 失败时至少保留原文标题
-            return chunk_id, f"## {title}\n- Error extracting content"
+            except Exception as e:
+                error_msg = str(e)
+                print(f"Chunk {chunk_id} error (Attempt {attempt + 1}/{max_retries + 1}): {e}")
+                
+                # 如果是最后一次尝试，放弃
+                if attempt == max_retries:
+                    return chunk_id, f"## {title}\n- Error extracting content: {error_msg}"
+                
+                # 策略: 指数退避 (Adaptive / DeepSeek)
+                if "429" in error_msg or "rate limit" in error_msg.lower():
+                    # 计算退避时间: base * (2 ^ attempt)
+                    # 例如: 1s, 2s, 4s, 8s, 16s
+                    sleep_time = base_delay * (strategy.get("backoff_base", 2) ** attempt)
+                    print(f"Rate limited (429). Retrying in {sleep_time}s...")
+                    await asyncio.sleep(sleep_time)
+                else:
+                    # 其他错误 (500等)，也稍微等待
+                    await asyncio.sleep(1)
 
 async def generate_root_summary(full_markdown: str):
     """
