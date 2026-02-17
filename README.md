@@ -1,52 +1,115 @@
-# FilesMind: 智能文档解析与思维导图生成器
+# FilesMind - AI 驱动的智能思维导图生成器
 
-**基于 Docling (IBM) + DeepSeek/MiniMax + Markmap (Vue3) 的下一代文档智能解决方案。**
+**FilesMind** 是一个基于大模型的智能文档分析工具，专注于将长篇 PDF 文档转换为结构化、层级清晰的思维导图（XMind/Markdown）。
 
-## 项目简介
+它解决了传统 RAG（检索增强生成）方案中常见的“上下文丢失”问题，通过独创的**上下文感知分块（Context-Aware Chunking）**算法，确保生成的导图能够精准还原文档的章节层级（如 `第1章 > 1.2节 > 1.2.3 核心概念`），而不是生成一堆扁平的碎片节点。
 
-FilesMind 是一个专门为深度学习和技术文档阅读设计的辅助工具。它不仅仅是一个 PDF 阅读器，更是一个**智能认知助手**。
+---
 
-通过结合 **IBM Docling** 的多模态布局分析能力和 **DeepSeek/MiniMax** 的长上下文推理能力，FilesMind 能够将数百页的复杂技术文档（如论文、手册、合同）自动转化为结构清晰、逻辑严密的**思维导图**。
+## 🌟 核心特性 (Key Features)
 
-## 核心特性
+* **📄 深度 PDF 解析**: 集成 `Docling` 解析引擎，精准提取文档中的标题、段落和结构信息。
+* **🧠 上下文感知分块 (Context-Aware Chunking)**: 独家实现的“标题栈”算法，在切分长文档时自动携带父级章节信息，彻底解决 AI "断章取义" 的问题。
+* **🤖 多模型支持**: 深度适配 **DeepSeek** 和 **MiniMax** 大模型，支持高并发异步处理。
+* **⚡ 异步任务流水线**: 基于 FastAPI + Asyncio 的后台任务队列，支持实时进度追踪。
+* **🚀 XMind 导出**: 一键生成 `.xmind` 源文件，可直接在 XMind 软件中编辑。
 
-- **多模态精准解析**：利用 IBM Docling 技术，精确还原 PDF 中的表格、公式、阅读顺序，彻底告别乱码。
-- **递归式深度推理**：采用 Map-Reduce 架构，利用 DeepSeek-V3/R1 或 MiniMax 2.5 处理局部细节，生成有深度的知识结构。
-- **硬件加速优化**：后端针对 Apple Silicon (M1/M2/M3/M4) 进行了 MPS 加速优化，同时支持 NVIDIA GPU。
-- **交互式可视化**：前端基于 Vue 3 + Markmap，支持节点折叠、缩放、漫游，提供流畅的知识探索体验。
-- **多模型支持**：支持 DeepSeek、MiniMax、OpenAI、Anthropic、Moonshot、阿里云等多种 LLM 服务商。
+---
 
-## 技术栈
+## 🛠️ 系统架构与逻辑 (System Architecture)
 
-- **Backend**: Python 3.13, FastAPI, IBM Docling, OpenAI SDK
-- **Frontend**: Vue 3, Vite, Markmap, TailwindCSS
-- **Infrastructure**: uv (Package Manager)
+### 1. 整体架构图
 
-## 快速开始
 
-### 1. 环境准备
 
-确保你已安装以下工具：
-- **Python 3.10+** (推荐使用 `uv` 管理)
-- **Node.js 18+**
-
-### 2. 后端部署
-
-```bash
-# 进入后端目录
-cd backend
-
-# 安装依赖 (推荐使用 uv，速度更快)
-uv sync
-
-# 启动服务
-uv run fastapi dev app.py --port 8000
+```mermaid
+graph TD
+    User["用户 (Browser)"] -->|上传 PDF| Frontend["前端 (Vue3 + Tailwind)"]
+    Frontend -->|API 请求| Backend["后端 (FastAPI)"]
+    
+    subgraph "Backend Core"
+        Backend -->|1. 解析| Parser["Docling Parser"]
+        Backend -->|2. 智能分块| Chunker["Context-Aware Chunker"]
+        Backend -->|3. AI 分析| Engine["Cognitive Engine"]
+        Backend -->|4. 导出| Exporter["XMind Generator"]
+    end
+    
+    Engine <-->|API 调用| AI["DeepSeek / MiniMax API"]
+    
+    Backend -->|存储| FS["本地文件系统 (PDF/MD)"]
+    Backend -->|记录| DB["JSON History Log"]
 ```
 
-### 3. 前端部署
+### 2. 核心处理流程 (Core Processing Pipeline)
+
+FilesMind 的核心优势在于**如何处理长文档的层级结构**。以下是处理一个文件的完整生命周期：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant API as FastAPI 后端
+    participant P as 解析器 (Parser)
+    participant C as 分块器 (Chunker)
+    participant AI as Cognitive Engine
+    
+    U->>API: 上下文 PDF 文件
+    API->>P: 调用 process_pdf_safely()
+    P-->>API: 返回 Markdown 文本
+    
+    Note over API, C: 关键步骤：上下文感知切分
+    API->>C: 调用 parse_markdown_chunks()
+    loop 遍历文档行
+        C->>C: 维护 Header Stack (标题栈)
+        C->>C: 生成带 Context 的数据块
+    end
+    C-->>API: 返回 List[Dict] (Content + Context)
+    
+    API->>AI: 启动 generate_mindmap_structure()
+    par 并发处理 (Map Phase)
+        AI->>AI: 任务 1: 分析 "第一章" (Context: Root)
+        AI->>AI: 任务 2: 分析 "1.1 节" (Context: 第一章 > 1.1)
+    end
+    
+    AI->>AI: 合并结果 (Reduce Phase)
+    AI-->>API: 返回完整思维导图 Markdown
+    API-->>U: 推送完成状态 & 允许下载 XMind
+```
+
+#### 💡 关键算法：标题栈 (Header Stack)
+
+为了解决长文档切分后层级丢失的问题，我们实现了一个基于栈的算法：
+
+1. **入栈**：遇到 `## 标题` 时，将其压入栈中。
+2. **出栈**：遇到同级或更高级标题时，弹出栈顶元素，保持栈内始终是当前内容的“父级路径”。
+3. **携带上下文**：当文档因为长度被切分（Chunking）时，我们将当前的**整个栈**（如 `Chapter 1 > Section 2`）作为 `Context` 字段传递给 AI。
+4. **AI 指令**：Prompt 中包含强制指令 `"You MUST start your Mind Map output by acknowledging this hierarchy"`，确保 AI 生成的节点能正确挂载。
+
+## 💻 快速开始 (Getting Started)
+
+### 环境要求
+
+- Python 3.10+
+- Node.js 16+
+- API Key (DeepSeek 或 MiniMax)
+
+### 1. 后端启动 (Backend)
 
 ```bash
-# 进入前端目录
+cd backend
+
+# 安装依赖
+pip install -r requirements.txt
+
+# (可选) 配置环境变量
+cp .env.example .env
+
+# 启动服务
+uvicorn app:app --reload --host 0.0.0.0 --port 8000
+```
+
+2. 前端启动 (Frontend)
+
+```bash
 cd frontend
 
 # 安装依赖
@@ -56,61 +119,56 @@ npm install
 npm run dev
 ```
 
-前端默认运行在 `http://localhost:5173`，会反向代理到后端 `/api` 路径。
+## 📖 使用指南 (Usage Practice)
 
-## 配置说明
+### ⚙️ 配置 API
 
-### LLM 模型配置
+1. 打开网页右上角的 **"设置" (Settings)**。
+2. 选择模型厂商（DeepSeek 或 MiniMax）。
+3. 输入您的 API Key。
+4. 点击保存。系统会自动测试连接。
 
-在设置页面中，你可以配置以下选项：
+### 📄 生成思维导图
 
-| 参数 | 说明 |
-|------|------|
-| 服务商 | 支持 MiniMax、DeepSeek、OpenAI、Anthropic、Moonshot、阿里云 |
-| API Base URL | 服务商的 API 端点地址 |
-| 模型 | 选择具体使用的 LLM 模型 |
-| API Key | 你的 API 密钥 |
+1. 点击首页的 **"上传文档"** 区域，选择 PDF 文件。
+2. 系统会自动开始处理，您可以看到以下阶段的进度条：
+   - **解析中 (Parsing)**: 将 PDF 转换为 Markdown。
+   - **分块中 (Chunking)**: 智能识别章节结构。
+   - **AI 思考中 (Analyzing)**: 并发调用大模型提取知识点。
+3. 处理完成后，点击右侧的 **"预览"** 查看导图，或点击 **"下载 XMind"** 获取源文件。
 
-### MiniMax 2.5 速率限制
+---
 
-当使用 **MiniMax 2.5** 模型时，系统会根据账户类型自动调整 API 调用限制：
+📁 项目结构
 
-| 账户类型 | RPM (每分钟请求数) | 并发限制 | 请求间隔 |
-|----------|-------------------|---------|---------|
-| 免费用户 | 20 | 2 | 0.5秒 |
-| 充值用户 | 500 | 10 | 0.3秒 |
-
-在设置页面选择 MiniMax 2.5 模型后，会自动显示"账户类型"选项，请根据您的账户类型选择对应选项以获得最佳性能。
-
-### 硬件加速配置
-
-在 `backend/parser_service.py` 中，默认配置适配 **Apple Silicon (MPS)**：
-
-```python
-accel_options = AcceleratorOptions(
-    num_threads=8, 
-    device=AcceleratorDevice.MPS  # 修改为 CUDA 以支持 NVIDIA 显卡
-)
+```shell
+filesMind/
+├── backend/
+│   ├── app.py                # 主程序 & 任务调度
+│   ├── cognitive_engine.py   # AI 交互 & Prompt 工程 (核心逻辑)
+│   ├── parser_service.py     # PDF 解析服务 (Docling)
+│   ├── xmind_exporter.py     # XMind 格式转换
+│   └── data/                 # 临时文件存储
+└── frontend/
+    ├── src/
+    │   ├── components/       # Vue 组件
+    │   └── App.vue           # 主界面
+    └── vite.config.js        # 前端配置
 ```
 
-### 内存优化
 
-对于小于 16GB 内存的设备，建议在 `parser_service.py` 中保持以下配置关闭：
 
-```python
-pipeline_opts.do_picture_classification = False
-pipeline_opts.do_code_enrichment = False
+## 📄 License
+
+MIT License
+
+```shell
+### 文档更新说明
+
+1.  **Mermaid 图表支持**：我在文档中嵌入了 `graph TD`（架构图）和 `sequenceDiagram`（时序图）。如果您的 Markdown 浏览器（如 GitHub, GitLab, 或 VS Code）支持 Mermaid，它们将直接渲染为图表。
+2.  **逻辑可视化**：
+    * **架构图**展示了从用户上传到导出 XMind 的全链路。
+    * **时序图**特别强调了 `parse_markdown_chunks` 和 `Cognitive Engine` 之间的交互，这是您项目的技术亮点。
+3.  **实践部分**：增加了“使用指南”和“配置 API”的步骤，降低了用户的上手门槛。
 ```
 
-## 功能验证
-
-确保后端已启动，运行以下命令验证核心逻辑：
-
-```bash
-# 在项目根目录下
-python backend/test_pipeline.py
-```
-
-## 许可证
-
-本软件遵循 MIT 许可证。详见 LICENSE 文件。
