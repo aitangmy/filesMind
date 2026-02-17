@@ -239,11 +239,18 @@ def get_file_hash(file_path: str) -> str:
     return hash_md5.hexdigest()
 
 def check_file_exists(file_hash: str) -> Optional[Dict]:
-    """检查文件是否已存在"""
+    """
+    检查文件是否已存在
+
+    返回:
+    - status='completed': 可直接复用 MD 结果
+    - status='failed': 可复用 PDF 文件，重新处理
+    - None: 新文件
+    """
     history = load_history()
     for item in history:
-        if item.get('file_hash') == file_hash and item.get('status') == 'completed':
-            return item
+        if item.get('file_hash') == file_hash:
+            return item  # 返回第一个匹配的记录（无论状态如何）
     return None
 
 def add_file_record(file_id: str, filename: str, file_hash: str, pdf_path: str, md_path: str, status: str = "processing", task_id: str = None):
@@ -420,15 +427,7 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         task.error = str(e)
         task.message = f"处理失败：{str(e)}"
         update_file_status(file_id, 'failed')
-
-    finally:
-        # 清理临时文件
-        if os.path.exists(file_location):
-            try:
-                os.remove(file_location)
-                logger.info(f"临时文件已删除：{file_location}")
-            except Exception as e:
-                logger.warning(f"清理临时文件失败：{e}")
+        # 注意：不删除 PDF 文件，保留以便后续重新处理或排查问题
 
 # ==================== API 路由 ====================
 
@@ -486,26 +485,59 @@ async def upload_document(file: UploadFile = File(...)):
     # 检查是否重复
     existing = check_file_exists(file_hash)
     if existing:
-        # 删除临时文件
-        os.remove(temp_file)
+        existing_status = existing.get('status')
 
-        # 获取已存在的 MD
-        existing_md = ""
-        if os.path.exists(existing['md_path']):
-            with open(existing['md_path'], 'r', encoding='utf-8') as f:
-                existing_md = f.read()
+        if existing_status == 'completed':
+            # 情况 1: 已完成，直接复用 MD 结果
+            # 删除临时文件
+            os.remove(temp_file)
 
-        logger.info(f"检测到重复文件：{file.filename}")
-        return UploadResponse(
-            task_id=task_id,
-            file_id=existing['file_id'],
-            status="completed",
-            message="文件已存在，直接加载",
-            is_duplicate=True,
-            existing_md=existing_md
-        )
+            # 获取已存在的 MD
+            existing_md = ""
+            if os.path.exists(existing['md_path']):
+                with open(existing['md_path'], 'r', encoding='utf-8') as f:
+                    existing_md = f.read()
 
-    # 移动到正式目录
+            logger.info(f"检测到重复文件（已完成）：{file.filename}")
+            return UploadResponse(
+                task_id=task_id,
+                file_id=existing['file_id'],
+                status="completed",
+                message="文件已存在，直接加载",
+                is_duplicate=True,
+                existing_md=existing_md
+            )
+
+        elif existing_status == 'failed':
+            # 情况 2: 之前处理失败，复用 PDF 文件，重新创建任务
+            old_file_id = existing['file_id']
+            pdf_path = existing.get('pdf_path')
+
+            if not pdf_path or not os.path.exists(pdf_path):
+                # PDF 文件不存在，删除临时文件并当作新文件处理
+                logger.warning(f"失败任务的 PDF 文件不存在：{pdf_path}")
+                # 继续执行后续逻辑，当作新文件处理
+            else:
+                # 复用现有 PDF 文件，删除临时文件
+                os.remove(temp_file)
+
+                # 更新原记录状态为 processing
+                md_path = os.path.join(MD_DIR, f"{old_file_id}.md")
+                add_file_record(old_file_id, existing['filename'], file_hash, pdf_path, md_path, "processing", task_id=task_id)
+
+                # 创建新任务，使用原有 PDF 路径
+                task = create_task(task_id)
+                asyncio.create_task(process_document_task(task_id, pdf_path, old_file_id, existing['filename']))
+
+                logger.info(f"检测到失败任务，重新处理：{file.filename}, file_id={old_file_id}")
+                return UploadResponse(
+                    task_id=task_id,
+                    file_id=old_file_id,
+                    status="processing",
+                    message="检测到之前处理失败，正在重新处理..."
+                )
+
+    # 新文件：移动到正式目录
     pdf_path = os.path.join(PDF_DIR, f"{file_id}_{file.filename}")
     shutil.move(temp_file, pdf_path)
 

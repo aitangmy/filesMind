@@ -1,6 +1,104 @@
 @import "tailwindcss";
 
-/* Custom Utilities if needed */
+/* Custom Utilities */
 body {
-    @apply bg-slate-50 text-slate-900;
+    @apply bg-gradient-to-br from-slate-50 via-blue-50/30 to-slate-50 text-slate-900;
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #94a3b8;
+}
+
+/* 毛玻璃效果 */
+.glass {
+    background: rgba(255, 255, 255, 0.7);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+/* 渐变边框 */
+.gradient-border {
+    position: relative;
+    background: white;
+    border-radius: 12px;
+}
+
+.gradient-border::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 12px;
+    padding: 1px;
+    background: linear-gradient(135deg, rgba(59, 130, 246, 0.3), rgba(147, 51, 234, 0.2));
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+}
+
+/* 柔和阴影 */
+.shadow-soft {
+    box-shadow: 0 2px 15px rgba(0, 0, 0, 0.04), 0 1px 3px rgba(0, 0, 0, 0.02);
+}
+
+.shadow-medium {
+    box-shadow: 0 4px 25px rgba(0, 0, 0, 0.06), 0 2px 8px rgba(0, 0, 0, 0.03);
+}
+
+/* 按钮悬停效果增强 */
+.btn-primary {
+    @apply bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-medium;
+    transition: all 0.2s ease;
+}
+
+.btn-primary:hover {
+    @apply shadow-lg shadow-blue-500/30;
+    transform: translateY(-1px);
+}
+
+.btn-secondary {
+    @apply bg-white text-slate-700 border border-slate-200 font-medium;
+    transition: all 0.2s ease;
+}
+
+.btn-secondary:hover {
+    @apply border-slate-300 shadow-md;
+    transform: translateY(-1px);
+}
+
+/* 卡片悬浮效果 */
+.card-hover {
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.card-hover:hover {
+    @apply shadow-medium;
+    transform: translateY(-2px);
+}
+
+/* 加载动画 */
+@keyframes shimmer {
+    0% { background-position: -1000px 0; }
+    100% { background-position: 1000px 0; }
+}
+
+.shimmer {
+    background: linear-gradient(90deg, #f1f5f9 0%, #e2e8f0 50%, #f1f5f9 100%);
+    background-size: 1000px 100%;
+    animation: shimmer 2s infinite;
 }

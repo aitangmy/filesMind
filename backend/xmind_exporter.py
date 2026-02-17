@@ -178,6 +178,7 @@ def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
         "title": filename,
         "rootTopic": root_topic,
         "topicPositioning": "fixed",
+        "designId": "design_1"  # 引用 design.json
     }
 
     # 2. 构造 content.json (必须是列表)
@@ -210,6 +211,56 @@ def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
         }
     }
 
+    # 生成 design.json - XMind 样式设计文件
+    # 参考 XMind 格式规范，提供默认主题和颜色配置
+    design = {
+        "id": "design_1",
+        "theme": {
+            "id": "theme_classic",
+            "name": "Classic",
+            "type": "classic"
+        },
+        "model": {
+            "fill": "#FFFFFF",
+            "border": {
+                "color": "#000000",
+                "width": 1,
+                "style": "solid"
+            },
+            "color": "#000000",
+            "font": {
+                "family": "微软雅黑",
+                "size": 14,
+                "style": "normal",
+                "weight": "normal"
+            },
+            "textAlignment": "left",
+            "verticalAlignment": "middle"
+        },
+        "relationships": {
+            "default": {
+                "color": "#000000",
+                "width": 1,
+                "style": "solid"
+            }
+        },
+        "summary": {
+            "fill": "#FFF8DC",
+            "border": {
+                "color": "#DAA520",
+                "width": 1,
+                "style": "solid"
+            }
+        }
+    }
+
+    # 更新 manifest，添加 design.json 条目
+    manifest["file-entries"]["design.json"] = {
+        "path": "design.json",
+        "media-type": "application/json",
+        "isModified": True
+    }
+
     # 创建 ZIP 文件
     buffer = BytesIO()
 
@@ -217,6 +268,7 @@ def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
         zf.writestr('content.json', json.dumps(content, ensure_ascii=False, indent=2))
         zf.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
         zf.writestr('metadata.json', json.dumps(metadata, ensure_ascii=False, indent=2))
+        zf.writestr('design.json', json.dumps(design, ensure_ascii=False, indent=2))
 
     return buffer.getvalue()
 
