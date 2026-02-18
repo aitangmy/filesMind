@@ -38,6 +38,141 @@ import torch
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("MacMiniParser")
 
+# ── docling-hierarchical-pdf 集成 ──────────────────────────────────────────
+# 该库通过分析字体大小、加粗、PDF 书签来推断正确的标题层级，
+# 解决 Docling 将所有标题识别为同一级别（全 ##）的问题。
+# 安装：pip install docling-hierarchical-pdf
+try:
+    from hierarchical.postprocessor import ResultPostprocessor
+    _HIERARCHICAL_AVAILABLE = True
+    logger.info("docling-hierarchical-pdf 已加载，将自动修正标题层级")
+except ImportError:
+    _HIERARCHICAL_AVAILABLE = False
+    logger.warning("docling-hierarchical-pdf 未安装，跳过层级后处理（pip install docling-hierarchical-pdf）")
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def reclassify_furniture_by_position(result) -> int:
+    """
+    Method A: Universal header/footer detection using page coordinates.
+
+    Docling's layout model sometimes misclassifies page headers and footers as
+    BODY content.  This function corrects that by examining the bounding-box
+    y-position of every text item relative to its page height:
+
+      - Items whose centre y falls in the top    _HEADER_ZONE_RATIO of the page
+        → reclassified as ContentLayer.FURNITURE (page header)
+      - Items whose centre y falls in the bottom _FOOTER_ZONE_RATIO of the page
+        → reclassified as ContentLayer.FURNITURE (page footer)
+
+    Since export_to_markdown() defaults to ContentLayer.BODY only, reclassified
+    items are automatically excluded from the Markdown output — no regex or
+    keyword lists required.  Works for any document regardless of language or
+    content.
+
+    Returns the number of items reclassified.
+    """
+    try:
+        from docling_core.types.doc.document import ContentLayer, DocItemLabel
+    except ImportError:
+        logger.warning("docling_core not available, skipping furniture reclassification")
+        return 0
+
+    # Fraction of page height treated as header / footer zone
+    _HEADER_ZONE_RATIO = 0.08   # top 8 %
+    _FOOTER_ZONE_RATIO = 0.08   # bottom 8 %
+
+    # Labels that can legitimately be page headers/footers
+    _CANDIDATE_LABELS = {
+        DocItemLabel.PAGE_HEADER,
+        DocItemLabel.PAGE_FOOTER,
+        DocItemLabel.TEXT,
+        DocItemLabel.PARAGRAPH,
+        DocItemLabel.SECTION_HEADER,
+    }
+
+    doc = result.document
+    reclassified = 0
+
+    try:
+        # Iterate over all items in the document body
+        for item, _ in doc.iterate_items():
+            # Only consider text-like items
+            if not hasattr(item, 'label') or item.label not in _CANDIDATE_LABELS:
+                continue
+            # Already marked as furniture — skip
+            if hasattr(item, 'content_layer') and item.content_layer == ContentLayer.FURNITURE:
+                continue
+            # Must have provenance (page + bbox)
+            if not item.prov:
+                continue
+
+            prov = item.prov[0]
+            page_no = prov.page_no
+
+            # Get page dimensions
+            if page_no not in doc.pages:
+                continue
+            page = doc.pages[page_no]
+            if page.size is None:
+                continue
+            page_h = page.size.height
+            if page_h <= 0:
+                continue
+
+            # Get bounding box (Docling uses bottom-left origin by default)
+            bbox = prov.bbox
+            if bbox is None:
+                continue
+
+            # Convert to top-left origin for intuitive top/bottom comparison
+            # In bottom-left origin: y=0 is bottom, y=page_h is top
+            # top-left origin: y=0 is top, y=page_h is bottom
+            # centre_y_from_top = page_h - (bbox.t + bbox.b) / 2
+            centre_y_from_top = page_h - (bbox.t + bbox.b) / 2.0
+
+            is_header = centre_y_from_top < page_h * _HEADER_ZONE_RATIO
+            is_footer = centre_y_from_top > page_h * (1.0 - _FOOTER_ZONE_RATIO)
+
+            if is_header or is_footer:
+                item.content_layer = ContentLayer.FURNITURE
+                reclassified += 1
+
+    except Exception as e:
+        logger.warning(f"bbox-based furniture reclassification encountered an error: {e}")
+
+    if reclassified:
+        logger.info(
+            f"[Method A] Reclassified {reclassified} items as FURNITURE "
+            f"(top/bottom {_HEADER_ZONE_RATIO*100:.0f}% of page)"
+        )
+    return reclassified
+
+
+def apply_hierarchy_postprocessor(result, file_path: str) -> None:
+    """
+    在 Docling 转换结果上运行层级后处理器，修正标题层级。
+
+    后处理优先级（由库内部决定）：
+      1. PDF 书签 / TOC（最准确）
+      2. 字体大小聚类（scikit-learn K-Means）
+      3. 加粗 + 字体大小组合
+      4. 数字编号模式（兜底）
+
+    注意：此函数直接修改 result.document（原地操作），无返回值。
+    失败时静默回退，不影响主流程。
+    """
+    if not _HIERARCHICAL_AVAILABLE:
+        return
+
+    try:
+        postprocessor = ResultPostprocessor(result=result, source=file_path)
+        postprocessor.process()
+        logger.info("层级后处理完成：标题层级已根据字体/书签修正")
+    except Exception as e:
+        # 后处理失败不应中断主流程，静默降级
+        logger.warning(f"层级后处理失败（将使用原始 Docling 输出）: {e}")
+
 def get_optimal_device():
     """
     自动检测最佳设备
@@ -116,8 +251,20 @@ def process_pdf_safely(file_path: str, output_dir: str = "./output", do_ocr: boo
         
         converter = get_optimized_converter(do_ocr=do_ocr)
         result = converter.convert(file_path)
-        
-        # 导出 Markdown
+
+        # ── Method A: 通用页眉/页脚过滤（坐标法）─────────────────────────────
+        # 将页面顶部/底部 8% 区域内的文本元素标记为 FURNITURE 层，
+        # 这样 export_to_markdown() 默认只导出 BODY 层时会自动跳过它们。
+        # 完全通用，不依赖任何关键词或文档特定规则。
+        reclassify_furniture_by_position(result)
+        # ──────────────────────────────────────────────────────────────────
+
+        # ── 层级后处理：修正标题层级（字体大小/书签推断）──────────────────
+        # 必须在 export_to_markdown() 之前调用，因为它直接修改 result.document
+        apply_hierarchy_postprocessor(result, str(file_path))
+        # ──────────────────────────────────────────────────────────────────
+
+        # 导出 Markdown（此时标题层级已被修正）
         md_content = result.document.export_to_markdown()
         
         output_file = Path(output_dir) / f"{file_path.stem}.md"
