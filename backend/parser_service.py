@@ -13,7 +13,7 @@ from pathlib import Path
 # 配置 HuggingFace 镜像（解决国内网络访问问题）
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["HF_HOME"] = os.path.expanduser("~/.cache/huggingface")
-os.environ["TRANSFORMERS_CACHE"] = os.path.expanduser("~/.cache/huggingface/transformers")
+# os.environ["TRANSFORMERS_CACHE"] = os.path.expanduser("~/.cache/huggingface/transformers") # Deprecated
 os.environ["HF_HUB_OFFLINE"] = "0"
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 

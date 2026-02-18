@@ -598,13 +598,16 @@ const testConfig = async () => {
             v-model="config.base_url"
             type="text"
             class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-white hover:border-slate-300 placeholder:text-slate-400"
-            placeholder="https://api.deepseek.com/v1"
+            placeholder="https://api.deepseek.com"
           />
           <p class="text-xs text-slate-400 mt-1.5 flex items-center gap-1">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
             </svg>
-            如需使用其他服务商，请在上方选择或自定义输入
+            如需使用其他服务商，请在上方选择或自定义输入。
+            <span v-if="config.base_url.includes('ollama') || config.base_url.includes('11434')" class="text-amber-500 ml-1">
+                注意：请确保 Ollama 服务已配置 OLLAMA_CONTEXT_LENGTH=16384 以避免长文档截断。
+            </span>
           </p>
         </div>
 
@@ -626,8 +629,8 @@ const testConfig = async () => {
           </select>
         </div>
 
-        <!-- API Key -->
-        <div>
+        <!-- API Key (Ollama 模式下隐藏/可选) -->
+        <div v-if="!config.base_url.includes('ollama') && !config.base_url.includes('11434')">
           <label class="flex items-center gap-2 text-sm font-medium text-slate-700 mb-2">
             <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path>
@@ -640,6 +643,12 @@ const testConfig = async () => {
             class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-white hover:border-slate-300 placeholder:text-slate-400"
             placeholder="sk-..."
           />
+        </div>
+        <div v-else class="p-3 bg-blue-50 text-blue-700 text-xs rounded-xl flex items-center gap-2">
+             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+             </svg>
+             Ollama 模式下无需 API Key (后台将自动处理)
         </div>
 
         <!-- 账户类型 (仅 MiniMax 2.5 需要) -->
@@ -682,7 +691,7 @@ const testConfig = async () => {
       <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-slate-200/60 bg-slate-50">
         <button
           @click="testConfig"
-          :disabled="configLoading || !config.api_key"
+          :disabled="configLoading"
           class="px-5 py-2.5 text-sm btn-secondary rounded-xl disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <span class="flex items-center gap-2">
@@ -694,7 +703,7 @@ const testConfig = async () => {
         </button>
         <button
           @click="saveConfig"
-          :disabled="configLoading || !config.api_key"
+          :disabled="configLoading || (!config.api_key && !config.base_url.includes('ollama') && !config.base_url.includes('11434'))"
           class="px-5 py-2.5 text-sm btn-primary rounded-xl disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {{ configLoading ? '保存中...' : '保存配置' }}

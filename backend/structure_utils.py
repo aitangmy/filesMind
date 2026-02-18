@@ -455,6 +455,11 @@ def tree_to_markdown(node, depth=0):
             lines.append(f"- **{item.get('topic', '')}**")
             for det in item.get('details', []):
                 lines.append(f"  - {det}")
+    elif node.content_lines:
+        # 修复：如果没有 AI 细节（处理失败或节点不需要处理），保留原始正文
+        content = node.full_content
+        if content:
+            lines.append(content)
 
     if node.children:
         lines.append("")

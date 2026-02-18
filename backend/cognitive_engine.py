@@ -37,11 +37,16 @@ def update_client_config(config: dict):
     api_key = config.get("api_key", "")
     model = config.get("model", "MiniMax-M2.5")
     
+    # 1. Base URL 规范化 (自动补全 /v1)
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url.rstrip('/')}/v1"
+
     if not api_key:
-        raise ValueError("API Key 不能为空")
-    
-    # 移除错误的 base_url 清理逻辑，保持用户输入的原始 URL
-    base_url = base_url.rstrip('/')
+        # 针对 Ollama 允许空 Key
+        if "ollama" in base_url.lower() or "11434" in base_url:
+             api_key = "ollama" # 占位符
+        else:
+             raise ValueError("API Key 不能为空")
     
     print(f"更新配置: base_url={base_url}, model={model}")
     
@@ -54,6 +59,35 @@ def update_client_config(config: dict):
     set_model(model)
     print(f"Client updated: base_url={base_url}, model={model}")
 
+async def fetch_models(base_url: str, api_key: str = "") -> list:
+    """从 API 获取模型列表"""
+    try:
+        # 1. Base URL 规范化
+        if not base_url.endswith("/v1"):
+            base_url = f"{base_url.rstrip('/')}/v1"
+
+        # 2. 針對 Ollama 的特殊处理
+        if not api_key or "ollama" in base_url.lower() or "11434" in base_url:
+            api_key = "ollama"
+            
+        temp_client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=5.0 # 短超时防止卡死
+        )
+        
+        # 尝试调用 /v1/models
+        response = await temp_client.models.list()
+        
+        models = []
+        for model in response.data:
+            models.append(model.id)
+            
+        return sorted(models)
+    except Exception as e:
+        print(f"Fetch models failed: {e}")
+        return []
+
 async def test_connection(config: dict) -> dict:
     """
     测试配置是否可用 - 增强版
@@ -62,11 +96,16 @@ async def test_connection(config: dict) -> dict:
     api_key = config.get("api_key", "")
     model = config.get("model", "MiniMax-M2.5")
     
-    if not api_key:
-        return {"success": False, "message": "API Key 不能为空"}
+    # 1. Base URL 规范化
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url.rstrip('/')}/v1"
     
-    # 移除错误的 base_url 清理逻辑
-    base_url = base_url.rstrip('/')
+    # 针对 Ollama 允许空 Key
+    if not api_key:
+        if "ollama" in base_url.lower() or "11434" in base_url:
+             api_key = "ollama"
+        else:
+             return {"success": False, "message": "API Key 不能为空"}
     
     print(f"测试连接: base_url={base_url}, model={model}")
     
@@ -115,6 +154,8 @@ async def test_connection(config: dict) -> dict:
             return {"success": False, "message": "请求频率超限，请稍后重试"}
         elif "timeout" in error_msg.lower():
             return {"success": False, "message": "请求超时，请检查网络"}
+        elif "econnrefused" in error_msg.lower() or "connection refused" in error_msg.lower():
+             return {"success": False, "message": "连接被拒绝，请检查 Ollama 是否已启动 (ollama serve)"}
         else:
             return {"success": False, "message": f"连接失败: {error_msg[:100]}"}
 

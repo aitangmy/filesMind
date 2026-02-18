@@ -3,7 +3,7 @@ name = "filesmind"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.12.*"
 dependencies = [
     "docling>=2.73.1",
     "fastapi[standard]>=0.115.0",
@@ -13,6 +13,7 @@ dependencies = [
     "torchvision>=0.19.0",
     "uvicorn>=0.40.0",
     "python-multipart>=0.0.20",
+    "docling-hierarchical-pdf>=0.0.1",
 ]
 
 
@@ -24,8 +25,3 @@ torch = [
 torchvision = [
   { url = "https://download.pytorch.org/whl/cu121/torchvision-0.20.1%2Bcu121-cp312-cp312-win_amd64.whl", marker = "sys_platform == 'win32'" }
 ]
-
-[[tool.uv.index]]
-name = "volces"
-url = "https://mirrors.volces.com/pypi/simple/"
-#url = "https://mirrors.ivolces.com/pypi/simple/" # 内网
