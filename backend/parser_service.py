@@ -1,5 +1,6 @@
 import sys
 import gc
+import re
 import logging
 import os
 # 解决 Windows 下 OpenMP 多重加载冲突 (OMP: Error #15)
@@ -218,6 +219,12 @@ def get_optimized_converter(do_ocr: bool = True):
     pipeline_opts.do_picture_classification = False 
     pipeline_opts.do_code_enrichment = False
 
+    # ── 开启图片提取功能 (Step 1) ──────────────────────────────────────────
+    pipeline_opts.generate_picture_images = True  # 提取内嵌图片
+    pipeline_opts.generate_page_images = True     # 必须开启，TableItem.get_image() 依赖它
+    pipeline_opts.images_scale = 2.0              # 提高清晰度 (2x)
+    # ──────────────────────────────────────────────────────────────────────
+
     # 针对不同硬件的特性配置
     if device == AcceleratorDevice.CUDA:
         # NVIDIA GPU (3060Ti 等): 支持完整功能
@@ -239,12 +246,84 @@ def get_optimized_converter(do_ocr: bool = True):
     )
     return converter
 
-def process_pdf_safely(file_path: str, output_dir: str = "./output", do_ocr: bool = True):
+
+def extract_and_save_images(result, output_dir: Path, file_id: str) -> dict:
+    """
+    提取并保存文档中的图片和表格截图
+    
+    Returns:
+        image_map (dict): 映射关系 { "ref_uri": "local_path" }
+        key 是 Docling 内部引用的 URI/Ref
+        value 是保存到本地的相对路径 (e.g. "images/{file_id}/pic_1.png")
+    """
+    from docling_core.types.doc import PictureItem, TableItem, ImageRefMode
+    
+    images_subdir = output_dir / "images" / file_id
+    images_subdir.mkdir(parents=True, exist_ok=True)
+    
+    image_map = {}
+    doc = result.document
+    
+    # 1. 提取图片 (PictureItem)
+    pic_count = 0
+    for item, _ in doc.iterate_items():
+        if isinstance(item, PictureItem):
+            # 获取图片数据 (PIL Image)
+            try:
+                img = item.get_image(doc)
+                if img:
+                    filename = f"pic_{pic_count}.png"
+                    filepath = images_subdir / filename
+                    img.save(filepath, "PNG")
+                    
+                    # 记录映射：Docling 在 Markdown 中使用 item.self_ref 作为引用
+                    # 或者我们使用自定义占位符。这里我们构建一个 map 供后续替换。
+                    # 注意：export_to_markdown(image_mode=REFERENCED) 会生成类似
+                    # ![Image](image_uri) 的链接。我们需要知道 image_uri 是什么。
+                    # Docling 默认生成的 URI 通常是内部引用。
+                    # 简单起见，我们直接替换 Markdown 中的引用。
+                    
+                    # 记录 self_ref -> local path
+                    # 相对路径，供前端访问: /images/{file_id}/{filename}
+                    web_path = f"/images/{file_id}/{filename}"
+                    image_map[item.self_ref] = web_path
+                    pic_count += 1
+            except Exception as e:
+                logger.warning(f"保存图片失败: {e}")
+
+    # 2. 提取表格截图 (TableItem)
+    table_count = 0
+    for item, _ in doc.iterate_items():
+        if isinstance(item, TableItem):
+            try:
+                # TableItem.get_image() 需要 generate_page_images=True
+                img = item.get_image(doc)
+                if img:
+                    filename = f"table_{table_count}.png"
+                    filepath = images_subdir / filename
+                    img.save(filepath, "PNG")
+                    
+                    web_path = f"/images/{file_id}/{filename}"
+                    image_map[item.self_ref] = web_path
+                    table_count += 1
+            except Exception as e:
+                logger.warning(f"保存表格图片失败: {e}")
+                
+    logger.info(f"提取完成: {pic_count} 张图片, {table_count} 个表格截图")
+    return image_map
+
+
+def process_pdf_safely(file_path: str, output_dir: str = "./output", file_id: str = None, do_ocr: bool = True):
     """
     分块处理逻辑，防止 OOM
+    :param file_id: 文件唯一ID，用于隔离图片存储
     :param do_ocr: 是否开启 OCR (建议纯文本 PDF 关闭)
     """
     file_path = Path(file_path)
+    # 如果没有传 file_id，使用文件名 stem (兼容旧调用)
+    if not file_id:
+        file_id = file_path.stem
+        
     try:
         device = get_optimal_device()
         logger.info(f"开始解析: {file_path} on {device} Backend (OCR={do_ocr})")
@@ -253,40 +332,134 @@ def process_pdf_safely(file_path: str, output_dir: str = "./output", do_ocr: boo
         result = converter.convert(file_path)
 
         # ── Method A: 通用页眉/页脚过滤（坐标法）─────────────────────────────
-        # 将页面顶部/底部 8% 区域内的文本元素标记为 FURNITURE 层，
-        # 这样 export_to_markdown() 默认只导出 BODY 层时会自动跳过它们。
-        # 完全通用，不依赖任何关键词或文档特定规则。
         reclassify_furniture_by_position(result)
         # ──────────────────────────────────────────────────────────────────
 
         # ── 层级后处理：修正标题层级（字体大小/书签推断）──────────────────
-        # 必须在 export_to_markdown() 之前调用，因为它直接修改 result.document
         apply_hierarchy_postprocessor(result, str(file_path))
         # ──────────────────────────────────────────────────────────────────
 
-        # 导出 Markdown（此时标题层级已被修正）
-        md_content = result.document.export_to_markdown()
+        # ── 提取图片和表格 (Step 1) ───────────────────────────────────────
+        # 这里传入 output_dir 的父级 data 目录，以便生成 data/images/{file_id}
+        # 假设 output_dir 通常是 ./data/mds 或 ./output
+        # 我们统一使用 data/images 结构
+        # 既然 output_dir 传入的是 md 目录，我们向上找 data 目录
+        data_dir = Path(output_dir).parent if Path(output_dir).name in ['mds', 'pdfs'] else Path(output_dir)
         
-        output_file = Path(output_dir) / f"{file_path.stem}.md"
+        image_map = extract_and_save_images(result, data_dir, file_id)
+        # ──────────────────────────────────────────────────────────────────
+
+        # 导出 Markdown
+        # 使用 image_mode=REFERENCED 让 Docling 生成图片引用而非 base64
+        from docling_core.types.doc import ImageRefMode
+        md_content = result.document.export_to_markdown(image_mode=ImageRefMode.REFERENCED)
+        
+        # ── 后处理 Markdown：替换图片引用 ──────────────────────────────────
+        # Docling 的 REFERENCED 模式默认生成类似 ![Image](image_1.png) 的链接
+        # 或者引用内部 URI。我们需要将其替换为咱们的 Web 路径。
+        # 由于 Docling 的 export 逻辑比较封闭，最稳妥的方式是：
+        # 既然我们已经有了 image_map (self_ref -> web_path)，
+        # 我们可以手动替换 Markdown 中的引用。
+        # 但 Docling export 的 markdown 里的链接可能不是 self_ref。
+        # 
+        # 策略 B：直接修改 Docling Document 对象中的 PictureItem 的引用路径？
+        # 不行，Docling API 比较复杂。
+        # 
+        # 策略 C：暴力替换。Docling 生成的图片链接通常是 ![Image](...)
+        # 但这很难对应。
+        # 
+        # 最佳策略：使用 iterate_items 遍历时，不仅保存图片，还记录它在 Markdown 中的位置？难。
+        # 
+        # 回退一步：Docling 的 `export_to_markdown` 不太方便自定义图片路径。
+        # 我们可以自己拼接图片吗？
+        # 
+        # 让我们使用一个简单的替换逻辑：
+        # 既然我们无法轻易控制 Docling 生成的 URL，我们不如直接把表格图片插入到 Markdown 中？
+        # 对于 PictureItem，Docling 会生成 `![Image](...)`。
+        # 对于 TableItem，Docling 只生成 Markdown 表格。
+        # 
+        # 修正方案：
+        # 1. 遍历 image_map，查找 Markdown 中对应的 Table 文本，替换为图片？这太难了。
+        # 2. 我们通过 regex 替换。Docling 默认生成的图片文件名可能不可控。
+        # 
+        # 让我们换一种思路：不依赖 `image_mode=REFERENCED` 的自动链接，
+        # 而是使用 `image_placeholder` 钩子？Docling 没有这个钩子。
+        # 
+        # 实际上，Docling v2 的 export_to_markdown 在 REFERENCED 模式下，
+        # 会以为图片已经保存在以此 markdown 为基准的路径下。
+        # 
+        # 让我们先只做“保存图片到磁盘”，Markdown 里的替换留给后续优化？
+        # 不，用户如果不显示图片就没意义。
+        # 
+        # 让我们看下 image_map 的 key 是 self_ref (e.g. `#/pictures/0`).
+        # 我们可以在 export 之前，修改 doc 里的 PictureItem 的 ref？
+        # 
+        # 经过调研，最稳妥的方式是 post-processing MD。
+        # 但无法匹配。
+        # 
+        # 让我们简单点：Docling 提取的图片按顺序保存。Markdown 里的图片顺序也是一致的。
+        # 我们可以按顺序替换 `![Image](...)` 链接。
+        
+        # 替换图片链接
+        # 查找所有 ![alt](uri) 模式
+        # 注意：Docling 可能生成 ![Image](image_0.png)
+        
+        # 简单的计数器替换
+        def replace_pic_link(match):
+            nonlocal pic_idx
+            alt_text = match.group(1)
+            if pic_idx < len(pic_urls):
+                url = pic_urls[pic_idx]
+                pic_idx += 1
+                return f"![{alt_text}]({url})"
+            return match.group(0)
+            
+        pic_urls = [path for ref, path in image_map.items() if "pic_" in path] # 按顺序
+        # 排序 pic_urls 确保顺序 (pic_0, pic_1...)
+        pic_urls.sort(key=lambda x: int(re.search(r'pic_(\d+)', x).group(1)))
+        
+        pic_idx = 0
+        md_content = re.sub(r'!\[(.*?)\]\(.*?\)', replace_pic_link, md_content)
+        
+        # 替换表格：Docling 生成的是 Markdown 表格。
+        # 如果我们需要显示表格截图（防止乱序），我们需要把 Markdown 表格替换为图片链接。
+        # 这比较激进，可能会丢失文本信息。
+        # 用户建议：“表格建议提取为图片（Snapshot）而不是文字”
+        # 那我们需要找到 Markdown 中的表格，并替换它。
+        # Markdown 表格特征：`| ... | ... |`
+        # 这是一个有风险的操作。
+        # 
+        # 暂时方案：保留 Markdown 表格，但在表格上方/下方 插入图片链接？
+        # 或者只针对“乱序严重”的表格？
+        # 
+        # 鉴于实现复杂性，目前 Step 1 先只处理 Picture 的替换。
+        # Table 图片已保存到磁盘，但暂不自动插入 Markdown，
+        # 除非我们能精确定位。
+        # (Marker 库在这方面做得更好)
+        # 
+        # 妥协：将所有表格图片链接 append 到 Markdown 底部，或者
+        # 仅当用户选择“纯图模式”时替换。
+        # 目前保持 Markdown 表格文本，图片仅作为资源存在（XMind 可以用）。
+        # ──────────────────────────────────────────────────────────────────
+
+        output_file = Path(output_dir) / f"{file_id}.md"
         output_file.parent.mkdir(parents=True, exist_ok=True)
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(md_content)
             
         logger.info(f"解析完成，输出至: {output_file}")
         
-        # 关键：显式释放内存
+        # 显式释放内存
         if hasattr(result.input, '_backend') and result.input._backend:
             result.input._backend.unload()
-        
-        # Explicitly delete large objects
         del result
         del converter
         gc.collect()
         
-        return md_content
+        return md_content, data_dir
     except Exception as e:
         logger.error(f"解析失败: {e}")
-        return None
+        return None, None
 
 if __name__ == "__main__":
     # 验证测试

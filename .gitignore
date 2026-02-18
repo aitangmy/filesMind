@@ -72,7 +72,12 @@ tmp/
 
 # 输出文件
 output/
+backend/output_verify/
 *.log
+
+# Test & Verification scripts
+backend/verify_*.py
+backend/test_*.py
 
 # ===========================================
 # macOS

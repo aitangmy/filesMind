@@ -5,6 +5,8 @@ XMind 格式导出工具 - 兼容 XMind 8 和 XMind Zen
 import json
 import re
 import zipfile
+import os
+import hashlib
 from io import BytesIO
 from typing import Dict, Any, List
 
@@ -79,8 +81,8 @@ def parse_markdown_to_tree(markdown: str) -> Dict[str, Any]:
                 is_header = True
                 last_header_level = level  # 更新最近标题级别
 
-                # 清理文本
-                node_text = clean_node_text(node_text)
+                # 移除此处过早的清理，统一在后续步骤处理 (Step 3 refinement)
+                # node_text = clean_node_text(node_text) 
 
         elif stripped.startswith(('-', '*', '+')):
             # 列表项处理
@@ -107,8 +109,25 @@ def parse_markdown_to_tree(markdown: str) -> Dict[str, Any]:
         if not node_text:
             continue
 
+        # 提取图片路径 (Step 3)
+        image_match = re.search(r'!\[(.*?)\]\((.*?)\)', node_text)
+        image_path = None
+        if image_match:
+            # 获取图片路径
+            image_alt = image_match.group(1)  # Capture Alt Text
+            image_path = image_match.group(2)
+            
+            # 从标题中移除图片引用字符串
+            node_text = node_text.replace(image_match.group(0), " ")
+
         # 清理文本
         node_text = clean_node_text(node_text)
+        
+        # 如果文本被情况（例如只有图片），使用 Alt Text 或默认值
+        if (not node_text or node_text.strip() == "") and image_path:
+            node_text = image_alt if image_alt else "Image"
+            
+        # ==================== 栈操作：找到父节点 ====================
 
         # ==================== 栈操作：找到父节点 ====================
         # 统一处理：弹出所有 >= 当前 level 的节点，栈顶即为父节点
@@ -123,6 +142,12 @@ def parse_markdown_to_tree(markdown: str) -> Dict[str, Any]:
             "title": node_text,
             "children": []
         }
+        
+        if image_path:
+            # 去除可能存在的 URL query/hash
+            if '?' in image_path:
+                image_path = image_path.split('?')[0]
+            new_node['image_path'] = image_path
 
         parent.setdefault('children', []).append(new_node)
 
@@ -132,11 +157,67 @@ def parse_markdown_to_tree(markdown: str) -> Dict[str, Any]:
     return root
 
 
-def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
+def generate_xmind_content(markdown: str, filename: str = "mindmap", images_dir: str = None) -> bytes:
     """
     生成 XMind 格式的 ZIP 文件内容
+    :param images_dir: 图片存储目录 (e.g. data/images/{file_id})
     """
     tree = parse_markdown_to_tree(markdown)
+    
+    # 准备资源列表
+    resources = {}  # { local_filename: (md5_hash, file_bytes, media_type) }
+    
+    if images_dir and os.path.exists(images_dir):
+        # 预先加载所有可能的图片，或者按需加载
+        pass
+
+    # 递归处理节点，收集图片引用并重写为 xap:resources/
+    def process_node_images(node):
+        # 检查 title 是否包含图片引用 ![...](...)
+        # parse_markdown_to_tree 还是保留了原始 Markdown？
+        # clean_node_text 移除了图片引用。我们需要 modify parse_markdown_to_tree
+        # 或者在 clean 之前提取。
+        # 
+        # 由于我们要修改 parse_markdown_to_tree 比较麻烦（逻辑紧耦合），
+        # 我们可以在 parse_markdown_to_tree 里提取 image_path。
+        # 下面假设 parse_markdown_to_tree 已经把 image_path 放入 node 字典中。
+        
+        if 'image_path' in node and images_dir:
+            # 读取图片
+            img_name = os.path.basename(node['image_path'])  # pic_0.png
+            local_path = os.path.join(images_dir, img_name)
+            
+            if os.path.exists(local_path):
+                # 读取并计算 Hash
+                with open(local_path, 'rb') as f:
+                    img_data = f.read()
+                
+                md5 = hashlib.md5(img_data).hexdigest()
+                ext = os.path.splitext(img_name)[1].lower()
+                resource_name = f"{md5}{ext}"
+                
+                # 记录资源
+                resources[resource_name] = img_data
+                
+                # 添加 image 字段到节点
+                node['image'] = {
+                    "src": f"xap:resources/{resource_name}",
+                    # "width": ... (可选，不填 XMind 会自动处理)
+                }
+
+        for child in node.get('children', []):
+            process_node_images(child)
+
+    # 需要先修改 parse_markdown_to_tree 提取图片路径
+    # 这里假设 tree 已经是带有 image_path 的结构
+    # 但由于 replace_file_content 无法同时修改两个函数（如果距离太远），
+    # 我们先修改 generate_xmind_content，再修改 parse_markdown_to_tree。
+    # 为了保证逻辑连贯，我们在 process_node_images 里做一点“补救”：
+    # 如果 parse_markdown_to_tree 没有提取 image_path，我们这就无法处理。
+    # 所以必须先修改 parse_markdown_to_tree。
+    
+    # 这里我们只写 generate_xmind_content 的骨架，依赖 tree 中的 image_path
+    process_node_images(tree)
 
     # 生成所有节点 ID
     all_ids = []
@@ -172,6 +253,10 @@ def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
             }
         }
     }
+    
+    # Add root image if exists
+    if 'image' in tree:
+        root_topic['image'] = tree['image']
 
     # 添加子主题
     for child in tree.get('children', []):
@@ -206,9 +291,24 @@ def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
             "manifest.json": {
                 "path": "manifest.json",
                 "media-type": "application/json"
+            },
+            "design.json": {
+                "path": "design.json",
+                "media-type": "application/json",
+                "isModified": True
             }
         }
     }
+    
+    # 添加资源到 manifest
+    for res_name, _ in resources.items():
+        # 简单推断 mimetype
+        ext = os.path.splitext(res_name)[1].lower()
+        mime = "image/png" if ext == ".png" else "image/jpeg"
+        manifest["file-entries"][f"resources/{res_name}"] = {
+            "path": f"resources/{res_name}",
+            "media-type": mime
+        }
 
     # 生成 metadata.json
     metadata = {
@@ -217,9 +317,8 @@ def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
             "version": "1.0"
         }
     }
-
-    # 生成 design.json - XMind 样式设计文件
-    # 参考 XMind 格式规范，提供默认主题和颜色配置
+    
+    # 生成 design.json (省略具体内容，保持原有)
     design = {
         "id": "design_1",
         "theme": {
@@ -229,43 +328,14 @@ def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
         },
         "model": {
             "fill": "#FFFFFF",
-            "border": {
-                "color": "#000000",
-                "width": 1,
-                "style": "solid"
-            },
+            "border": {"color": "#000000", "width": 1, "style": "solid"},
             "color": "#000000",
-            "font": {
-                "family": "微软雅黑",
-                "size": 14,
-                "style": "normal",
-                "weight": "normal"
-            },
+            "font": {"family": "微软雅黑", "size": 14, "style": "normal", "weight": "normal"},
             "textAlignment": "left",
             "verticalAlignment": "middle"
         },
-        "relationships": {
-            "default": {
-                "color": "#000000",
-                "width": 1,
-                "style": "solid"
-            }
-        },
-        "summary": {
-            "fill": "#FFF8DC",
-            "border": {
-                "color": "#DAA520",
-                "width": 1,
-                "style": "solid"
-            }
-        }
-    }
-
-    # 更新 manifest，添加 design.json 条目
-    manifest["file-entries"]["design.json"] = {
-        "path": "design.json",
-        "media-type": "application/json",
-        "isModified": True
+        "relationships": {"default": {"color": "#000000", "width": 1, "style": "solid"}},
+        "summary": {"fill": "#FFF8DC", "border": {"color": "#DAA520", "width": 1, "style": "solid"}}
     }
 
     # 创建 ZIP 文件
@@ -276,6 +346,10 @@ def generate_xmind_content(markdown: str, filename: str = "mindmap") -> bytes:
         zf.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
         zf.writestr('metadata.json', json.dumps(metadata, ensure_ascii=False, indent=2))
         zf.writestr('design.json', json.dumps(design, ensure_ascii=False, indent=2))
+        
+        # 写入图片资源
+        for res_name, res_data in resources.items():
+            zf.writestr(f"resources/{res_name}", res_data)
 
     return buffer.getvalue()
 
@@ -306,6 +380,10 @@ def create_topic_node(node: Dict) -> Dict:
             }
         }
     }
+    
+    # Add image if exists
+    if 'image' in node:
+        topic['image'] = node['image']
 
     # 递归添加子节点
     for child in node.get('children', []):
