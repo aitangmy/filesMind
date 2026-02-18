@@ -37,7 +37,7 @@
 ### 2. 克隆项目
 
 ```bash
-git clone https://github.com/your-username/filesMind.git
+git clone https://github.com/aitangmy/filesMind.git
 cd filesMind
 ```
 

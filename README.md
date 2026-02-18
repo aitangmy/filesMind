@@ -37,7 +37,7 @@ We ensure you can get the project running **within 5 minutes**. Follow these ste
 ### 2. Clone the Project
 
 ```bash
-git clone https://github.com/your-username/filesMind.git
+git clone https://github.com/aitangmy/filesMind.git
 cd filesMind
 ```
 
