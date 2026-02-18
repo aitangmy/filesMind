@@ -17,6 +17,7 @@ os.environ["TRANSFORMERS_CACHE"] = os.path.expanduser("~/.cache/huggingface/tran
 os.environ["HF_HUB_OFFLINE"] = "0"
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
+
 # 配置 SSL 证书（解决部分环境 SSL 问题）
 import certifi
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
@@ -29,6 +30,60 @@ except AttributeError:
     pass
 else:
     ssl._create_default_https_context = _create_unverified_https_context
+
+
+# ====== Markdown层级修复函数 ======
+def fix_markdown_hierarchy(markdown_content):
+    """
+    根据章节编号修复Markdown标题层级
+    Docling默认将所有标题识别为H2，此函数根据数字编号推断正确的层级
+    
+    规则:
+    - 1.x → H2
+    - 1.1.x → H3
+    - 1.1.1.x → H4
+    - 1.1.1.1.x → H5
+    - 1.1.1.1.1.x → H6
+    
+    返回: 修复后的Markdown内容
+    """
+    lines = markdown_content.split('\n')
+    fixed_lines = []
+    
+    # 章节编号匹配模式 - 支持有/无空格的情况
+    chapter_pattern = re.compile(r'^(\d+(?:\.\d+)*)\.?\s*(.*)')
+    
+    for line in lines:
+        stripped = line.strip()
+        
+        # 检查是否是标题行 (# 开头)
+        header_match = re.match(r'^(#{1,6})\s+(.*)', stripped)
+        if header_match:
+            title = header_match.group(2)
+            
+            # 尝试匹配章节编号
+            chapter_match = chapter_pattern.match(title)
+            if chapter_match:
+                num = chapter_match.group(1)
+                
+                # 根据编号确定层级
+                num_parts = [p for p in num.split('.') if p]
+                level = len(num_parts) + 1
+                
+                # 限制在H2-H6范围内
+                level = min(max(level, 2), 6)
+                
+                # 生成新的标题
+                new_header = '#' * level + ' ' + title
+                fixed_lines.append(new_header)
+            else:
+                fixed_lines.append(stripped)
+        else:
+            fixed_lines.append(stripped)
+    
+    return '\n'.join(fixed_lines)
+# ====== 层级修复函数结束 ======
+
 
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
@@ -98,30 +153,25 @@ def reclassify_furniture_by_position(result) -> int:
     try:
         # Iterate over all items in the document body
         for item, _ in doc.iterate_items():
-            # Only consider text-like items
-            if not hasattr(item, 'label') or item.label not in _CANDIDATE_LABELS:
-                continue
-            # Already marked as furniture — skip
-            if hasattr(item, 'content_layer') and item.content_layer == ContentLayer.FURNITURE:
-                continue
-            # Must have provenance (page + bbox)
-            if not item.prov:
+            # Skip items that are not in candidate labels
+            if hasattr(item, 'label') and item.label not in _CANDIDATE_LABELS:
                 continue
 
-            prov = item.prov[0]
-            page_no = prov.page_no
+            # Get the provision (metadata)
+            prov = item.prov[0] if item.prov else None
+            if not prov:
+                continue
 
             # Get page dimensions
-            if page_no not in doc.pages:
+            page = prov.page
+            if not page:
                 continue
-            page = doc.pages[page_no]
-            if page.size is None:
-                continue
-            page_h = page.size.height
+            
+            page_h = page.height
             if page_h <= 0:
                 continue
 
-            # Get bounding box (Docling uses bottom-left origin by default)
+            # Get bounding box(Docling uses bottom-left origin by default)
             bbox = prov.bbox
             if bbox is None:
                 continue
@@ -276,15 +326,7 @@ def extract_and_save_images(result, output_dir: Path, file_id: str) -> dict:
                     filepath = images_subdir / filename
                     img.save(filepath, "PNG")
                     
-                    # 记录映射：Docling 在 Markdown 中使用 item.self_ref 作为引用
-                    # 或者我们使用自定义占位符。这里我们构建一个 map 供后续替换。
-                    # 注意：export_to_markdown(image_mode=REFERENCED) 会生成类似
-                    # ![Image](image_uri) 的链接。我们需要知道 image_uri 是什么。
-                    # Docling 默认生成的 URI 通常是内部引用。
-                    # 简单起见，我们直接替换 Markdown 中的引用。
-                    
-                    # 记录 self_ref -> local path
-                    # 相对路径，供前端访问: /images/{file_id}/{filename}
+                    # 记录映射
                     web_path = f"/images/{file_id}/{filename}"
                     image_map[item.self_ref] = web_path
                     pic_count += 1
@@ -296,7 +338,6 @@ def extract_and_save_images(result, output_dir: Path, file_id: str) -> dict:
     for item, _ in doc.iterate_items():
         if isinstance(item, TableItem):
             try:
-                # TableItem.get_image() 需要 generate_page_images=True
                 img = item.get_image(doc)
                 if img:
                     filename = f"table_{table_count}.png"
@@ -320,7 +361,6 @@ def process_pdf_safely(file_path: str, output_dir: str = "./output", file_id: st
     :param do_ocr: 是否开启 OCR (建议纯文本 PDF 关闭)
     """
     file_path = Path(file_path)
-    # 如果没有传 file_id，使用文件名 stem (兼容旧调用)
     if not file_id:
         file_id = file_path.stem
         
@@ -340,107 +380,68 @@ def process_pdf_safely(file_path: str, output_dir: str = "./output", file_id: st
         # ──────────────────────────────────────────────────────────────────
 
         # ── 提取图片和表格 (Step 1) ───────────────────────────────────────
-        # 这里传入 output_dir 的父级 data 目录，以便生成 data/images/{file_id}
-        # 假设 output_dir 通常是 ./data/mds 或 ./output
-        # 我们统一使用 data/images 结构
-        # 既然 output_dir 传入的是 md 目录，我们向上找 data 目录
         data_dir = Path(output_dir).parent if Path(output_dir).name in ['mds', 'pdfs'] else Path(output_dir)
         
         image_map = extract_and_save_images(result, data_dir, file_id)
         # ──────────────────────────────────────────────────────────────────
 
-        # 导出 Markdown
-        # 使用 image_mode=REFERENCED 让 Docling 生成图片引用而非 base64
+        # ── 导出 Markdown ─────────────────────────────────────────────────
+        # 使用 PLACEHOLDER 模式获取占位符，然后精确替换
         from docling_core.types.doc import ImageRefMode
-        md_content = result.document.export_to_markdown(image_mode=ImageRefMode.REFERENCED)
+        md_content = result.document.export_to_markdown(image_mode=ImageRefMode.PLACEHOLDER)
         
-        # ── 后处理 Markdown：替换图片引用 ──────────────────────────────────
-        # Docling 的 REFERENCED 模式默认生成类似 ![Image](image_1.png) 的链接
-        # 或者引用内部 URI。我们需要将其替换为咱们的 Web 路径。
-        # 由于 Docling 的 export 逻辑比较封闭，最稳妥的方式是：
-        # 既然我们已经有了 image_map (self_ref -> web_path)，
-        # 我们可以手动替换 Markdown 中的引用。
-        # 但 Docling export 的 markdown 里的链接可能不是 self_ref。
-        # 
-        # 策略 B：直接修改 Docling Document 对象中的 PictureItem 的引用路径？
-        # 不行，Docling API 比较复杂。
-        # 
-        # 策略 C：暴力替换。Docling 生成的图片链接通常是 ![Image](...)
-        # 但这很难对应。
-        # 
-        # 最佳策略：使用 iterate_items 遍历时，不仅保存图片，还记录它在 Markdown 中的位置？难。
-        # 
-        # 回退一步：Docling 的 `export_to_markdown` 不太方便自定义图片路径。
-        # 我们可以自己拼接图片吗？
-        # 
-        # 让我们使用一个简单的替换逻辑：
-        # 既然我们无法轻易控制 Docling 生成的 URL，我们不如直接把表格图片插入到 Markdown 中？
-        # 对于 PictureItem，Docling 会生成 `![Image](...)`。
-        # 对于 TableItem，Docling 只生成 Markdown 表格。
-        # 
-        # 修正方案：
-        # 1. 遍历 image_map，查找 Markdown 中对应的 Table 文本，替换为图片？这太难了。
-        # 2. 我们通过 regex 替换。Docling 默认生成的图片文件名可能不可控。
-        # 
-        # 让我们换一种思路：不依赖 `image_mode=REFERENCED` 的自动链接，
-        # 而是使用 `image_placeholder` 钩子？Docling 没有这个钩子。
-        # 
-        # 实际上，Docling v2 的 export_to_markdown 在 REFERENCED 模式下，
-        # 会以为图片已经保存在以此 markdown 为基准的路径下。
-        # 
-        # 让我们先只做“保存图片到磁盘”，Markdown 里的替换留给后续优化？
-        # 不，用户如果不显示图片就没意义。
-        # 
-        # 让我们看下 image_map 的 key 是 self_ref (e.g. `#/pictures/0`).
-        # 我们可以在 export 之前，修改 doc 里的 PictureItem 的 ref？
-        # 
-        # 经过调研，最稳妥的方式是 post-processing MD。
-        # 但无法匹配。
-        # 
-        # 让我们简单点：Docling 提取的图片按顺序保存。Markdown 里的图片顺序也是一致的。
-        # 我们可以按顺序替换 `![Image](...)` 链接。
+        # ── 精确替换图片引用 ────────────────────────────────────────────────
+        # 方法：使用 image_map 中的键值对进行精确匹配替换
+        # image_map 格式: { item.self_ref: "/images/{file_id}/pic_0.png" }
         
-        # 替换图片链接
-        # 查找所有 ![alt](uri) 模式
-        # 注意：Docling 可能生成 ![Image](image_0.png)
+        # 创建用于替换的映射：按文件名中的数字排序
+        sorted_image_items = sorted(
+            image_map.items(),
+            key=lambda x: int(re.search(r'_(pic|table)_(\d+)', x[1]).group(2)) if re.search(r'_(pic|table)_(\d+)', x[1]) else 0
+        )
         
-        # 简单的计数器替换
-        def replace_pic_link(match):
-            nonlocal pic_idx
-            alt_text = match.group(1)
-            if pic_idx < len(pic_urls):
-                url = pic_urls[pic_idx]
-                pic_idx += 1
-                return f"![{alt_text}]({url})"
-            return match.group(0)
+        # 用于跟踪已替换的图片（避免重复替换）
+        replaced_refs = set()
+        
+        def replace_image_refs(match):
+            """
+            精确替换图片引用：
+            1. 获取原始 markdown 中的引用（可能是占位符或原始URI）
+            2. 在 image_map 中查找匹配的项
+            3. 替换为本地保存的文件路径
+            """
+            nonlocal replaced_refs
+            alt_text = match.group(1) if match.group(1) else "image"
+            original_ref = match.group(2)  # 可能是 <!-- image --> 或原始 URI
             
-        pic_urls = [path for ref, path in image_map.items() if "pic_" in path] # 按顺序
-        # 排序 pic_urls 确保顺序 (pic_0, pic_1...)
-        pic_urls.sort(key=lambda x: int(re.search(r'pic_(\d+)', x).group(1)))
+            # 尝试在 image_map 中找到匹配的引用
+            for doc_ref, local_path in sorted_image_items:
+                if doc_ref not in replaced_refs:
+                    # 匹配逻辑：
+                    # 1. 完全匹配
+                    # 2. 或者原始引用中包含 doc_ref 的一部分
+                    # 3. 或者 doc_ref 包含原始引用的一部分
+                    # 4. 对于占位符模式，使用顺序替换
+                    if (doc_ref == original_ref or 
+                        doc_ref in original_ref or 
+                        original_ref in doc_ref or
+                        "image" in original_ref.lower()):
+                        
+                        replaced_refs.add(doc_ref)
+                        return f"![{alt_text}]({local_path})"
+            
+            # 如果找不到匹配，保留原始内容
+            return match.group(0)
         
-        pic_idx = 0
-        md_content = re.sub(r'!\[(.*?)\]\(.*?\)', replace_pic_link, md_content)
+        # 替换所有图片引用
+        md_content = re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', replace_image_refs, md_content)
         
-        # 替换表格：Docling 生成的是 Markdown 表格。
-        # 如果我们需要显示表格截图（防止乱序），我们需要把 Markdown 表格替换为图片链接。
-        # 这比较激进，可能会丢失文本信息。
-        # 用户建议：“表格建议提取为图片（Snapshot）而不是文字”
-        # 那我们需要找到 Markdown 中的表格，并替换它。
-        # Markdown 表格特征：`| ... | ... |`
-        # 这是一个有风险的操作。
-        # 
-        # 暂时方案：保留 Markdown 表格，但在表格上方/下方 插入图片链接？
-        # 或者只针对“乱序严重”的表格？
-        # 
-        # 鉴于实现复杂性，目前 Step 1 先只处理 Picture 的替换。
-        # Table 图片已保存到磁盘，但暂不自动插入 Markdown，
-        # 除非我们能精确定位。
-        # (Marker 库在这方面做得更好)
-        # 
-        # 妥协：将所有表格图片链接 append 到 Markdown 底部，或者
-        # 仅当用户选择“纯图模式”时替换。
-        # 目前保持 Markdown 表格文本，图片仅作为资源存在（XMind 可以用）。
         # ──────────────────────────────────────────────────────────────────
+
+        # ====== 修复标题层级 ======
+        # Docling默认将所有标题识别为H2，根据章节编号推断正确层级
+        md_content = fix_markdown_hierarchy(md_content)
+        # ====== 层级修复完成 ======
 
         output_file = Path(output_dir) / f"{file_id}.md"
         output_file.parent.mkdir(parents=True, exist_ok=True)

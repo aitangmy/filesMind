@@ -33,7 +33,7 @@ uv.lock
 
 # PyCharm
 .idea/
-
+test_output/
 # VS Code
 .vscode/
 .minimax/
@@ -78,6 +78,15 @@ backend/output_verify/
 # Test & Verification scripts
 backend/verify_*.py
 backend/test_*.py
+
+# Test Results & Artifacts
+test_out.txt
+test_run_out.txt
+test_universal_hf_results.json
+backend/test_out.txt
+backend/test_run_out.txt
+backend/test_universal_hf_results.json
+image_*.png
 
 # ===========================================
 # macOS

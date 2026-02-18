@@ -277,7 +277,9 @@ app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
 
 # ==================== 数据模型 ====================
 
-class TaskStatus(str):
+from enum import Enum
+
+class TaskStatus(str, Enum):
     PENDING = "pending"
     PROCESSING = "processing"
     COMPLETED = "completed"
@@ -302,7 +304,108 @@ class FileRecord(BaseModel):
     created_at: str
     status: str  # "completed", "processing", "failed"
 
-# ... (skip history management)
+# ==================== 任务存储（内存） ====================
+# 注意：服务重启后任务状态丢失，这对单用户桌面应用是可接受的
+tasks: Dict[str, "Task"] = {}
+
+def create_task(task_id: str) -> "Task":
+    """创建并注册新任务"""
+    task = Task(task_id)
+    tasks[task_id] = task
+    return task
+
+def get_task(task_id: str) -> "Task":
+    """根据 task_id 获取任务，不存在则返回 None"""
+    return tasks.get(task_id)
+
+# ==================== 文件 Hash ====================
+
+def get_file_hash(file_path: str) -> str:
+    """计算文件 MD5，用于去重检测"""
+    h = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+# ==================== 历史记录管理 ====================
+# 使用 JSON 文件持久化，asyncio.Lock 防止并发写入冲突
+
+_history_lock = asyncio.Lock()
+
+def load_history() -> List[Dict]:
+    """同步读取历史记录（读操作不需要锁）"""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"读取历史记录失败: {e}")
+        return []
+
+def _save_history_sync(history: List[Dict]):
+    """同步写入历史记录（内部使用）"""
+    os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+def add_file_record(
+    file_id: str,
+    filename: str,
+    file_hash: str,
+    pdf_path: str,
+    md_path: str,
+    status: str,
+    task_id: str = None,
+):
+    """添加或更新文件记录（同步，调用方已在后台任务中）"""
+    history = load_history()
+
+    # 如果已存在同 file_id 的记录，先移除旧记录
+    history = [item for item in history if item.get("file_id") != file_id]
+
+    record = {
+        "file_id": file_id,
+        "task_id": task_id,
+        "filename": filename,
+        "file_hash": file_hash,
+        "pdf_path": pdf_path,
+        "md_path": md_path,
+        "created_at": datetime.now().isoformat(),
+        "status": status,
+    }
+    history.append(record)
+    _save_history_sync(history)
+    logger.info(f"文件记录已保存: {file_id} ({status})")
+
+def update_file_status(file_id: str, status: str, md_path: str = None):
+    """更新文件处理状态"""
+    history = load_history()
+    for item in history:
+        if item.get("file_id") == file_id:
+            item["status"] = status
+            if md_path:
+                item["md_path"] = md_path
+            break
+    _save_history_sync(history)
+
+def delete_file_record(file_id: str) -> bool:
+    """删除文件记录，返回是否成功"""
+    history = load_history()
+    new_history = [item for item in history if item.get("file_id") != file_id]
+    if len(new_history) == len(history):
+        return False  # 未找到
+    _save_history_sync(new_history)
+    return True
+
+def check_file_exists(file_hash: str) -> Dict:
+    """根据 MD5 检查文件是否已存在，返回记录或 None"""
+    history = load_history()
+    for item in history:
+        if item.get("file_hash") == file_hash:
+            return item
+    return None
 
 # ==================== 后台任务 ====================
 
@@ -324,8 +427,13 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         task.message = "正在解析 PDF 文档..."
         logger.info(f"任务 {task_id}: 开始解析 PDF")
 
-        # Update: process_pdf_safely returns (md_content, images_dir)
-        md_content, _ = process_pdf_safely(file_location, file_id=file_id)
+        # Run CPU-bound task in a separate thread to avoid blocking the event loop
+        loop = asyncio.get_running_loop()
+        import functools
+        md_content, image_map = await loop.run_in_executor(
+            None, 
+            functools.partial(process_pdf_safely, file_location, output_dir=MD_DIR, file_id=file_id)
+        )
 
         if not md_content:
             logger.error(f"PDF 解析失败: {file_location}")
