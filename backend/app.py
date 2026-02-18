@@ -445,7 +445,7 @@ def get_task(task_id: str) -> Optional[Task]:
 
 async def process_document_task(task_id: str, file_location: str, file_id: str, original_filename: str):
     """
-    异步处理文档任务
+    异步处理文档任务 - Skeleton-Refinement Strategy
     """
     logger.info(f"开始处理任务：{task_id}")
     task = get_task(task_id)
@@ -455,7 +455,7 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         return
 
     try:
-        # 阶段 1: PDF 解析 (0-40%)
+        # 阶段 1: PDF 解析 (0-10%)
         task.status = TaskStatus.PROCESSING
         task.progress = 5
         task.message = "正在解析 PDF 文档..."
@@ -464,58 +464,111 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         md_content = process_pdf_safely(file_location)
 
         if not md_content:
+            logger.error(f"PDF 解析失败: {file_location}")
             raise Exception("PDF 解析失败")
 
-        task.progress = 40
-        task.message = "文档解析完成，正在生成思维导图..."
+        task.progress = 10
+        task.message = "文档解析完成，正在构建知识骨架..."
         logger.info(f"任务 {task_id}: PDF 解析完成")
-        # 阶段 2: 文本分块 (40-50%)
-        task.progress = 45
-        task.message = "正在分块处理内容..."
+        
+        # 阶段 2: 构建骨架 (10-20%)
+        from structure_utils import build_hierarchy_tree, tree_to_markdown
+        
+        root_node = build_hierarchy_tree(md_content)
+        
+        # 收集需要 Refinement 的节点
+        nodes_to_refine = []
+        
+        def collect_nodes(node):
+            # 策略：只处理有内容的叶子节点或包含大量文本的中间节点
+            # 以及 Root 下的"孤儿内容"
+            content_len = len(node.full_content)
+            
+            # Refinement 1: Empty Node Handling (Skip small container nodes)
+            if content_len > 50:
+                nodes_to_refine.append(node)
+            
+            for child in node.children:
+                collect_nodes(child)
+                
+        collect_nodes(root_node)
+        
+        task.progress = 20
+        task.message = f"知识骨架构建完成，共发现 {len(nodes_to_refine)} 个关键章节..."
+        logger.info(f"Tree built. Nodes to refine: {len(nodes_to_refine)}")
 
-        # 使用智能分块函数，保留章节标题
-        chunks = parse_markdown_chunks(md_content)
+        # 阶段 3: 并行 Refinement (20-95%)
+        from cognitive_engine import refine_node_content
+        
+        # Refinement 2: Concurrency Control
+        semaphore = asyncio.Semaphore(5)
+        total_nodes = len(nodes_to_refine)
+        completed_count = 0
+        
+        async def process_node(node):
+            nonlocal completed_count
+            async with semaphore:
+                try:
+                    # Refinement 3: Context Breadcrumbs
+                    context_path = node.get_breadcrumbs()
+                    
+                    details = await refine_node_content(
+                        node_title=node.topic,
+                        content_chunk=node.full_content,
+                        context_path=context_path
+                    )
+                    
+                    if details:
+                        node.ai_details = details
+                    
+                    # 更新进度
+                    completed_count += 1
+                    current_progress = 20 + int((completed_count / total_nodes) * 75)
+                    task.progress = min(95, current_progress)
+                    if completed_count % 5 == 0:
+                        task.message = f"AI 正在深入分析章节 ({completed_count}/{total_nodes})..."
+                        
+                except Exception as e:
+                    logger.error(f"Node processing failed: {e}")
+                    
+        if nodes_to_refine:
+            tasks_list = [process_node(n) for n in nodes_to_refine]
+            await asyncio.gather(*tasks_list)
+        else:
+            logger.warning("No nodes required refinement.")
 
-        # DEBUG: Visual Inspection of Contexts
-        for i, chunk in enumerate(chunks[:5]):
-            ctx = chunk.get('context', 'N/A')
-            content_preview = chunk.get('content', '')[:30].replace('\n', ' ')
-            logger.info(f"Chunk {i} Context: [{ctx}] | Content: {content_preview}...")
-
-        task.progress = 50
-        task.message = f"已分块，共 {len(chunks)} 个章节"
-
-        # 阶段 3: DeepSeek AI 处理 (50-95%)
-        task.progress = 50
-        task.message = "正在调用 AI 生成知识结构..."
-
-        mindmap_md = await generate_mindmap_structure(chunks, task)
-
-        if not mindmap_md:
-            raise Exception("AI 处理失败")
+        # 阶段 4: 组装与导出 (95-100%)
+        task.progress = 98
+        task.message = "正在组装最终图谱..."
+        
+        final_md = tree_to_markdown(root_node)
+        
+        # 添加根节点标题 (如果 Root 没有显示)
+        # tree_to_markdown 默认不打印 Root，我们手动加一个 H1
+        doc_title = original_filename.replace('.pdf', '')
+        if not final_md.startswith('# '):
+            final_md = f"# {doc_title}\n\n{final_md}"
 
         # 保存 MD 文件
         md_path = os.path.join(MD_DIR, f"{file_id}.md")
         with open(md_path, 'w', encoding='utf-8') as f:
-            f.write(mindmap_md)
+            f.write(final_md)
 
         # 更新文件记录状态
         update_file_status(file_id, 'completed', md_path)
 
-        # 阶段 4: 完成
         task.status = TaskStatus.COMPLETED
         task.progress = 100
         task.message = "处理完成！"
-        task.result = mindmap_md
+        task.result = final_md
         logger.info(f"任务 {task_id}: 处理完成")
 
     except Exception as e:
-        logger.error(f"任务 {task_id} 处理失败：{e}")
+        logger.error(f"任务 {task_id} 处理失败：{e}", exc_info=True)
         task.status = TaskStatus.FAILED
         task.error = str(e)
         task.message = f"处理失败：{str(e)}"
         update_file_status(file_id, 'failed')
-        # 注意：不删除 PDF 文件，保留以便后续重新处理或排查问题
 
 # ==================== API 路由 ====================
 

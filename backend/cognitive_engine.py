@@ -626,3 +626,81 @@ async def generate_mindmap_structure(chunks: list, task=None):
         final_output = f"# 知识图谱\n\n{full_branches}"
 
     return final_output
+
+async def refine_node_content(node_title: str, content_chunk: str, context_path: str = "") -> list:
+    """
+    Refinement Phase: 针对特定节点生成子级详情
+    强制 JSON 输出
+    
+    :return: List[Dict] e.g. [{"topic": "...", "details": [...]}]
+    """
+    system_prompt = """
+    你是一个专业的文档分析助手。你的任务是根据给定的段落内容，
+    生成该章节下的详细思维导图分支。
+    
+    【输出格式要求】：
+    1. 必须是严格的 JSON 格式 (List of Objects)
+    2. 不要包含 Markdown 代码块标记（如 ```json），直接输出 JSON 字符串
+    3. 结构如下：
+    [
+      {"topic": "关键子论点1", "details": ["细节1", "细节2"]},
+      {"topic": "关键子论点2", "details": []}
+    ]
+    
+    【内容原则】：
+    - 只提取与当前章节标题【强相关】的内容
+    - 如果文本包含列表、步骤、或者加粗定义的术语，请务必将其转换为独立的 topic
+    - 保留所有具体的参数、数值、日期
+    """
+    
+    user_prompt = f"""
+    【上下文路径】：{context_path}
+    【当前章节】：{node_title}
+    
+    【待分析内容】：
+    {content_chunk}
+    
+    请提取关键信息作为子节点。忽略与本章节无关的内容。
+    """
+    
+    try:
+        client = get_client()
+        model = get_model()
+        
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+            response_format={"type": "json_object"} if "minimax" not in model.lower() else None 
+        )
+        
+        content = response.choices[0].message.content
+        # 清理可能存在的 Markdown 标记
+        content = content.replace("```json", "").replace("```", "").strip()
+        
+        # 解析 JSON
+        import json
+        try:
+            data = json.loads(content)
+            # 兼容可能的 { "items": [] } 包裹格式
+            if isinstance(data, dict):
+                for key in ["items", "nodes", "children"]:
+                    if key in data and isinstance(data[key], list):
+                        return data[key]
+                # 如果没找到列表，看看本身是不是 list
+                return []
+            if isinstance(data, list):
+                return data
+            return []
+        except json.JSONDecodeError:
+            print(f"JSON Parse Error for node {node_title}: {content[:100]}...")
+            return []
+            
+    except Exception as e:
+        print(f"Refine node {node_title} failed: {e}")
+        return []
+
