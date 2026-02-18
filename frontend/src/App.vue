@@ -12,6 +12,9 @@ const showSidebar = ref(true);
 const history = ref([]);
 const currentFileId = ref(null);
 
+// 硬件状态
+const hardwareType = ref('unknown'); // 'cpu', 'gpu', 'mps'
+
 // 设置弹窗
 const showSettings = ref(false);
 const config = ref({
@@ -178,6 +181,22 @@ const handleFileUpload = async (event) => {
   const file = event.target.files[0];
   if (!file) return;
 
+  // [新增] 硬件性能检查拦截
+  if (hardwareType.value === 'cpu') {
+      const confirmCpu = window.confirm(
+          "⚠️ 性能效能提醒\n\n" +
+          "服务器当前正在使用 CPU 进行运算。\n" +
+          "解析大文件可能需要较长时间（预计 2-5 分钟）。\n\n" +
+          "建议使用支持 GPU (CUDA) 或 Mac (MPS) 的设备以获得最佳速度。\n\n" +
+          "是否仍要继续上传？"
+      );
+      
+      if (!confirmCpu) {
+          event.target.value = ''; // 清空选择
+          return; // 终止上传
+      }
+  }
+
   if (currentTaskId.value) {
     cleanupPoll();
   }
@@ -264,7 +283,22 @@ const formatDate = (dateStr) => {
 onMounted(() => {
   loadHistory();
   loadConfig();
+  checkHardware();
 });
+
+// 检查硬件状态
+const checkHardware = async () => {
+    try {
+        const response = await fetch('/api/system/hardware');
+        if (response.ok) {
+            const data = await response.json();
+            hardwareType.value = data.device_type;
+            console.log("Hardware Status:", data);
+        }
+    } catch (err) {
+        console.warn("Hardware check failed:", err);
+    }
+};
 
 // 加载配置
 const loadConfig = async () => {

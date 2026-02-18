@@ -224,19 +224,24 @@ def apply_hierarchy_postprocessor(result, file_path: str) -> None:
         # 后处理失败不应中断主流程，静默降级
         logger.warning(f"层级后处理失败（将使用原始 Docling 输出）: {e}")
 
+from hardware_utils import get_hardware_info
+
 def get_optimal_device():
     """
     自动检测最佳设备
-    M4/M3/M2/M1 系列优先使用 MPS
+    使用统一的硬件检测逻辑映射到 Docling 设备类型
     """
-    if torch.backends.mps.is_available():
-        logger.info("检测到 Apple Silicon MPS 加速可用")
+    info = get_hardware_info()
+    device_type = info["device_type"]
+    
+    if device_type == "mps":
+        logger.info("检测到 Apple Silicon MPS 加速可用 (from hardware_utils)")
         return AcceleratorDevice.MPS
-    elif torch.cuda.is_available():
-        logger.info("检测到 NVIDIA GPU 加速可用")
+    elif device_type == "gpu":
+        logger.info("检测到 NVIDIA GPU 加速可用 (from hardware_utils)")
         return AcceleratorDevice.CUDA
     else:
-        logger.warning("未检测到 GPU 加速，将使用 CPU")
+        logger.warning("未检测到加速器，将使用 CPU (from hardware_utils)")
         return AcceleratorDevice.CPU
 
 def get_optimized_converter(do_ocr: bool = True):

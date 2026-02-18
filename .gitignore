@@ -64,6 +64,9 @@ data/
 *.pdf
 # 生成的 MD 文件
 *.md
+!README.md
+!README.zh-CN.md
+!Skeleton-Refinement.md
 
 # 临时文件
 temp/
@@ -78,6 +81,7 @@ backend/output_verify/
 # Test & Verification scripts
 backend/verify_*.py
 backend/test_*.py
+verify_*.py
 
 # Test Results & Artifacts
 test_out.txt

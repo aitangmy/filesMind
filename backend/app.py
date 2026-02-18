@@ -798,6 +798,16 @@ async def export_xmind_from_content(request: Request):
 @app.get("/health")
 async def health_check():
     """健康检查"""
+    return {"status": "ok"}
+
+from hardware_utils import get_hardware_info
+
+@app.get("/system/hardware")
+async def check_hardware_status():
+    """前端轮询此接口以决定是否弹窗警告"""
+    info = get_hardware_info()
+    logger.info(f"前端查询硬件状态: {info}")
+    return info
     return {"status": "ok", "tasks_count": len(tasks)}
 
 # ==================== 配置 API ====================
