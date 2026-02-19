@@ -68,6 +68,9 @@ data/
 !README.md
 !README.zh-CN.md
 !Skeleton-Refinement.md
+!CONTRIBUTING.md
+!SECURITY.md
+!CODE_OF_CONDUCT.md
 
 # 临时文件
 temp/
