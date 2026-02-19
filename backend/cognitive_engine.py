@@ -59,34 +59,35 @@ def update_client_config(config: dict):
     set_model(model)
     print(f"Client updated: base_url={base_url}, model={model}")
 
-async def fetch_models(base_url: str, api_key: str = "") -> list:
-    """从 API 获取模型列表"""
+async def fetch_models_detailed(base_url: str, api_key: str = "") -> dict:
+    """从 API 获取模型列表，返回结构化结果"""
     try:
         # 1. Base URL 规范化
         if not base_url.endswith("/v1"):
             base_url = f"{base_url.rstrip('/')}/v1"
 
-        # 2. 針對 Ollama 的特殊处理
+        # 2. 针对 Ollama 的特殊处理
         if not api_key or "ollama" in base_url.lower() or "11434" in base_url:
             api_key = "ollama"
-            
+
         temp_client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
-            timeout=5.0 # 短超时防止卡死
+            timeout=5.0  # 短超时防止卡死
         )
-        
-        # 尝试调用 /v1/models
+
         response = await temp_client.models.list()
-        
-        models = []
-        for model in response.data:
-            models.append(model.id)
-            
-        return sorted(models)
+        models = sorted([model.id for model in response.data])
+        return {"success": True, "models": models, "error": ""}
     except Exception as e:
         print(f"Fetch models failed: {e}")
-        return []
+        return {"success": False, "models": [], "error": str(e)}
+
+
+async def fetch_models(base_url: str, api_key: str = "") -> list:
+    """兼容旧调用：仅返回模型数组"""
+    result = await fetch_models_detailed(base_url, api_key)
+    return result.get("models", [])
 
 async def test_connection(config: dict) -> dict:
     """
@@ -744,4 +745,3 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
     except Exception as e:
         print(f"Refine node {node_title} failed: {e}")
         return []
-

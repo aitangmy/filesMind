@@ -1,6 +1,18 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue';
+import { ref, onMounted, onUnmounted, computed } from 'vue';
 import MindMap from './components/MindMap.vue';
+
+const MASKED_KEY = '***';
+const providerOptions = [
+  { value: 'minimax', label: 'MiniMax', base_url: 'https://api.minimaxi.com/v1' },
+  { value: 'deepseek', label: 'DeepSeek (官方)', base_url: 'https://api.deepseek.com' },
+  { value: 'openai', label: 'OpenAI', base_url: 'https://api.openai.com' },
+  { value: 'anthropic', label: 'Anthropic (Claude)', base_url: 'https://api.anthropic.com' },
+  { value: 'moonshot', label: '月之暗面 (Moonshot)', base_url: 'https://api.moonshot.cn' },
+  { value: 'dashscope', label: '阿里云 (DashScope)', base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+  { value: 'ollama', label: 'Ollama (Local)', base_url: 'http://localhost:11434/v1' },
+  { value: 'custom', label: 'Custom', base_url: '' }
+];
 
 const fileInput = ref(null);
 const isLoading = ref(false);
@@ -17,42 +29,205 @@ const hardwareType = ref('unknown'); // 'cpu', 'gpu', 'mps'
 
 // 设置弹窗
 const showSettings = ref(false);
-const config = ref({
-  base_url: 'https://api.deepseek.com',  // 不要加 /v1，库会自动添加
-  model: 'deepseek-chat',
-  api_key: '',
-  account_type: 'free'  // 新增：账户类型 (free/paid)
-});
 const configLoading = ref(false);
 const configTestResult = ref(null);
+const modelFetchResult = ref(null);
+const modelLoading = ref(false);
 
-// 预设服务商列表
-const providerOptions = [
-  { value: 'https://api.minimaxi.com/v1', label: 'MiniMax' },
-  { value: 'https://api.deepseek.com', label: 'DeepSeek (官方)' },
-  { value: 'https://api.openai.com', label: 'OpenAI' },
-  { value: 'https://api.anthropic.com', label: 'Anthropic (Claude)' },
-  { value: 'https://api.moonshot.cn', label: '月之暗面 (Moonshot)' },
-  { value: 'https://dashscope.aliyuncs.com/compatible-mode/v1', label: '阿里云 (DashScope)' }
-];
+// 配置中心（多 profile）
+const profiles = ref([]);
+const activeProfileId = ref('');
+const config = ref({
+  id: '',
+  name: '',
+  provider: 'custom',
+  base_url: '',
+  model: '',
+  api_key: '',
+  has_api_key: false,
+  account_type: 'free',
+  manual_models_text: ''
+});
+const modelCatalogByProfile = ref({});
 
-// 预设模型列表
-const modelOptions = [
-  { value: 'MiniMax-M2.5', label: 'MiniMax 2.5' },
-  { value: 'deepseek-chat', label: 'DeepSeek V3 (非思考)' },
-  { value: 'deepseek-reasoner', label: 'DeepSeek R1 (思考)' },
-  { value: 'gpt-4o', label: 'GPT-4o' },
-  { value: 'gpt-4o-mini', label: 'GPT-4o Mini' },
-  { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet' },
-  { value: 'moonshot-v1-8k-vision-preview', label: 'Moonshot V1 8K' },
-  { value: 'qwen-plus', label: '通义千问 Plus' }
-];
+const makeProfileId = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return `profile_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+};
+
+const isOllamaUrl = (baseUrl) => {
+  const lowered = (baseUrl || '').toLowerCase();
+  return lowered.includes('ollama') || lowered.includes('11434');
+};
+
+const normalizeManualModels = (value) => {
+  if (!value) return [];
+  return [...new Set(
+    String(value)
+      .split(/[,\n;]/)
+      .map((v) => v.trim())
+      .filter(Boolean)
+  )].slice(0, 100);
+};
+
+const createProfile = (overrides = {}) => ({
+  id: overrides.id || makeProfileId(),
+  name: overrides.name || 'New Profile',
+  provider: overrides.provider || 'custom',
+  base_url: overrides.base_url || 'https://api.deepseek.com',
+  model: overrides.model || 'deepseek-chat',
+  api_key: '',
+  has_api_key: Boolean(overrides.has_api_key || (overrides.api_key && overrides.api_key !== MASKED_KEY)),
+  account_type: overrides.account_type || 'free',
+  manual_models_text: (overrides.manual_models || []).join(', ')
+});
+
+const activeProfileModels = computed(() => {
+  const profileId = config.value.id;
+  if (!profileId) return normalizeManualModels(config.value.manual_models_text);
+  const remote = modelCatalogByProfile.value[profileId] || [];
+  if (remote.length > 0) return remote;
+  return normalizeManualModels(config.value.manual_models_text);
+});
+
+const requiresApiKey = computed(() => !isOllamaUrl(config.value.base_url));
+const hasUsableApiKey = computed(() => !requiresApiKey.value || Boolean(config.value.api_key?.trim() || config.value.has_api_key));
+const canTestConfig = computed(() => Boolean(config.value.base_url?.trim() && config.value.model?.trim()));
+const isSaveDisabled = computed(() => {
+  if (configLoading.value) return true;
+  if (!config.value.name?.trim()) return true;
+  if (!config.value.base_url?.trim()) return true;
+  if (!config.value.model?.trim()) return true;
+  return !hasUsableApiKey.value;
+});
 
 // 检测是否为 MiniMax 2.5 系列模型
 const isMiniMax25 = (model) => {
   if (!model) return false;
   const minimaxModels = ['MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'abab6.5s-chat', 'abab6.5g-chat'];
   return minimaxModels.some(m => model.toLowerCase().includes(m.toLowerCase()));
+};
+
+const persistEditorProfile = () => {
+  if (!config.value.id) return;
+  const idx = profiles.value.findIndex((item) => item.id === config.value.id);
+  if (idx === -1) return;
+  profiles.value[idx] = {
+    ...profiles.value[idx],
+    ...config.value,
+    manual_models_text: config.value.manual_models_text || ''
+  };
+};
+
+const loadProfileIntoEditor = (profileId) => {
+  const profile = profiles.value.find((item) => item.id === profileId);
+  if (!profile) return;
+  config.value = { ...profile };
+  activeProfileId.value = profileId;
+  configTestResult.value = null;
+  modelFetchResult.value = null;
+};
+
+const onProfileChange = (event) => {
+  persistEditorProfile();
+  loadProfileIntoEditor(event.target.value);
+};
+
+const addProfile = () => {
+  persistEditorProfile();
+  const profile = createProfile({ name: `Profile ${profiles.value.length + 1}` });
+  profiles.value.push(profile);
+  loadProfileIntoEditor(profile.id);
+};
+
+const removeProfile = () => {
+  if (profiles.value.length <= 1) {
+    alert('至少保留一个配置档案');
+    return;
+  }
+  const removeId = activeProfileId.value;
+  const next = profiles.value.find((item) => item.id !== removeId);
+  profiles.value = profiles.value.filter((item) => item.id !== removeId);
+  if (modelCatalogByProfile.value[removeId]) {
+    delete modelCatalogByProfile.value[removeId];
+  }
+  if (next) loadProfileIntoEditor(next.id);
+};
+
+const clearStoredKey = () => {
+  config.value.has_api_key = false;
+  config.value.api_key = '';
+};
+
+const applyProviderPreset = () => {
+  const preset = providerOptions.find((item) => item.value === config.value.provider);
+  if (!preset) return;
+  if (preset.base_url) {
+    config.value.base_url = preset.base_url;
+  }
+  if (config.value.provider === 'ollama' && !config.value.model) {
+    config.value.model = 'qwen2.5:7b';
+  }
+  modelFetchResult.value = null;
+};
+
+const buildConfigStorePayload = () => {
+  persistEditorProfile();
+  return {
+    active_profile_id: activeProfileId.value,
+    profiles: profiles.value.map((item) => ({
+      id: item.id,
+      name: item.name?.trim() || 'Unnamed Profile',
+      provider: item.provider || 'custom',
+      base_url: item.base_url?.trim() || '',
+      model: item.model?.trim() || '',
+      api_key: item.api_key?.trim() ? item.api_key.trim() : (item.has_api_key ? MASKED_KEY : ''),
+      account_type: item.account_type || 'free',
+      manual_models: normalizeManualModels(item.manual_models_text)
+    }))
+  };
+};
+
+const buildSingleProfilePayload = () => ({
+  profile: {
+    id: config.value.id,
+    name: config.value.name?.trim() || 'Unnamed Profile',
+    provider: config.value.provider || 'custom',
+    base_url: config.value.base_url?.trim() || '',
+    model: config.value.model?.trim() || '',
+    api_key: config.value.api_key?.trim() ? config.value.api_key.trim() : (config.value.has_api_key ? MASKED_KEY : ''),
+    account_type: config.value.account_type || 'free',
+    manual_models: normalizeManualModels(config.value.manual_models_text)
+  }
+});
+
+const normalizeConfigStore = (raw) => {
+  // 兼容 legacy 单配置格式
+  if (!raw?.profiles || !Array.isArray(raw.profiles)) {
+    const fallback = createProfile({
+      name: 'Default',
+      provider: 'custom',
+      base_url: raw?.base_url || 'https://api.deepseek.com',
+      model: raw?.model || 'deepseek-chat',
+      api_key: raw?.api_key || '',
+      has_api_key: Boolean(raw?.api_key),
+      account_type: raw?.account_type || 'free',
+      manual_models: []
+    });
+    return { active_profile_id: fallback.id, profiles: [fallback] };
+  }
+
+  const normalizedProfiles = raw.profiles.map((item) => createProfile({
+    ...item,
+    has_api_key: Boolean(item.has_api_key || item.api_key === MASKED_KEY || item.api_key),
+    manual_models: item.manual_models || []
+  }));
+
+  const active = normalizedProfiles.find((item) => item.id === raw.active_profile_id) || normalizedProfiles[0];
+  return {
+    active_profile_id: active?.id || '',
+    profiles: normalizedProfiles
+  };
 };
 
 // 轮询相关
@@ -311,7 +486,11 @@ const loadConfig = async () => {
   try {
     const response = await fetch('/api/config');
     if (response.ok) {
-      config.value = await response.json();
+      const data = await response.json();
+      const normalized = normalizeConfigStore(data);
+      profiles.value = normalized.profiles;
+      activeProfileId.value = normalized.active_profile_id;
+      loadProfileIntoEditor(activeProfileId.value);
     }
   } catch (err) {
     console.error('加载配置失败:', err);
@@ -323,17 +502,21 @@ const saveConfig = async () => {
   configLoading.value = true;
   configTestResult.value = null;
   try {
+    const payload = buildConfigStorePayload();
     const response = await fetch('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config.value)
+      body: JSON.stringify(payload)
     });
-    if (response.ok) {
+    const data = await response.json();
+    if (response.ok && data.success !== false) {
+      await loadConfig();
       showSettings.value = false;
       alert('配置已保存');
     } else {
-      const data = await response.json();
-      alert('保存失败: ' + (data.detail || '未知错误'));
+      const detail = data?.detail || data;
+      const message = typeof detail === 'string' ? detail : (detail?.message || '未知错误');
+      alert('保存失败: ' + message);
     }
   } catch (err) {
     alert('保存失败: ' + err.message);
@@ -349,13 +532,36 @@ const testConfig = async () => {
     const response = await fetch('/api/config/test', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config.value)
+      body: JSON.stringify(buildSingleProfilePayload())
     });
     configTestResult.value = await response.json();
   } catch (err) {
     configTestResult.value = { success: false, message: err.message };
   }
   configLoading.value = false;
+};
+
+const loadModels = async () => {
+  modelLoading.value = true;
+  modelFetchResult.value = null;
+  try {
+    const response = await fetch('/api/config/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildSingleProfilePayload())
+    });
+    const data = await response.json();
+    modelFetchResult.value = data;
+    if (data?.success && Array.isArray(data.models)) {
+      modelCatalogByProfile.value[config.value.id] = data.models;
+      if (!config.value.model && data.models.length > 0) {
+        config.value.model = data.models[0];
+      }
+    }
+  } catch (err) {
+    modelFetchResult.value = { success: false, message: err.message, source: 'none', code: 'NETWORK_ERROR' };
+  }
+  modelLoading.value = false;
 };
 </script>
 
@@ -553,7 +759,7 @@ const testConfig = async () => {
 
   <!-- 设置弹窗 -->
   <div v-if="showSettings" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-50 p-4" @click.self="showSettings = false">
-    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl mx-4 overflow-hidden">
       <!-- 弹窗头部 -->
       <div class="flex items-center justify-between px-6 py-4 border-b border-slate-200/60 bg-gradient-to-r from-slate-50 to-blue-50/30">
         <div class="flex items-center gap-3">
@@ -573,17 +779,41 @@ const testConfig = async () => {
       </div>
 
       <!-- 弹窗内容 -->
-      <div class="p-6 space-y-5">
+      <div class="p-6 space-y-5 max-h-[70vh] overflow-y-auto">
+        <!-- 配置档案 -->
+        <div class="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+          <label class="flex items-center gap-2 text-sm font-medium text-slate-700">
+            配置档案
+          </label>
+          <div class="flex items-center gap-2">
+            <select
+              :value="activeProfileId"
+              @change="onProfileChange"
+              class="flex-1 px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+            >
+              <option v-for="item in profiles" :key="item.id" :value="item.id">
+                {{ item.name }}
+              </option>
+            </select>
+            <button @click="addProfile" type="button" class="px-3 py-2 text-xs rounded-lg border border-slate-300 hover:bg-slate-100">新增</button>
+            <button @click="removeProfile" type="button" class="px-3 py-2 text-xs rounded-lg border border-red-200 text-red-600 hover:bg-red-50">删除</button>
+          </div>
+          <input
+            v-model="config.name"
+            type="text"
+            class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+            placeholder="配置档案名称"
+          />
+        </div>
+
         <!-- 服务商选择 -->
         <div>
           <label class="flex items-center gap-2 text-sm font-medium text-slate-700 mb-2">
-            <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
-            </svg>
             服务商
           </label>
           <select
-            v-model="config.base_url"
+            v-model="config.provider"
+            @change="applyProviderPreset"
             class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-white hover:border-slate-300"
           >
             <option v-for="opt in providerOptions" :key="opt.value" :value="opt.value">
@@ -592,12 +822,9 @@ const testConfig = async () => {
           </select>
         </div>
 
-        <!-- Base URL (可选自定义) -->
+        <!-- Base URL -->
         <div>
           <label class="flex items-center gap-2 text-sm font-medium text-slate-700 mb-2">
-            <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path>
-            </svg>
             API Base URL
           </label>
           <input
@@ -606,41 +833,54 @@ const testConfig = async () => {
             class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-white hover:border-slate-300 placeholder:text-slate-400"
             placeholder="https://api.deepseek.com"
           />
-          <p class="text-xs text-slate-400 mt-1.5 flex items-center gap-1">
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-            </svg>
-            如需使用其他服务商，请在上方选择或自定义输入。
-            <span v-if="config.base_url.includes('ollama') || config.base_url.includes('11434')" class="text-amber-500 ml-1">
-                注意：请确保 Ollama 服务已配置 OLLAMA_CONTEXT_LENGTH=16384 以避免长文档截断。
-            </span>
-          </p>
         </div>
 
         <!-- 模型选择 -->
-        <div>
-          <label class="flex items-center gap-2 text-sm font-medium text-slate-700 mb-2">
-            <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"></path>
-            </svg>
-            模型
-          </label>
+        <div class="space-y-2">
+          <div class="flex items-center justify-between">
+            <label class="text-sm font-medium text-slate-700">模型</label>
+            <button
+              @click="loadModels"
+              :disabled="modelLoading || !canTestConfig"
+              type="button"
+              class="px-3 py-1.5 text-xs rounded-lg border border-slate-300 hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {{ modelLoading ? '拉取中...' : '拉取模型列表' }}
+            </button>
+          </div>
           <select
+            v-if="activeProfileModels.length > 0"
             v-model="config.model"
             class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-white hover:border-slate-300"
           >
-            <option v-for="opt in modelOptions" :key="opt.value" :value="opt.value">
-              {{ opt.label }}
+            <option v-for="model in activeProfileModels" :key="model" :value="model">
+              {{ model }}
             </option>
           </select>
+          <input
+            v-model="config.model"
+            type="text"
+            class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-white hover:border-slate-300 placeholder:text-slate-400"
+            placeholder="手动输入模型名"
+          />
+          <textarea
+            v-model="config.manual_models_text"
+            rows="2"
+            class="w-full px-4 py-2 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-white hover:border-slate-300 placeholder:text-slate-400"
+            placeholder="手动白名单（逗号或换行分隔），用于 /models 不可用时回退"
+          ></textarea>
+          <div
+            v-if="modelFetchResult"
+            class="text-xs p-2 rounded-lg border"
+            :class="modelFetchResult.success ? 'bg-green-50 border-green-200 text-green-700' : 'bg-amber-50 border-amber-200 text-amber-700'"
+          >
+            {{ modelFetchResult.message }}<span v-if="modelFetchResult.source">（source: {{ modelFetchResult.source }}）</span>
+          </div>
         </div>
 
-        <!-- API Key (Ollama 模式下隐藏/可选) -->
-        <div v-if="!config.base_url.includes('ollama') && !config.base_url.includes('11434')">
+        <!-- API Key -->
+        <div v-if="requiresApiKey">
           <label class="flex items-center gap-2 text-sm font-medium text-slate-700 mb-2">
-            <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path>
-            </svg>
             API Key
           </label>
           <input
@@ -649,12 +889,13 @@ const testConfig = async () => {
             class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-white hover:border-slate-300 placeholder:text-slate-400"
             placeholder="sk-..."
           />
+          <div v-if="config.has_api_key && !config.api_key" class="mt-2 flex items-center justify-between text-xs text-slate-500">
+            <span>已保存密钥（未显示）。留空表示继续使用已保存密钥。</span>
+            <button @click="clearStoredKey" type="button" class="text-red-600 hover:text-red-700">清空密钥</button>
+          </div>
         </div>
         <div v-else class="p-3 bg-blue-50 text-blue-700 text-xs rounded-xl flex items-center gap-2">
-             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-             </svg>
-             Ollama 模式下无需 API Key (后台将自动处理)
+          Ollama 模式下无需 API Key（后台自动处理占位）。
         </div>
 
         <!-- 账户类型 (仅 MiniMax 2.5 需要) -->
@@ -672,12 +913,6 @@ const testConfig = async () => {
             <option value="free">免费用户 (20 RPM)</option>
             <option value="paid">充值用户 (500 RPM)</option>
           </select>
-          <p class="text-xs text-amber-700 mt-2 flex items-center gap-1">
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-            </svg>
-            选择账户类型以适配 API 速率限制
-          </p>
         </div>
 
         <!-- 测试结果 -->
@@ -697,7 +932,7 @@ const testConfig = async () => {
       <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-slate-200/60 bg-slate-50">
         <button
           @click="testConfig"
-          :disabled="configLoading"
+          :disabled="configLoading || !canTestConfig"
           class="px-5 py-2.5 text-sm btn-secondary rounded-xl disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <span class="flex items-center gap-2">
@@ -709,7 +944,7 @@ const testConfig = async () => {
         </button>
         <button
           @click="saveConfig"
-          :disabled="configLoading || (!config.api_key && !config.base_url.includes('ollama') && !config.base_url.includes('11434'))"
+          :disabled="isSaveDisabled"
           class="px-5 py-2.5 text-sm btn-primary rounded-xl disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {{ configLoading ? '保存中...' : '保存配置' }}

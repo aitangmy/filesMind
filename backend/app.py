@@ -20,8 +20,9 @@ logger = logging.getLogger("FilesMind")
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel
-from typing import Optional, Dict, List
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, List, Any
+from urllib.parse import urlparse
 import shutil
 
 # 导入扩展模块
@@ -206,47 +207,350 @@ def fallback_chunking(md_content: str, chunk_size: int = 15000) -> list:
 
 app = FastAPI()
 
-# ==================== 启动时配置 ====================
-@app.on_event("startup")
-async def startup_event():
-    """启动时加载配置"""
-    config = load_config()
-    if config.get("api_key"):
-        try:
-            update_client_config(config)
-            # 加载账户类型
-            set_account_type(config.get("account_type", "free"))
-            logger.info("配置已加载并应用到运行时")
-        except Exception as e:
-            logger.warning(f"启动时加载配置失败：{e}")
-    else:
-        logger.info("未配置 API Key，请在前端设置")
-
 # ==================== 配置管理 ====================
 # 使用绝对路径，确保在任何目录启动都能找到配置
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "data", "config.json")
+MASKED_SECRET = "***"
+CONFIG_SCHEMA_VERSION = 2
 
-def load_config() -> Dict:
-    """加载配置"""
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            pass
+DEFAULT_PROVIDER_PRESETS = {
+    "minimax": {"base_url": "https://api.minimaxi.com/v1", "model": "MiniMax-M2.5"},
+    "deepseek": {"base_url": "https://api.deepseek.com", "model": "deepseek-chat"},
+    "openai": {"base_url": "https://api.openai.com", "model": "gpt-4o-mini"},
+    "anthropic": {"base_url": "https://api.anthropic.com", "model": "claude-3-5-sonnet-20241022"},
+    "moonshot": {"base_url": "https://api.moonshot.cn", "model": "moonshot-v1-8k-vision-preview"},
+    "dashscope": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus"},
+    "ollama": {"base_url": "http://localhost:11434/v1", "model": "qwen2.5:7b"},
+    "custom": {"base_url": "https://api.deepseek.com", "model": "deepseek-chat"},
+}
+
+
+class ConfigValidationError(ValueError):
+    def __init__(self, code: str, message: str, field: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.field = field
+
+    def to_detail(self) -> Dict[str, Any]:
+        detail = {"code": self.code, "message": self.message}
+        if self.field:
+            detail["field"] = self.field
+        return detail
+
+
+class ProfilePayload(BaseModel):
+    id: str
+    name: str
+    provider: str = "custom"
+    base_url: str
+    model: str
+    api_key: str = ""
+    account_type: str = "free"
+    manual_models: List[str] = Field(default_factory=list)
+
+
+class ConfigStorePayload(BaseModel):
+    active_profile_id: str
+    profiles: List[ProfilePayload] = Field(default_factory=list)
+
+
+class ProfileView(BaseModel):
+    id: str
+    name: str
+    provider: str
+    base_url: str
+    model: str
+    api_key: str
+    has_api_key: bool
+    account_type: str
+    manual_models: List[str] = Field(default_factory=list)
+
+
+class ConfigStoreView(BaseModel):
+    schema_version: int
+    active_profile_id: str
+    profiles: List[ProfileView] = Field(default_factory=list)
+
+
+class ModelListRequest(BaseModel):
+    profile: ProfilePayload
+
+
+def _is_ollama_url(base_url: str) -> bool:
+    lowered = (base_url or "").lower()
+    return "ollama" in lowered or "11434" in lowered
+
+
+def _default_profile() -> Dict[str, Any]:
+    preset = DEFAULT_PROVIDER_PRESETS["minimax"]
     return {
-        "base_url": "https://api.minimaxi.com/v1",
-        "model": "MiniMax-M2.5",
+        "id": str(uuid.uuid4()),
+        "name": "Default",
+        "provider": "minimax",
+        "base_url": preset["base_url"],
+        "model": preset["model"],
         "api_key": "",
-        "account_type": "free"
+        "account_type": "free",
+        "manual_models": [],
     }
 
-def save_config(config: Dict):
-    """保存配置"""
+
+def _normalize_models(models: Any) -> List[str]:
+    if models is None:
+        return []
+    if isinstance(models, str):
+        items = re.split(r"[,;\n]", models)
+    elif isinstance(models, list):
+        items = models
+    else:
+        return []
+
+    normalized = []
+    seen = set()
+    for raw in items:
+        value = str(raw).strip()
+        if not value:
+            continue
+        if value not in seen:
+            normalized.append(value)
+            seen.add(value)
+    return normalized[:100]
+
+
+def _validate_base_url(base_url: str, field: str):
+    if not base_url or not base_url.strip():
+        raise ConfigValidationError("MISSING_BASE_URL", "API Base URL 不能为空", field)
+    parsed = urlparse(base_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ConfigValidationError("INVALID_BASE_URL", "API Base URL 格式无效，需以 http:// 或 https:// 开头", field)
+
+
+def _validate_profile(profile: Dict[str, Any], field_prefix: str = "profile") -> Dict[str, Any]:
+    profile_id = str(profile.get("id", "")).strip()
+    if not profile_id:
+        raise ConfigValidationError("MISSING_PROFILE_ID", "配置档案缺少 ID", f"{field_prefix}.id")
+
+    name = str(profile.get("name", "")).strip()
+    if not name:
+        raise ConfigValidationError("MISSING_PROFILE_NAME", "配置档案名称不能为空", f"{field_prefix}.name")
+
+    base_url = str(profile.get("base_url", "")).strip()
+    _validate_base_url(base_url, f"{field_prefix}.base_url")
+
+    model = str(profile.get("model", "")).strip()
+    if not model:
+        raise ConfigValidationError("MISSING_MODEL", "模型名称不能为空", f"{field_prefix}.model")
+
+    account_type = str(profile.get("account_type", "free")).strip().lower() or "free"
+    if account_type not in {"free", "paid"}:
+        raise ConfigValidationError("INVALID_ACCOUNT_TYPE", "账户类型仅支持 free 或 paid", f"{field_prefix}.account_type")
+
+    provider = str(profile.get("provider", "custom")).strip().lower() or "custom"
+    api_key = str(profile.get("api_key", ""))
+    manual_models = _normalize_models(profile.get("manual_models"))
+
+    return {
+        "id": profile_id,
+        "name": name,
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "api_key": api_key,
+        "account_type": account_type,
+        "manual_models": manual_models,
+    }
+
+
+def _migrate_legacy_config(raw: Dict[str, Any]) -> Dict[str, Any]:
+    profile = _default_profile()
+    profile.update({
+        "base_url": str(raw.get("base_url") or profile["base_url"]).strip(),
+        "model": str(raw.get("model") or profile["model"]).strip(),
+        "api_key": str(raw.get("api_key", "")),
+        "account_type": str(raw.get("account_type", "free")).strip().lower() or "free",
+    })
+    profile = _validate_profile(profile, "profiles[0]")
+    return {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "active_profile_id": profile["id"],
+        "profiles": [profile],
+    }
+
+
+def _normalize_config_store(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raw = {}
+
+    if "profiles" not in raw:
+        return _migrate_legacy_config(raw)
+
+    profiles_raw = raw.get("profiles")
+    if not isinstance(profiles_raw, list) or not profiles_raw:
+        raise ConfigValidationError("EMPTY_PROFILES", "至少需要一个配置档案", "profiles")
+
+    profiles = []
+    seen_ids = set()
+    for idx, item in enumerate(profiles_raw):
+        if not isinstance(item, dict):
+            raise ConfigValidationError("INVALID_PROFILE", "配置档案格式无效", f"profiles[{idx}]")
+        cleaned = _validate_profile(item, f"profiles[{idx}]")
+        if cleaned["id"] in seen_ids:
+            raise ConfigValidationError("DUPLICATE_PROFILE_ID", f"配置档案 ID 重复: {cleaned['id']}", f"profiles[{idx}].id")
+        seen_ids.add(cleaned["id"])
+        profiles.append(cleaned)
+
+    active_profile_id = str(raw.get("active_profile_id", "")).strip()
+    if not active_profile_id:
+        active_profile_id = profiles[0]["id"]
+
+    if active_profile_id not in seen_ids:
+        raise ConfigValidationError("ACTIVE_PROFILE_NOT_FOUND", "激活配置档案不存在", "active_profile_id")
+
+    return {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "active_profile_id": active_profile_id,
+        "profiles": profiles,
+    }
+
+
+def _load_config_store() -> Dict[str, Any]:
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return _normalize_config_store(raw)
+        except ConfigValidationError as e:
+            logger.warning(f"配置文件结构无效，将回退默认配置: {e.message}")
+        except Exception as e:
+            logger.warning(f"读取配置失败，将回退默认配置: {e}")
+
+    return _migrate_legacy_config({})
+
+
+def _save_config_store(config_store: Dict[str, Any]):
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config_store, f, ensure_ascii=False, indent=2)
+
+
+def _find_profile(config_store: Dict[str, Any], profile_id: str) -> Optional[Dict[str, Any]]:
+    for profile in config_store.get("profiles", []):
+        if profile.get("id") == profile_id:
+            return profile
+    return None
+
+
+def _active_profile(config_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    profile_id = config_store.get("active_profile_id", "")
+    profile = _find_profile(config_store, profile_id)
+    return profile or (config_store.get("profiles") or [None])[0]
+
+
+def _merge_masked_api_keys(incoming: Dict[str, Any], existing: Dict[str, Any]) -> Dict[str, Any]:
+    existing_map = {item.get("id"): item for item in existing.get("profiles", [])}
+    merged_profiles = []
+    for profile in incoming.get("profiles", []):
+        current = dict(profile)
+        api_key = current.get("api_key", "")
+        if api_key == MASKED_SECRET:
+            previous = existing_map.get(current.get("id"), {})
+            current["api_key"] = previous.get("api_key", "")
+        merged_profiles.append(current)
+    incoming["profiles"] = merged_profiles
+    return incoming
+
+
+def _profile_to_runtime(profile: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "base_url": profile.get("base_url", ""),
+        "model": profile.get("model", ""),
+        "api_key": profile.get("api_key", ""),
+        "account_type": profile.get("account_type", "free"),
+    }
+
+
+def _config_to_view(config_store: Dict[str, Any]) -> ConfigStoreView:
+    profiles_view = []
+    for profile in config_store.get("profiles", []):
+        api_key = profile.get("api_key", "")
+        profiles_view.append(
+            ProfileView(
+                id=profile.get("id", ""),
+                name=profile.get("name", ""),
+                provider=profile.get("provider", "custom"),
+                base_url=profile.get("base_url", ""),
+                model=profile.get("model", ""),
+                api_key=MASKED_SECRET if api_key else "",
+                has_api_key=bool(api_key),
+                account_type=profile.get("account_type", "free"),
+                manual_models=profile.get("manual_models", []),
+            )
+        )
+    return ConfigStoreView(
+        schema_version=CONFIG_SCHEMA_VERSION,
+        active_profile_id=config_store.get("active_profile_id", ""),
+        profiles=profiles_view,
+    )
+
+
+def _apply_runtime_config(config_store: Dict[str, Any]):
+    profile = _active_profile(config_store)
+    if not profile:
+        logger.info("未找到可用配置档案，请在前端设置")
+        return
+
+    runtime_config = _profile_to_runtime(profile)
+    if not runtime_config.get("api_key") and not _is_ollama_url(runtime_config.get("base_url", "")):
+        logger.info("当前激活配置缺少 API Key，请在前端设置")
+        return
+
+    update_client_config(runtime_config)
+    set_model(runtime_config.get("model", "deepseek-chat"))
+    set_account_type(runtime_config.get("account_type", "free"))
+    logger.info(f"配置已应用: profile={profile.get('name')} ({profile.get('provider')})")
+
+
+def _map_error_code(error_text: str) -> str:
+    lowered = (error_text or "").lower()
+    if "401" in lowered or "authentication" in lowered:
+        return "AUTH_FAILED"
+    if "403" in lowered:
+        return "PERMISSION_DENIED"
+    if "404" in lowered:
+        return "RESOURCE_NOT_FOUND"
+    if "429" in lowered or "rate limit" in lowered:
+        return "RATE_LIMITED"
+    if "timeout" in lowered:
+        return "NETWORK_TIMEOUT"
+    if "connection refused" in lowered or "econnrefused" in lowered:
+        return "CONNECTION_REFUSED"
+    return "UNKNOWN_ERROR"
+
+
+def _extract_profile_payload(payload: Dict[str, Any], existing_store: Dict[str, Any]) -> Dict[str, Any]:
+    if "profile" in payload and isinstance(payload["profile"], dict):
+        profile = _validate_profile(payload["profile"], "profile")
+    else:
+        profile = _validate_profile(payload, "profile")
+
+    if profile.get("api_key") == MASKED_SECRET:
+        previous = _find_profile(existing_store, profile.get("id", ""))
+        profile["api_key"] = previous.get("api_key", "") if previous else ""
+
+    return profile
+
+
+# ==================== 启动时配置 ====================
+@app.on_event("startup")
+async def startup_event():
+    """启动时加载配置"""
+    try:
+        config_store = _load_config_store()
+        _apply_runtime_config(config_store)
+    except Exception as e:
+        logger.warning(f"启动时加载配置失败：{e}")
 
 # 配置 CORS
 app.add_middleware(
@@ -884,50 +1188,119 @@ async def check_hardware_status():
     return info
 
 # ==================== 配置 API ====================
-@app.get("/config")
+@app.get("/config", response_model=ConfigStoreView)
 async def get_config():
-    """获取当前配置"""
-    config = load_config()
-    # 隐藏部分 api_key
-    config["api_key"] = "***" if config.get("api_key") else ""
-    return config
+    """获取配置中心数据（多 profile）"""
+    config_store = _load_config_store()
+    return _config_to_view(config_store)
+
 
 @app.post("/config")
-async def set_config(config: Dict):
-    """设置配置"""
-    # 如果 API Key 是保留符号，使用原有 Key
-    if config.get("api_key") == "***":
-        existing_config = load_config()
-        config["api_key"] = existing_config.get("api_key", "")
+async def set_config(request: Request):
+    """保存配置中心数据（支持 legacy payload 自动迁移）"""
+    try:
+        payload = await request.json()
+        normalized = _normalize_config_store(payload)
+        existing = _load_config_store()
+        normalized = _merge_masked_api_keys(normalized, existing)
+        _save_config_store(normalized)
 
-    # 确保 account_type 存在
-    if "account_type" not in config:
-        existing_config = load_config()
-        config["account_type"] = existing_config.get("account_type", "free")
+        try:
+            _apply_runtime_config(normalized)
+        except Exception as runtime_err:
+            # 配置保存成功但运行时应用失败时，返回可诊断信息
+            logger.warning(f"配置已保存，但运行时应用失败: {runtime_err}")
+            return {
+                "success": False,
+                "code": _map_error_code(str(runtime_err)),
+                "message": f"配置已保存，但激活配置应用失败: {runtime_err}",
+                "active_profile_id": normalized.get("active_profile_id"),
+            }
 
-    save_config(config)
-    # 更新运行时配置
-    update_client_config(config)
-    set_model(config.get("model", "deepseek-chat"))
-    # 设置账户类型
-    set_account_type(config.get("account_type", "free"))
-    return {"message": "配置已保存"}
+        return {
+            "success": True,
+            "message": "配置已保存",
+            "active_profile_id": normalized.get("active_profile_id"),
+        }
+    except ConfigValidationError as e:
+        raise HTTPException(status_code=422, detail=e.to_detail())
+    except Exception as e:
+        logger.error(f"保存配置失败：{e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "CONFIG_SAVE_FAILED",
+                "message": f"保存配置失败: {str(e)}",
+            },
+        )
+
 
 @app.post("/config/test")
 async def test_config(request: Request):
-    """测试配置"""
+    """测试单个 profile 配置"""
     try:
         request_data = await request.json()
+        existing = _load_config_store()
+        profile = _extract_profile_payload(request_data, existing)
+        runtime_profile = _profile_to_runtime(profile)
 
-        # 如果 API Key 是保留符号，使用原有 Key 进行测试
-        if request_data.get("api_key") == "***":
-            existing_config = load_config()
-            # 只有当原有配置有 Key 时才替换
-            if existing_config.get("api_key"):
-                request_data["api_key"] = existing_config.get("api_key")
-
-        result = await test_connection(request_data)
+        result = await test_connection(runtime_profile)
+        if not result.get("success"):
+            result["code"] = _map_error_code(result.get("message", ""))
+        else:
+            result["code"] = "OK"
         return result
+    except ConfigValidationError as e:
+        return {"success": False, "code": e.code, "message": e.message, "field": e.field}
     except Exception as e:
         logger.error(f"测试配置失败：{e}")
-        return {"success": False, "message": f"内部错误：{str(e)}"}
+        return {"success": False, "code": "INTERNAL_ERROR", "message": f"内部错误：{str(e)}"}
+
+
+@app.post("/config/models")
+async def load_models(request: ModelListRequest):
+    """动态拉取模型列表；失败时返回手动白名单作为降级来源"""
+    try:
+        existing = _load_config_store()
+        profile_payload = request.profile.model_dump() if hasattr(request.profile, "model_dump") else request.profile.dict()
+        profile = _extract_profile_payload({"profile": profile_payload}, existing)
+        runtime_profile = _profile_to_runtime(profile)
+
+        from cognitive_engine import fetch_models_detailed
+
+        fetch_result = await fetch_models_detailed(
+            base_url=runtime_profile.get("base_url", ""),
+            api_key=runtime_profile.get("api_key", ""),
+        )
+
+        if fetch_result.get("success") and fetch_result.get("models"):
+            return {
+                "success": True,
+                "source": "remote",
+                "models": fetch_result.get("models", []),
+                "message": f"已拉取 {len(fetch_result.get('models', []))} 个模型",
+                "code": "OK",
+            }
+
+        manual_models = profile.get("manual_models", [])
+        if manual_models:
+            return {
+                "success": True,
+                "source": "manual",
+                "models": manual_models,
+                "message": "远程模型列表不可用，已回退到手动白名单",
+                "code": _map_error_code(fetch_result.get("error", "")),
+            }
+
+        return {
+            "success": False,
+            "source": "none",
+            "models": [],
+            "message": fetch_result.get("error", "无法获取模型列表"),
+            "code": _map_error_code(fetch_result.get("error", "")),
+        }
+    except ConfigValidationError as e:
+        return {"success": False, "source": "none", "models": [], "code": e.code, "message": e.message, "field": e.field}
+    except Exception as e:
+        logger.error(f"拉取模型列表失败：{e}")
+        return {"success": False, "source": "none", "models": [], "code": "INTERNAL_ERROR", "message": f"内部错误：{str(e)}"}
