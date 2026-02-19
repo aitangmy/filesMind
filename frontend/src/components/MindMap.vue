@@ -24,6 +24,56 @@ const svgRef = ref(null);
 const toolbarRef = ref(null);
 const transformer = new Transformer();
 let mm_instance = null;
+const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/;
+const PURE_DASH_RE = /^\s*-{5,}\s*$/;
+
+const isTableRowLike = (line) => {
+  const text = (line || '').trim();
+  if (!text || text.startsWith('#')) return false;
+  const pipeMatches = text.match(/\|/g);
+  return pipeMatches && pipeMatches.length >= 2;
+};
+
+const nearestNonEmptyLine = (lines, index, step) => {
+  let i = index + step;
+  while (i >= 0 && i < lines.length) {
+    const text = lines[i].trim();
+    if (text) return text;
+    i += step;
+  }
+  return '';
+};
+
+const sanitizeMarkdownForMindmap = (markdown) => {
+  if (!markdown) return markdown;
+  const lines = markdown.split('\n');
+  const cleaned = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i];
+    const stripped = raw.trim();
+    if (!stripped) {
+      cleaned.push(raw);
+      continue;
+    }
+
+    if (TABLE_SEPARATOR_RE.test(stripped)) {
+      continue;
+    }
+
+    if (PURE_DASH_RE.test(stripped)) {
+      const prev = nearestNonEmptyLine(lines, i, -1);
+      const next = nearestNonEmptyLine(lines, i, 1);
+      if (isTableRowLike(prev) || isTableRowLike(next)) {
+        continue;
+      }
+    }
+
+    cleaned.push(raw);
+  }
+
+  return cleaned.join('\n');
+};
 
 // 导出为 Markdown 文件
 const exportMarkdown = () => {
@@ -134,7 +184,7 @@ const exportPNG = async () => {
 const updateMap = async () => {
     if (!svgRef.value || !props.markdown) return;
 
-    const { root } = transformer.transform(props.markdown);
+    const { root } = transformer.transform(sanitizeMarkdownForMindmap(props.markdown));
 
     if (mm_instance) {
         mm_instance.setData(root);

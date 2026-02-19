@@ -91,6 +91,19 @@ class RefineNodeTests(unittest.TestCase):
         core = next(item for item in data if item["topic"] == "核心概念")
         self.assertEqual(core["details"], ["关键定义"])
 
+    def test_refine_response_removes_table_separator_noise(self):
+        payload = """{
+          "items": [
+            {"topic": "表格结构", "details": ["|------|------|", "有效细节"]},
+            {"topic": "|-----|-----|", "details": ["无效"]}
+          ]
+        }"""
+        data = ce._parse_refine_response(payload, "测试章节")
+
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["topic"], "表格结构")
+        self.assertEqual(data[0]["details"], ["有效细节"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

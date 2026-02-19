@@ -721,6 +721,9 @@ _REFINE_URL_RE = re.compile(r'^https?://', re.IGNORECASE)
 _REFINE_PATH_RE = re.compile(r'^(?:[A-Z]:\\|/(?:usr|home|var|etc|opt|tmp)/)', re.IGNORECASE)
 _REFINE_DIGIT_RE = re.compile(r'^\d{2,}$')
 _REFINE_DIAGRAM_LABEL_RE = re.compile(r'^[A-Za-z]{1,4}\s*\([^)]{1,30}\)$')
+_REFINE_MD_TABLE_SEPARATOR_RE = re.compile(
+    r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$'
+)
 
 
 def _normalize_refine_text(value: str) -> str:
@@ -748,6 +751,8 @@ def _is_refine_noise(text: str) -> bool:
     if _REFINE_DIGIT_RE.match(text):
         return True
     if _REFINE_DIAGRAM_LABEL_RE.match(text):
+        return True
+    if _REFINE_MD_TABLE_SEPARATOR_RE.match(text):
         return True
     return False
 

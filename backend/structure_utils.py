@@ -241,6 +241,10 @@ _STANDALONE_NOISE_RE = re.compile(
 )
 _REPEATED_DECORATIVE_MAX_LEN = 40
 _REPEATED_DECORATIVE_MIN_COUNT = 3
+_MD_TABLE_SEPARATOR_RE = re.compile(
+    r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$'
+)
+_PURE_DASH_LINE_RE = re.compile(r'^\s*-{5,}\s*$')
 
 
 def _normalise_repeated_noise_line(line: str) -> str:
@@ -292,6 +296,56 @@ def detect_and_remove_repeated_decorative_lines(lines: list) -> tuple:
         else:
             cleaned.append(raw)
     return cleaned, repeated_noise
+
+
+def _nearest_non_empty_line(lines: list, start_idx: int, step: int) -> str:
+    i = start_idx + step
+    while 0 <= i < len(lines):
+        stripped = lines[i].strip()
+        if stripped:
+            return stripped
+        i += step
+    return ""
+
+
+def _is_table_row_candidate(text: str) -> bool:
+    return text.count("|") >= 2 and not text.startswith("#")
+
+
+def detect_and_remove_table_separator_lines(lines: list) -> tuple:
+    """
+    Remove markdown table separator rows from content.
+
+    Why:
+    - Docling/OCR occasionally emits extra separator rows inside table bodies
+      (e.g. "|-----|-----|"), which later appear as noisy "-----" lines in map nodes.
+    - Markmap does not need those separator rows to show table text content.
+    """
+    cleaned = []
+    removed = 0
+
+    for idx, raw in enumerate(lines):
+        stripped = raw.strip()
+        if not stripped:
+            cleaned.append(raw)
+            continue
+
+        if _MD_TABLE_SEPARATOR_RE.match(stripped):
+            removed += 1
+            continue
+
+        # OCR may occasionally drop pipe characters and leave a pure dash line
+        # between table rows. Remove only in obvious table context.
+        if _PURE_DASH_LINE_RE.match(stripped):
+            prev_text = _nearest_non_empty_line(lines, idx, -1)
+            next_text = _nearest_non_empty_line(lines, idx, 1)
+            if _is_table_row_candidate(prev_text) or _is_table_row_candidate(next_text):
+                removed += 1
+                continue
+
+        cleaned.append(raw)
+
+    return cleaned, removed
 
 
 def _normalize_heading_topic(topic: str) -> str:
@@ -458,6 +512,11 @@ def preprocess_markdown(text: str) -> str:
     lines = cleaned_lines
     if noise_removed:
         print(f"[preprocess] Removed {noise_removed} standalone noise lines")
+
+    # ── Pass 0.5: remove markdown table separator noise ──────────────────────
+    lines, table_sep_removed = detect_and_remove_table_separator_lines(lines)
+    if table_sep_removed:
+        print(f"[preprocess] Removed {table_sep_removed} table separator line(s)")
 
     # ── Pass 1: frequency+position-based header/footer removal ───────────────
     lines, _hf_fps = detect_and_remove_headers_footers(lines)

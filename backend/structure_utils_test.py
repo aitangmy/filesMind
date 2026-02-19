@@ -126,6 +126,37 @@ class StructureUtilsTests(unittest.TestCase):
         self.assertIn("正文标题", result)
         self.assertIn("第二章", result)
 
+    def test_preprocess_removes_table_separator_lines(self):
+        md = "\n".join([
+            "## 表格章节",
+            "| 阶段 | 说明 |",
+            "|------|------|",
+            "| 需求分析阶段 | 明确目标 |",
+            "|------|------|",
+            "| 设计阶段 | 模块划分 |",
+        ])
+        result = su.preprocess_markdown(md)
+
+        self.assertIn("| 阶段 | 说明 |", result)
+        self.assertIn("| 需求分析阶段 | 明确目标 |", result)
+        self.assertIn("| 设计阶段 | 模块划分 |", result)
+        self.assertNotIn("|------|------|", result)
+
+    def test_preprocess_removes_pure_dash_line_in_table_context(self):
+        md = "\n".join([
+            "## 表格章节",
+            "| 字段 | 含义 |",
+            "--------",
+            "| A | Alpha |",
+            "普通文本中的 ---- 不应被误删",
+        ])
+        result = su.preprocess_markdown(md)
+
+        self.assertIn("| 字段 | 含义 |", result)
+        self.assertIn("| A | Alpha |", result)
+        self.assertNotIn("\n--------\n", f"\n{result}\n")
+        self.assertIn("普通文本中的 ---- 不应被误删", result)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
