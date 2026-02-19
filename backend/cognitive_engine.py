@@ -341,6 +341,16 @@ SYSTEM_PROMPT = """
 - 第 4 层列表："      - 更细节"（6 个空格缩进）
 - 目标：至少 3-4 层深度
 
+【输入噪声处理 - 重要】：
+输入文本来自 PDF 自动解析，可能包含解析残留的噪声内容，请自动识别并忽略以下类型：
+1. 页眉页脚残留（如重复出现的文档标题、公司名称、日期）
+2. 页码（如 "-3-"、"Page 5"、"第3页"、"3 / 20"）
+3. 水印文字（如 "CONFIDENTIAL"、"DRAFT"、"内部文件"、"仅供参考"）
+4. 分隔线和装饰符号（如 "---"、"==="、"***"、"■ ▲ ● ◆"）
+5. 版权声明和免责声明
+6. 纯 URL 或文件路径
+如果发现这些内容，直接跳过，只关注实质性的文档内容。不要将噪声内容作为节点输出。
+
 【内容要求】：
 - 捕获所有关键概念、定义、数据点、示例和关系
 - 使用完整有意义的短语（不要只写单个关键词）
@@ -413,6 +423,8 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
 2. 输入文本中包含 {input_header_count} 个标题，你的输出中也必须包含这 {input_header_count} 个标题（1:1 保留）
 3. context 路径中的标题已在全局存在，不要在输出中重复它们
 4. 禁止生成 # (H1) 标题，H1 只用于文档根节点
+
+【注意】：本段文本来自 PDF 自动解析，可能包含页眉页脚、水印、页码等噪声内容，请智能过滤，不要将它们作为节点输出。
 
 【原文内容】：
 {text_chunk}
@@ -669,6 +681,176 @@ async def generate_mindmap_structure(chunks: list, task=None):
 
     return final_output
 
+def _is_minimax_backend(model: str, client) -> bool:
+    """Detect MiniMax-compatible backend by model id or base_url."""
+    model_lower = (model or "").lower()
+    if "minimax" in model_lower or model_lower.startswith("abab"):
+        return True
+    if is_minimax_2_5_model(model):
+        return True
+
+    base_url = str(getattr(client, "base_url", "")).lower()
+    return "minimaxi.com" in base_url
+
+
+def _should_use_response_format(model: str, client) -> bool:
+    """Use structured response format only for backends with better compatibility."""
+    return not _is_minimax_backend(model, client)
+
+
+def _is_response_format_error(error_message: str) -> bool:
+    msg = (error_message or "").lower()
+    if "response_format" in msg:
+        return True
+    return "expr_path=response_format" in msg
+
+
+_REFINE_NOISE_RE = re.compile(
+    r'^(?:'
+    r'-\s*\d+\s*-'
+    r'|page\s+\d+'
+    r'|\d+\s*/\s*\d+'
+    r'|\d+\s+of\s+\d+'
+    r'|confidential|draft|internal'
+    r'|内部|机密|仅供参考|草稿'
+    r')$',
+    re.IGNORECASE
+)
+_REFINE_DECORATIVE_RE = re.compile(r'^[\s\-=_~*#★☆■▲●◆○△◇•·]{2,}$')
+_REFINE_URL_RE = re.compile(r'^https?://', re.IGNORECASE)
+_REFINE_PATH_RE = re.compile(r'^(?:[A-Z]:\\|/(?:usr|home|var|etc|opt|tmp)/)', re.IGNORECASE)
+_REFINE_DIGIT_RE = re.compile(r'^\d{2,}$')
+_REFINE_DIAGRAM_LABEL_RE = re.compile(r'^[A-Za-z]{1,4}\s*\([^)]{1,30}\)$')
+
+
+def _normalize_refine_text(value: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    text = re.sub(r'^[\-*•\d\.\)\(]+', '', text).strip()
+    text = re.sub(r'\s+', ' ', text)
+    return text
+
+
+def _is_refine_noise(text: str) -> bool:
+    if not text:
+        return True
+    if len(text) < 2:
+        return True
+    if _REFINE_NOISE_RE.match(text):
+        return True
+    if _REFINE_DECORATIVE_RE.match(text):
+        return True
+    if _REFINE_URL_RE.match(text):
+        return True
+    if _REFINE_PATH_RE.match(text):
+        return True
+    if _REFINE_DIGIT_RE.match(text):
+        return True
+    if _REFINE_DIAGRAM_LABEL_RE.match(text):
+        return True
+    return False
+
+
+def _sanitize_refine_items(items: list) -> list:
+    sanitized = []
+    seen_topics = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+
+        topic = _normalize_refine_text(str(raw.get("topic", "")))
+        if _is_refine_noise(topic):
+            continue
+        if len(topic) > 120:
+            topic = topic[:120].rstrip()
+
+        topic_key = topic.lower()
+        if topic_key in seen_topics:
+            continue
+        seen_topics.add(topic_key)
+
+        details_raw = raw.get("details", [])
+        if isinstance(details_raw, str):
+            details_raw = [details_raw]
+        if not isinstance(details_raw, list):
+            details_raw = []
+
+        details = []
+        seen_details = set()
+        for detail in details_raw:
+            text = _normalize_refine_text(str(detail))
+            if _is_refine_noise(text):
+                continue
+            if len(text) > 160:
+                text = text[:160].rstrip()
+            key = text.lower()
+            if key in seen_details:
+                continue
+            seen_details.add(key)
+            details.append(text)
+            if len(details) >= 12:
+                break
+
+        sanitized.append({"topic": topic, "details": details})
+        if len(sanitized) >= 30:
+            break
+
+    return sanitized
+
+
+async def _create_refine_completion(client, request_kwargs: dict, use_response_format: bool):
+    """
+    Send refine request with optional response_format.
+    Some providers reject response_format; if so, retry without it.
+    """
+    if not use_response_format:
+        return await client.chat.completions.create(**request_kwargs)
+
+    try:
+        return await client.chat.completions.create(
+            **request_kwargs,
+            response_format={"type": "json_object"},
+        )
+    except Exception as e:
+        if _is_response_format_error(str(e)):
+            print("Refine node: response_format not supported, retrying without it.")
+            return await client.chat.completions.create(**request_kwargs)
+        raise
+
+
+def _parse_refine_response(content: str, node_title: str) -> list:
+    """Parse model output to list[dict]."""
+    if not content:
+        return []
+
+    cleaned = content.replace("```json", "").replace("```", "").strip()
+    if not cleaned:
+        return []
+
+    import json
+
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        print(f"JSON Parse Error for node {node_title}: {cleaned[:100]}...")
+        return []
+
+    if isinstance(data, list):
+        return _sanitize_refine_items(data)
+
+    if isinstance(data, dict):
+        for key in ["items", "nodes", "children", "data"]:
+            value = data.get(key)
+            if isinstance(value, list):
+                return _sanitize_refine_items(value)
+        if data.get("topic"):
+            return _sanitize_refine_items([data])
+        return []
+
+    return []
+
+
 async def refine_node_content(node_title: str, content_chunk: str, context_path: str = "") -> list:
     """
     Refinement Phase: 针对特定节点生成子级详情
@@ -693,6 +875,17 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
     - 只提取与当前章节标题【强相关】的内容
     - 如果文本包含列表、步骤、或者加粗定义的术语，请务必将其转换为独立的 topic
     - 保留所有具体的参数、数值、日期
+    - topic 要简洁、可读、可独立理解；避免单字、纯数字或乱码
+    - details 仅保留事实性信息，避免重复、空泛措辞
+    
+    【噪声过滤】：
+    输入文本来自 PDF 自动解析，可能包含页眉页脚、页码、水印、分隔线等残留噪声。
+    请自动忽略这些内容，不要将其作为 topic 或 details 输出。
+
+    【质量约束】：
+    - 不输出 “Page 3”“3 / 20”“CONFIDENTIAL”“仅供参考” 等噪声词
+    - 不输出 URL、文件路径、纯符号行
+    - 输出前请自检，确保 JSON 数组中的每个对象都包含 topic 字段
     """
     
     user_prompt = f"""
@@ -708,39 +901,21 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
     try:
         client = get_client()
         model = get_model()
-        
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
+
+        request_kwargs = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.3,
-            max_tokens=2000,
-            response_format={"type": "json_object"} if "minimax" not in model.lower() else None 
-        )
-        
+            "temperature": 0.3,
+            "max_tokens": 2000,
+        }
+
+        use_response_format = _should_use_response_format(model, client)
+        response = await _create_refine_completion(client, request_kwargs, use_response_format)
         content = response.choices[0].message.content
-        # 清理可能存在的 Markdown 标记
-        content = content.replace("```json", "").replace("```", "").strip()
-        
-        # 解析 JSON
-        import json
-        try:
-            data = json.loads(content)
-            # 兼容可能的 { "items": [] } 包裹格式
-            if isinstance(data, dict):
-                for key in ["items", "nodes", "children"]:
-                    if key in data and isinstance(data[key], list):
-                        return data[key]
-                # 如果没找到列表，看看本身是不是 list
-                return []
-            if isinstance(data, list):
-                return data
-            return []
-        except json.JSONDecodeError:
-            print(f"JSON Parse Error for node {node_title}: {content[:100]}...")
-            return []
+        return _parse_refine_response(content, node_title)
             
     except Exception as e:
         print(f"Refine node {node_title} failed: {e}")

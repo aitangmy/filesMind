@@ -200,6 +200,125 @@ _FORMULA_PATTERNS = re.compile(
     r'|\[[^\]]{0,60}\]'
 )
 _MAX_HEADING_LENGTH = 60
+_PURE_SYMBOL_RE = re.compile(r'^[\s★☆*#\-_=~`·•\[\]【】()（）]+$')
+_PURE_DIGIT_RE = re.compile(r'^\d{2,}$')
+_SHORT_GARBAGE_TOKEN_RE = re.compile(r'^[A-Za-z]\d{0,3}[*#]?$')
+_DIAGRAM_LABEL_RE = re.compile(r'^[A-Za-z]{1,4}\s*\([^)]{1,30}\)$')
+_SENTENCE_PUNCT_RE = re.compile(r'[，。！？；?!;]')
+_LONG_DIGIT_PREFIX_2_RE = re.compile(r'^\d{4,}(\d{2}(?:\.\d+)+(?:\.?\s*.*)?)$')
+_LONG_DIGIT_PREFIX_1_RE = re.compile(r'^\d{4,}(\d(?:\.\d+)+(?:\.?\s*.*)?)$')
+
+# ── Phase 2 Enhancement: Additional noise patterns ───────────────────────────
+_WATERMARK_RE = re.compile(
+    r'^(?:confidential|draft|internal|'
+    r'\u5185\u90e8|\u673a\u5bc6|\u4ec5\u4f9b\u53c2\u8003|\u4fdd\u5bc6|'
+    r'\u8349\u7a3f|\u5f85\u5ba1|\u672a\u5b9a\u7a3f)$',
+    re.IGNORECASE
+)
+_PAGE_NUMBER_RE = re.compile(
+    r'^(?:'
+    r'-\s*\d+\s*-'
+    r'|page\s+\d+'
+    r'|\u7b2c\s*\d+\s*\u9875'
+    r'|\d+\s*/\s*\d+'
+    r'|\d+\s+of\s+\d+'
+    r')$',
+    re.IGNORECASE
+)
+_DECORATIVE_LINE_RE = re.compile(r'^[\s\-=_~*\u25a0\u25b2\u25cf\u25c6\u25cb\u25b3\u25c7\u2605\u2606\u2022\u00b7]{3,}$')
+_URL_RE = re.compile(r'^https?://', re.IGNORECASE)
+_FILE_PATH_RE = re.compile(r'^(?:[A-Z]:\\|/(?:usr|home|var|etc|opt|tmp)/)', re.IGNORECASE)
+_COPYRIGHT_RE = re.compile(r'^[\u00a9\xc2]|^copyright\s|^\u7248\u6743|^all\s+rights\s+reserved', re.IGNORECASE)
+_STANDALONE_NOISE_RE = re.compile(
+    r'^(?:'
+    r'-\s*\d+\s*-'
+    r'|page\s+\d+'
+    r'|\u7b2c\s*\d+\s*\u9875'
+    r'|\d+\s*/\s*\d+'
+    r'|\d+\s+of\s+\d+'
+    r')$',
+    re.IGNORECASE
+)
+_REPEATED_DECORATIVE_MAX_LEN = 40
+_REPEATED_DECORATIVE_MIN_COUNT = 3
+
+
+def _normalise_repeated_noise_line(line: str) -> str:
+    line = re.sub(r'^#+\s*', '', line)
+    line = re.sub(r'\s+', ' ', line)
+    return line.strip()
+
+
+def detect_and_remove_repeated_decorative_lines(lines: list) -> tuple:
+    """
+    Remove globally repeated decorative/noise lines.
+
+    This complements Method B (position+frequency) for cases where OCR/output
+    order causes noise lines to escape top/bottom zone detection.
+    """
+    candidates = []
+    for raw in lines:
+        text = _normalise_repeated_noise_line(raw)
+        if not text:
+            continue
+        if len(text) > _REPEATED_DECORATIVE_MAX_LEN:
+            continue
+        if (
+            _STANDALONE_NOISE_RE.match(text)
+            or _DECORATIVE_LINE_RE.match(text)
+            or _WATERMARK_RE.match(text)
+            or _COPYRIGHT_RE.match(text)
+            or _URL_RE.match(text)
+        ):
+            candidates.append(text.lower())
+
+    counter = Counter(candidates)
+    repeated_noise = {
+        text for text, count in counter.items()
+        if count >= _REPEATED_DECORATIVE_MIN_COUNT
+    }
+
+    if repeated_noise:
+        print(
+            f"[preprocess] Repeated decorative lines removed: {len(repeated_noise)} "
+            f"(min_count={_REPEATED_DECORATIVE_MIN_COUNT})"
+        )
+
+    cleaned = []
+    for raw in lines:
+        text = _normalise_repeated_noise_line(raw).lower()
+        if text in repeated_noise:
+            cleaned.append('')
+        else:
+            cleaned.append(raw)
+    return cleaned, repeated_noise
+
+
+def _normalize_heading_topic(topic: str) -> str:
+    """
+    Recover likely heading text from OCR line-noise.
+    Example: "7174811.2. 内存管理" -> "11.2. 内存管理"
+    """
+    topic = topic.strip()
+    for pattern in (_LONG_DIGIT_PREFIX_2_RE, _LONG_DIGIT_PREFIX_1_RE):
+        m = pattern.match(topic)
+        if m:
+            topic = m.group(1).strip()
+            break
+    return topic
+
+
+def _has_structured_prefix(topic: str) -> bool:
+    return bool(
+        _STRICT_NUMERIC_RE.match(topic)
+        or re.match(
+            r'^\u7b2c[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\d]+'
+            r'[\u7ae0\u8282\u7bc7\u90e8]',
+            topic
+        )
+        or re.match(r'^(?:Chapter|Section|Part|Appendix)\s+[\dIVXivx]+', topic, re.IGNORECASE)
+        or re.match(r'^Q\d+\s*[：:。\s]', topic, re.IGNORECASE)
+    )
 
 
 def is_valid_heading(topic: str) -> bool:
@@ -207,9 +326,30 @@ def is_valid_heading(topic: str) -> bool:
     Heuristic filter: decide whether a Markdown heading line is a genuine
     section title or body text that Docling mis-labelled as a heading.
     """
-    topic = topic.strip()
+    topic = _normalize_heading_topic(topic)
+
+    if not topic:
+        return False
 
     if len(topic) > _MAX_HEADING_LENGTH:
+        return False
+
+    if _PURE_SYMBOL_RE.match(topic):
+        return False
+
+    if _PURE_DIGIT_RE.match(topic):
+        return False
+
+    if len(topic) == 1 and re.match(r'[\u4e00-\u9fffA-Za-z0-9]', topic):
+        return False
+
+    if _SHORT_GARBAGE_TOKEN_RE.match(topic):
+        return False
+
+    if _DIAGRAM_LABEL_RE.match(topic):
+        return False
+
+    if topic in {"年", "月", "日"}:
         return False
 
     if _BODY_TEXT_STARTERS.match(topic):
@@ -218,15 +358,33 @@ def is_valid_heading(topic: str) -> bool:
     if _LIST_ITEM_RE.match(topic):
         return False
 
-    if _FORMULA_PATTERNS.search(topic):
-        has_section_number = bool(_STRICT_NUMERIC_RE.match(topic))
-        has_chinese_chapter = bool(re.match(
-            r'^\u7b2c[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\d]+'
-            r'[\u7ae0\u8282\u7bc7\u90e8]',
-            topic
-        ))
-        if not has_section_number and not has_chinese_chapter:
+    has_structured_prefix = _has_structured_prefix(topic)
+    if _SENTENCE_PUNCT_RE.search(topic) and not has_structured_prefix:
+        if len(topic) >= 18 or len(_SENTENCE_PUNCT_RE.findall(topic)) >= 2:
             return False
+
+    if _FORMULA_PATTERNS.search(topic):
+        if not has_structured_prefix:
+            return False
+
+    # ── Phase 2: Additional noise filters ────────────────────────────────────
+    if _WATERMARK_RE.match(topic):
+        return False
+
+    if _PAGE_NUMBER_RE.match(topic):
+        return False
+
+    if _DECORATIVE_LINE_RE.match(topic):
+        return False
+
+    if _URL_RE.match(topic):
+        return False
+
+    if _FILE_PATH_RE.match(topic):
+        return False
+
+    if _COPYRIGHT_RE.match(topic):
+        return False
 
     return True
 
@@ -277,8 +435,35 @@ def preprocess_markdown(text: str) -> str:
     """
     lines = text.split('\n')
 
+    # ── Pass 0: Remove standalone noise lines (page numbers, watermarks,
+    #    decorative dividers) that are NOT headings but pollute content ────────
+    cleaned_lines = []
+    noise_removed = 0
+    for line in lines:
+        stripped = line.strip()
+        # Skip heading lines — they are handled by is_valid_heading later
+        if stripped.startswith('#'):
+            cleaned_lines.append(line)
+            continue
+        # Remove standalone noise
+        if stripped and (
+            _STANDALONE_NOISE_RE.match(stripped)
+            or _WATERMARK_RE.match(stripped)
+            or _DECORATIVE_LINE_RE.match(stripped)
+            or _COPYRIGHT_RE.match(stripped)
+        ):
+            noise_removed += 1
+            continue
+        cleaned_lines.append(line)
+    lines = cleaned_lines
+    if noise_removed:
+        print(f"[preprocess] Removed {noise_removed} standalone noise lines")
+
     # ── Pass 1: frequency+position-based header/footer removal ───────────────
     lines, _hf_fps = detect_and_remove_headers_footers(lines)
+
+    # ── Pass 1.5: remove globally repeated decorative lines ───────────────────
+    lines, _rep_noise = detect_and_remove_repeated_decorative_lines(lines)
 
     # ── Pass 2: TOC region detection and heading demotion ────────────────────
     toc_start, toc_end = _detect_toc_region(lines)
@@ -373,33 +558,36 @@ def build_hierarchy_tree(markdown_text):
     stack = [root]
 
     # Pre-scan for numeric inference threshold
-    raw_header_lines = [l for l in lines if re.match(r'^(#+)\s+(.*)', l)]
-
-    valid_header_lines = []
-    for l in raw_header_lines:
-        m = re.match(r'^(#+)\s+(.*)', l)
-        if m and is_valid_heading(m.group(2).strip()):
-            valid_header_lines.append(l)
+    raw_header_topics = []
+    valid_header_topics = []
+    for line in lines:
+        m = re.match(r'^(#+)\s+(.*)', line)
+        if not m:
+            continue
+        topic = _normalize_heading_topic(m.group(2).strip())
+        raw_header_topics.append(topic)
+        if is_valid_heading(topic):
+            valid_header_topics.append(topic)
 
     numbered_count = sum(
-        1 for l in valid_header_lines
+        1 for topic in valid_header_topics
         if re.match(
-            r'^#+\s+(?:'
+            r'^(?:'
             r'\d+(?:\.\d+)*\.?\s*(?=[a-zA-Z\u4e00-\u9fff\uff08\u3010\[（【])'
             r'|\u7b2c[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\d]+[\u7ae0\u8282\u7bc7\u90e8]'
             r'|(?:Chapter|Section|Part|Appendix)\s+[\dIVXivx]+'
             r'|Q\d+\s*[：:。\s]'
             r')',
-            l, re.IGNORECASE
+            topic, re.IGNORECASE
         )
     )
     use_numbering_inference = (
-        len(valid_header_lines) > 0 and
-        (numbered_count / len(valid_header_lines)) >= 0.5
+        len(valid_header_topics) > 0 and
+        (numbered_count / len(valid_header_topics)) >= 0.5
     )
 
-    total_raw   = len(raw_header_lines)
-    total_valid = len(valid_header_lines)
+    total_raw   = len(raw_header_topics)
+    total_valid = len(valid_header_topics)
     demoted     = total_raw - total_valid
     print(
         f"[build_hierarchy_tree] Raw headings: {total_raw}, "
@@ -413,7 +601,7 @@ def build_hierarchy_tree(markdown_text):
 
         if header_match:
             markdown_level = len(header_match.group(1))
-            topic = header_match.group(2).strip()
+            topic = _normalize_heading_topic(header_match.group(2).strip())
 
             if not is_valid_heading(topic):
                 if topic:

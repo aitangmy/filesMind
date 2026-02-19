@@ -19,6 +19,7 @@ FilesMind 是一个开源文档分析工具，面向深度阅读场景。它结�
 3. 基于 IBM Docling 的深度 PDF 解析（文本、表格、图片、公式）。
 4. 原生 `.xmind` 导出，支持图片。
 5. 前后端分离架构（Vue 3 + FastAPI）。
+6. 可切换 PDF 解析后端：`docling` / `marker` / `hybrid`。
 
 ---
 
@@ -77,6 +78,35 @@ npm run dev
 4. 点击 **测试连接**，再点击 **保存配置**
 
 如果模型配置无效，上传后会处理失败。
+
+### 6. 可选：启用 Marker/Hybrid 解析
+
+现在可通过环境变量切换解析后端：
+
+- `PARSER_BACKEND=docling`（默认）
+- `PARSER_BACKEND=marker`
+- `PARSER_BACKEND=hybrid`（先 Docling，噪声高时自动回退 Marker）
+
+先安装 Marker：
+
+```bash
+uv pip install marker-pdf
+```
+
+以 hybrid 模式启动后端：
+
+```bash
+cd backend
+PARSER_BACKEND=hybrid uv run uvicorn app:app --reload --host 0.0.0.0 --port 8000
+```
+
+可选：调整回退阈值（无效标题比例）
+
+```bash
+HYBRID_NOISE_THRESHOLD=0.20
+```
+
+注意：`marker-pdf` / `surya-ocr` 的许可证与本仓库 MIT 不同；若用于再分发或商业场景，请先做许可证合规评估。
 
 ---
 

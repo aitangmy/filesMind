@@ -14,6 +14,15 @@ def _install_test_stubs():
     """Install lightweight stubs so app import does not require heavy runtime deps."""
     parser_service = types.ModuleType("parser_service")
     parser_service.process_pdf_safely = lambda *args, **kwargs: ("# dummy\n", None)
+    parser_service.get_parser_runtime_config = lambda: {
+        "parser_backend": "docling",
+        "hybrid_noise_threshold": 0.2,
+        "hybrid_docling_skip_score": 70.0,
+        "hybrid_switch_min_delta": 2.0,
+        "hybrid_marker_min_length": 200,
+        "marker_prefer_api": False,
+    }
+    parser_service.update_parser_runtime_config = lambda *args, **kwargs: None
     sys.modules["parser_service"] = parser_service
 
     cognitive_engine = types.ModuleType("cognitive_engine")
@@ -26,6 +35,10 @@ def _install_test_stubs():
         return {"success": True, "message": "ok"}
 
     cognitive_engine.test_connection = _test_connection
+    async def _fetch_models_detailed(*args, **kwargs):
+        return {"success": True, "models": ["dummy-model"], "error": ""}
+
+    cognitive_engine.fetch_models_detailed = _fetch_models_detailed
     sys.modules["cognitive_engine"] = cognitive_engine
 
     hardware_utils = types.ModuleType("hardware_utils")
@@ -61,6 +74,7 @@ class FastAPIEndpointTests(unittest.TestCase):
         app_module.IMAGES_DIR = str(self.base / "data" / "images")
         app_module.HISTORY_FILE = str(self.base / "data" / "history.json")
         app_module.CONFIG_FILE = str(self.base / "data" / "config.json")
+        app_module.CONFIG_KEY_FILE = str(self.base / "data" / "config.key")
 
         os.makedirs(app_module.PDF_DIR, exist_ok=True)
         os.makedirs(app_module.MD_DIR, exist_ok=True)
@@ -215,6 +229,126 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertIn("attachment; filename=paper.xmind", res.headers.get("content-disposition", ""))
         mock_gen.assert_called_once()
         self.assertEqual(mock_gen.call_args.kwargs.get("images_dir"), expected_images_dir)
+
+    def test_config_save_encrypts_api_key_and_get_masks(self):
+        payload = {
+            "active_profile_id": "p1",
+            "profiles": [
+                {
+                    "id": "p1",
+                    "name": "default",
+                    "provider": "deepseek",
+                    "base_url": "https://api.deepseek.com",
+                    "model": "deepseek-chat",
+                    "api_key": "sk-test-123",
+                    "account_type": "free",
+                    "manual_models": ["deepseek-chat"],
+                }
+            ],
+        }
+
+        with TestClient(app_module.app) as client:
+            save_res = client.post("/config", json=payload)
+            self.assertEqual(save_res.status_code, 200)
+
+            get_res = client.get("/config")
+            self.assertEqual(get_res.status_code, 200)
+            view = get_res.json()
+            self.assertEqual(view["profiles"][0]["api_key"], "***")
+            self.assertTrue(view["profiles"][0]["has_api_key"])
+
+        config_file_content = Path(app_module.CONFIG_FILE).read_text(encoding="utf-8")
+        self.assertNotIn("sk-test-123", config_file_content)
+        self.assertIn("enc:v1:", config_file_content)
+
+    def test_config_export_and_import_roundtrip_without_plaintext_key(self):
+        initial_payload = {
+            "active_profile_id": "p1",
+            "profiles": [
+                {
+                    "id": "p1",
+                    "name": "default",
+                    "provider": "deepseek",
+                    "base_url": "https://api.deepseek.com",
+                    "model": "deepseek-chat",
+                    "api_key": "sk-test-456",
+                    "account_type": "free",
+                    "manual_models": ["deepseek-chat"],
+                }
+            ],
+        }
+
+        with TestClient(app_module.app) as client:
+            save_res = client.post("/config", json=initial_payload)
+            self.assertEqual(save_res.status_code, 200)
+
+            export_res = client.get("/config/export")
+            self.assertEqual(export_res.status_code, 200)
+            exported = export_res.json()
+            self.assertEqual(exported["profiles"][0]["api_key"], "")
+            self.assertTrue(exported["profiles"][0]["has_api_key"])
+
+            imported_payload = {
+                "active_profile_id": "p1",
+                "profiles": [
+                    {
+                        "id": "p1",
+                        "name": "default",
+                        "provider": "deepseek",
+                        "base_url": "https://api.deepseek.com",
+                        "model": "deepseek-chat",
+                        "api_key": "",
+                        "has_api_key": True,
+                        "account_type": "free",
+                        "manual_models": ["deepseek-chat"],
+                    }
+                ],
+            }
+            import_res = client.post("/config/import", json=imported_payload)
+            self.assertEqual(import_res.status_code, 200)
+            self.assertTrue(import_res.json().get("success"))
+
+            get_res = client.get("/config")
+            self.assertEqual(get_res.status_code, 200)
+            view = get_res.json()
+            self.assertEqual(view["profiles"][0]["api_key"], "***")
+            self.assertTrue(view["profiles"][0]["has_api_key"])
+
+    def test_config_roundtrip_includes_parser_settings(self):
+        payload = {
+            "active_profile_id": "p1",
+            "parser": {
+                "parser_backend": "hybrid",
+                "hybrid_noise_threshold": 0.35,
+                "hybrid_docling_skip_score": 68,
+                "hybrid_switch_min_delta": 3,
+                "hybrid_marker_min_length": 300,
+                "marker_prefer_api": True,
+            },
+            "profiles": [
+                {
+                    "id": "p1",
+                    "name": "default",
+                    "provider": "deepseek",
+                    "base_url": "https://api.deepseek.com",
+                    "model": "deepseek-chat",
+                    "api_key": "sk-test-999",
+                    "account_type": "free",
+                    "manual_models": ["deepseek-chat"],
+                }
+            ],
+        }
+
+        with TestClient(app_module.app) as client:
+            save_res = client.post("/config", json=payload)
+            self.assertEqual(save_res.status_code, 200)
+
+            get_res = client.get("/config")
+            self.assertEqual(get_res.status_code, 200)
+            parser = get_res.json().get("parser", {})
+            self.assertEqual(parser.get("parser_backend"), "hybrid")
+            self.assertEqual(parser.get("hybrid_marker_min_length"), 300)
+            self.assertTrue(parser.get("marker_prefer_api"))
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ FilesMind is an open-source document analysis tool for deep reading. It uses Doc
 3. Deep PDF parsing via IBM Docling (text, tables, images, formulas).
 4. Native `.xmind` export with image support.
 5. Frontend-backend decoupled architecture (Vue 3 + FastAPI).
+6. Switchable PDF parser backend: `docling` / `marker` / `hybrid`.
 
 ---
 
@@ -77,6 +78,35 @@ Before uploading PDF, open **Settings** in the UI and set:
 4. Click **Test Connection** and then **Save**
 
 Without valid model configuration, processing requests will fail.
+
+### 6. Optional: Enable Marker/Hybrid parser
+
+FilesMind now supports parser backend switching via env var:
+
+- `PARSER_BACKEND=docling` (default)
+- `PARSER_BACKEND=marker`
+- `PARSER_BACKEND=hybrid` (Docling first, auto fallback to Marker on noisy output)
+
+Install Marker first:
+
+```bash
+uv pip install marker-pdf
+```
+
+Start backend in hybrid mode:
+
+```bash
+cd backend
+PARSER_BACKEND=hybrid uv run uvicorn app:app --reload --host 0.0.0.0 --port 8000
+```
+
+Tune fallback sensitivity (optional):
+
+```bash
+HYBRID_NOISE_THRESHOLD=0.20
+```
+
+Note: `marker-pdf` / `surya-ocr` have different license terms than this repository (MIT). Verify compatibility before redistribution/commercial use.
 
 ---
 

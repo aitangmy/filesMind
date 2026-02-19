@@ -8,9 +8,10 @@ import asyncio
 import logging
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 import threading
+from copy import deepcopy
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,9 +25,10 @@ from pydantic import BaseModel, Field
 from typing import Optional, Dict, List, Any
 from urllib.parse import urlparse
 import shutil
+from cryptography.fernet import Fernet, InvalidToken
 
 # 导入扩展模块
-from parser_service import process_pdf_safely
+from parser_service import process_pdf_safely, get_parser_runtime_config, update_parser_runtime_config
 from cognitive_engine import generate_mindmap_structure, update_client_config, test_connection, set_model, set_account_type
 from xmind_exporter import generate_xmind_content
 
@@ -211,8 +213,11 @@ app = FastAPI()
 # 使用绝对路径，确保在任何目录启动都能找到配置
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "data", "config.json")
+CONFIG_KEY_FILE = os.path.join(BASE_DIR, "data", "config.key")
 MASKED_SECRET = "***"
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
+ENCRYPTION_PREFIX = "enc:v1:"
+_config_cipher: Optional[Fernet] = None
 
 DEFAULT_PROVIDER_PRESETS = {
     "minimax": {"base_url": "https://api.minimaxi.com/v1", "model": "MiniMax-M2.5"},
@@ -251,9 +256,19 @@ class ProfilePayload(BaseModel):
     manual_models: List[str] = Field(default_factory=list)
 
 
+class ParserSettingsPayload(BaseModel):
+    parser_backend: str = "docling"
+    hybrid_noise_threshold: float = 0.20
+    hybrid_docling_skip_score: float = 70.0
+    hybrid_switch_min_delta: float = 2.0
+    hybrid_marker_min_length: int = 200
+    marker_prefer_api: bool = False
+
+
 class ConfigStorePayload(BaseModel):
     active_profile_id: str
     profiles: List[ProfilePayload] = Field(default_factory=list)
+    parser: ParserSettingsPayload = Field(default_factory=ParserSettingsPayload)
 
 
 class ProfileView(BaseModel):
@@ -272,10 +287,17 @@ class ConfigStoreView(BaseModel):
     schema_version: int
     active_profile_id: str
     profiles: List[ProfileView] = Field(default_factory=list)
+    parser: ParserSettingsPayload = Field(default_factory=ParserSettingsPayload)
 
 
 class ModelListRequest(BaseModel):
     profile: ProfilePayload
+
+
+class ConfigImportPayload(BaseModel):
+    active_profile_id: str
+    profiles: List[Dict[str, Any]] = Field(default_factory=list)
+    parser: Optional[Dict[str, Any]] = None
 
 
 def _is_ollama_url(base_url: str) -> bool:
@@ -294,6 +316,18 @@ def _default_profile() -> Dict[str, Any]:
         "api_key": "",
         "account_type": "free",
         "manual_models": [],
+    }
+
+
+def _default_parser_config() -> Dict[str, Any]:
+    runtime = get_parser_runtime_config()
+    return {
+        "parser_backend": str(runtime.get("parser_backend", "docling")),
+        "hybrid_noise_threshold": float(runtime.get("hybrid_noise_threshold", 0.20)),
+        "hybrid_docling_skip_score": float(runtime.get("hybrid_docling_skip_score", 70.0)),
+        "hybrid_switch_min_delta": float(runtime.get("hybrid_switch_min_delta", 2.0)),
+        "hybrid_marker_min_length": int(runtime.get("hybrid_marker_min_length", 200)),
+        "marker_prefer_api": bool(runtime.get("marker_prefer_api", False)),
     }
 
 
@@ -319,22 +353,161 @@ def _normalize_models(models: Any) -> List[str]:
     return normalized[:100]
 
 
+def _ensure_config_key() -> bytes:
+    os.makedirs(os.path.dirname(CONFIG_KEY_FILE), exist_ok=True)
+    if os.path.exists(CONFIG_KEY_FILE):
+        with open(CONFIG_KEY_FILE, "rb") as f:
+            key = f.read().strip()
+        if key:
+            return key
+
+    key = Fernet.generate_key()
+    with open(CONFIG_KEY_FILE, "wb") as f:
+        f.write(key)
+    try:
+        os.chmod(CONFIG_KEY_FILE, 0o600)
+    except Exception:
+        # Windows on some environments does not fully support chmod semantics.
+        pass
+    return key
+
+
+def _get_config_cipher() -> Fernet:
+    global _config_cipher
+    if _config_cipher is None:
+        _config_cipher = Fernet(_ensure_config_key())
+    return _config_cipher
+
+
+def _encrypt_secret(secret: str) -> str:
+    if not secret:
+        return ""
+    if secret.startswith(ENCRYPTION_PREFIX):
+        return secret
+    cipher = _get_config_cipher()
+    token = cipher.encrypt(secret.encode("utf-8")).decode("utf-8")
+    return f"{ENCRYPTION_PREFIX}{token}"
+
+
+def _decrypt_secret(secret: str) -> str:
+    if not secret:
+        return ""
+    if not secret.startswith(ENCRYPTION_PREFIX):
+        return secret
+    cipher = _get_config_cipher()
+    token = secret[len(ENCRYPTION_PREFIX):]
+    try:
+        return cipher.decrypt(token.encode("utf-8")).decode("utf-8")
+    except InvalidToken:
+        raise ConfigValidationError("INVALID_ENCRYPTED_KEY", "密钥解密失败，配置文件可能已损坏")
+
+
+def _decrypt_store_inplace(raw: Dict[str, Any]):
+    if "profiles" in raw and isinstance(raw.get("profiles"), list):
+        for profile in raw["profiles"]:
+            if isinstance(profile, dict) and "api_key" in profile:
+                profile["api_key"] = _decrypt_secret(str(profile.get("api_key", "")))
+    elif "api_key" in raw:
+        # legacy 单配置
+        raw["api_key"] = _decrypt_secret(str(raw.get("api_key", "")))
+
+
+def _encrypt_store_for_disk(config_store: Dict[str, Any]) -> Dict[str, Any]:
+    cloned = deepcopy(config_store)
+    for profile in cloned.get("profiles", []):
+        api_key = str(profile.get("api_key", ""))
+        profile["api_key"] = _encrypt_secret(api_key)
+    return cloned
+
+
 def _validate_base_url(base_url: str, field: str):
     if not base_url or not base_url.strip():
         raise ConfigValidationError("MISSING_BASE_URL", "API Base URL 不能为空", field)
     parsed = urlparse(base_url.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ConfigValidationError("INVALID_BASE_URL", "API Base URL 格式无效，需以 http:// 或 https:// 开头", field)
+    if len(base_url) > 200:
+        raise ConfigValidationError("BASE_URL_TOO_LONG", "API Base URL 长度不能超过 200", field)
+
+
+def _validate_parser_config(parser: Any, field_prefix: str = "parser") -> Dict[str, Any]:
+    if parser is None:
+        parser = {}
+    if not isinstance(parser, dict):
+        raise ConfigValidationError("INVALID_PARSER_CONFIG", "解析配置格式无效", field_prefix)
+
+    backend = str(parser.get("parser_backend", "docling")).strip().lower() or "docling"
+    if backend not in {"docling", "marker", "hybrid"}:
+        raise ConfigValidationError(
+            "INVALID_PARSER_BACKEND",
+            "解析后端仅支持 docling / marker / hybrid",
+            f"{field_prefix}.parser_backend",
+        )
+
+    def _as_float(name: str, min_v: float, max_v: float, default: float) -> float:
+        raw = parser.get(name, default)
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            raise ConfigValidationError(
+                f"INVALID_{name.upper()}",
+                f"{name} 必须是数字",
+                f"{field_prefix}.{name}",
+            )
+        if val < min_v or val > max_v:
+            raise ConfigValidationError(
+                f"OUT_OF_RANGE_{name.upper()}",
+                f"{name} 必须在 {min_v} 到 {max_v} 之间",
+                f"{field_prefix}.{name}",
+            )
+        return val
+
+    def _as_int(name: str, min_v: int, max_v: int, default: int) -> int:
+        raw = parser.get(name, default)
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            raise ConfigValidationError(
+                f"INVALID_{name.upper()}",
+                f"{name} 必须是整数",
+                f"{field_prefix}.{name}",
+            )
+        if val < min_v or val > max_v:
+            raise ConfigValidationError(
+                f"OUT_OF_RANGE_{name.upper()}",
+                f"{name} 必须在 {min_v} 到 {max_v} 之间",
+                f"{field_prefix}.{name}",
+            )
+        return val
+
+    marker_prefer_api_raw = parser.get("marker_prefer_api", False)
+    if isinstance(marker_prefer_api_raw, bool):
+        marker_prefer_api = marker_prefer_api_raw
+    else:
+        marker_prefer_api = str(marker_prefer_api_raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    return {
+        "parser_backend": backend,
+        "hybrid_noise_threshold": _as_float("hybrid_noise_threshold", 0.0, 1.0, 0.20),
+        "hybrid_docling_skip_score": _as_float("hybrid_docling_skip_score", 0.0, 100.0, 70.0),
+        "hybrid_switch_min_delta": _as_float("hybrid_switch_min_delta", 0.0, 50.0, 2.0),
+        "hybrid_marker_min_length": _as_int("hybrid_marker_min_length", 0, 1000000, 200),
+        "marker_prefer_api": marker_prefer_api,
+    }
 
 
 def _validate_profile(profile: Dict[str, Any], field_prefix: str = "profile") -> Dict[str, Any]:
     profile_id = str(profile.get("id", "")).strip()
     if not profile_id:
         raise ConfigValidationError("MISSING_PROFILE_ID", "配置档案缺少 ID", f"{field_prefix}.id")
+    if len(profile_id) > 80:
+        raise ConfigValidationError("PROFILE_ID_TOO_LONG", "配置档案 ID 长度不能超过 80", f"{field_prefix}.id")
 
     name = str(profile.get("name", "")).strip()
     if not name:
         raise ConfigValidationError("MISSING_PROFILE_NAME", "配置档案名称不能为空", f"{field_prefix}.name")
+    if len(name) > 60:
+        raise ConfigValidationError("PROFILE_NAME_TOO_LONG", "配置档案名称长度不能超过 60", f"{field_prefix}.name")
 
     base_url = str(profile.get("base_url", "")).strip()
     _validate_base_url(base_url, f"{field_prefix}.base_url")
@@ -342,13 +515,22 @@ def _validate_profile(profile: Dict[str, Any], field_prefix: str = "profile") ->
     model = str(profile.get("model", "")).strip()
     if not model:
         raise ConfigValidationError("MISSING_MODEL", "模型名称不能为空", f"{field_prefix}.model")
+    if len(model) > 120:
+        raise ConfigValidationError("MODEL_NAME_TOO_LONG", "模型名称长度不能超过 120", f"{field_prefix}.model")
 
     account_type = str(profile.get("account_type", "free")).strip().lower() or "free"
     if account_type not in {"free", "paid"}:
         raise ConfigValidationError("INVALID_ACCOUNT_TYPE", "账户类型仅支持 free 或 paid", f"{field_prefix}.account_type")
 
     provider = str(profile.get("provider", "custom")).strip().lower() or "custom"
+    if provider not in DEFAULT_PROVIDER_PRESETS:
+        raise ConfigValidationError("INVALID_PROVIDER", f"不支持的 provider: {provider}", f"{field_prefix}.provider")
     api_key = str(profile.get("api_key", ""))
+    if len(api_key) > 1024:
+        raise ConfigValidationError("API_KEY_TOO_LONG", "API Key 长度不能超过 1024", f"{field_prefix}.api_key")
+    if _is_ollama_url(base_url) and api_key and api_key != MASKED_SECRET:
+        # 允许填写但给出温和规范（自动忽略）
+        logger.info("检测到 Ollama 配置，API Key 将按本地模式处理")
     manual_models = _normalize_models(profile.get("manual_models"))
 
     return {
@@ -372,10 +554,12 @@ def _migrate_legacy_config(raw: Dict[str, Any]) -> Dict[str, Any]:
         "account_type": str(raw.get("account_type", "free")).strip().lower() or "free",
     })
     profile = _validate_profile(profile, "profiles[0]")
+    parser = _validate_parser_config(raw.get("parser", _default_parser_config()), "parser")
     return {
         "schema_version": CONFIG_SCHEMA_VERSION,
         "active_profile_id": profile["id"],
         "profiles": [profile],
+        "parser": parser,
     }
 
 
@@ -408,10 +592,13 @@ def _normalize_config_store(raw: Any) -> Dict[str, Any]:
     if active_profile_id not in seen_ids:
         raise ConfigValidationError("ACTIVE_PROFILE_NOT_FOUND", "激活配置档案不存在", "active_profile_id")
 
+    parser = _validate_parser_config(raw.get("parser", _default_parser_config()), "parser")
+
     return {
         "schema_version": CONFIG_SCHEMA_VERSION,
         "active_profile_id": active_profile_id,
         "profiles": profiles,
+        "parser": parser,
     }
 
 
@@ -420,6 +607,7 @@ def _load_config_store() -> Dict[str, Any]:
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
+            _decrypt_store_inplace(raw)
             return _normalize_config_store(raw)
         except ConfigValidationError as e:
             logger.warning(f"配置文件结构无效，将回退默认配置: {e.message}")
@@ -431,8 +619,9 @@ def _load_config_store() -> Dict[str, Any]:
 
 def _save_config_store(config_store: Dict[str, Any]):
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    encrypted_store = _encrypt_store_for_disk(config_store)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config_store, f, ensure_ascii=False, indent=2)
+        json.dump(encrypted_store, f, ensure_ascii=False, indent=2)
 
 
 def _find_profile(config_store: Dict[str, Any], profile_id: str) -> Optional[Dict[str, Any]]:
@@ -492,13 +681,41 @@ def _config_to_view(config_store: Dict[str, Any]) -> ConfigStoreView:
         schema_version=CONFIG_SCHEMA_VERSION,
         active_profile_id=config_store.get("active_profile_id", ""),
         profiles=profiles_view,
+        parser=_validate_parser_config(config_store.get("parser", _default_parser_config()), "parser"),
     )
 
 
+def _config_export_payload(config_store: Dict[str, Any]) -> Dict[str, Any]:
+    profiles = []
+    for profile in config_store.get("profiles", []):
+        profiles.append({
+            "id": profile.get("id", ""),
+            "name": profile.get("name", ""),
+            "provider": profile.get("provider", "custom"),
+            "base_url": profile.get("base_url", ""),
+            "model": profile.get("model", ""),
+            "account_type": profile.get("account_type", "free"),
+            "manual_models": profile.get("manual_models", []),
+            # 导出不含明文密钥；仅标记是否存在，导入后可复用同 id 的已有密钥
+            "api_key": "",
+            "has_api_key": bool(profile.get("api_key", "")),
+        })
+    return {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "active_profile_id": config_store.get("active_profile_id", ""),
+        "profiles": profiles,
+        "parser": _validate_parser_config(config_store.get("parser", _default_parser_config()), "parser"),
+    }
+
+
 def _apply_runtime_config(config_store: Dict[str, Any]):
+    parser_config = _validate_parser_config(config_store.get("parser", _default_parser_config()), "parser")
+    update_parser_runtime_config(parser_config)
+
     profile = _active_profile(config_store)
     if not profile:
-        logger.info("未找到可用配置档案，请在前端设置")
+        logger.info("未找到可用配置档案，请在前端设置（解析配置已生效）")
         return
 
     runtime_config = _profile_to_runtime(profile)
@@ -509,7 +726,10 @@ def _apply_runtime_config(config_store: Dict[str, Any]):
     update_client_config(runtime_config)
     set_model(runtime_config.get("model", "deepseek-chat"))
     set_account_type(runtime_config.get("account_type", "free"))
-    logger.info(f"配置已应用: profile={profile.get('name')} ({profile.get('provider')})")
+    logger.info(
+        f"配置已应用: profile={profile.get('name')} ({profile.get('provider')}), "
+        f"parser_backend={parser_config.get('parser_backend')}"
+    )
 
 
 def _map_error_code(error_text: str) -> str:
@@ -1193,6 +1413,56 @@ async def get_config():
     """获取配置中心数据（多 profile）"""
     config_store = _load_config_store()
     return _config_to_view(config_store)
+
+
+@app.get("/config/export")
+async def export_config():
+    """导出配置（不含明文密钥）"""
+    config_store = _load_config_store()
+    return _config_export_payload(config_store)
+
+
+@app.post("/config/import")
+async def import_config(payload: ConfigImportPayload):
+    """导入配置（不含密钥时可按 profile id 复用本地已保存密钥）"""
+    try:
+        raw_payload = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+        # 支持导出文件中的附加字段（如 exported_at）
+        normalized = _normalize_config_store({
+            "active_profile_id": raw_payload.get("active_profile_id", ""),
+            "profiles": raw_payload.get("profiles", []),
+            "parser": raw_payload.get("parser", _default_parser_config()),
+        })
+        existing = _load_config_store()
+
+        # 导入数据中 api_key 为空但标注 has_api_key=true 时，自动尝试保留旧密钥
+        existing_map = {item.get("id"): item for item in existing.get("profiles", [])}
+        for profile in normalized.get("profiles", []):
+            if not profile.get("api_key") and any(
+                item.get("id") == profile.get("id") and item.get("has_api_key")
+                for item in raw_payload.get("profiles", [])
+                if isinstance(item, dict)
+            ):
+                previous = existing_map.get(profile.get("id"), {})
+                profile["api_key"] = previous.get("api_key", "")
+
+        normalized = _merge_masked_api_keys(normalized, existing)
+        _save_config_store(normalized)
+        _apply_runtime_config(normalized)
+        return {
+            "success": True,
+            "message": "配置导入成功",
+            "active_profile_id": normalized.get("active_profile_id"),
+            "profiles_count": len(normalized.get("profiles", [])),
+        }
+    except ConfigValidationError as e:
+        raise HTTPException(status_code=422, detail=e.to_detail())
+    except Exception as e:
+        logger.error(f"导入配置失败：{e}")
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "CONFIG_IMPORT_FAILED", "message": f"导入配置失败: {str(e)}"},
+        )
 
 
 @app.post("/config")

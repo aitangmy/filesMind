@@ -13,6 +13,20 @@ const providerOptions = [
   { value: 'ollama', label: 'Ollama (Local)', base_url: 'http://localhost:11434/v1' },
   { value: 'custom', label: 'Custom', base_url: '' }
 ];
+const parserBackendOptions = [
+  { value: 'docling', label: 'Docling（稳定）' },
+  { value: 'marker', label: 'Marker（版面鲁棒）' },
+  { value: 'hybrid', label: 'Hybrid（自动择优）' }
+];
+
+const defaultParserConfig = () => ({
+  parser_backend: 'docling',
+  hybrid_noise_threshold: 0.2,
+  hybrid_docling_skip_score: 70,
+  hybrid_switch_min_delta: 2,
+  hybrid_marker_min_length: 200,
+  marker_prefer_api: false
+});
 
 const fileInput = ref(null);
 const isLoading = ref(false);
@@ -33,6 +47,8 @@ const configLoading = ref(false);
 const configTestResult = ref(null);
 const modelFetchResult = ref(null);
 const modelLoading = ref(false);
+const configImportInput = ref(null);
+const configOperationMsg = ref('');
 
 // 配置中心（多 profile）
 const profiles = ref([]);
@@ -49,6 +65,7 @@ const config = ref({
   manual_models_text: ''
 });
 const modelCatalogByProfile = ref({});
+const parserConfig = ref(defaultParserConfig());
 
 const makeProfileId = () => {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
@@ -69,6 +86,48 @@ const normalizeManualModels = (value) => {
       .filter(Boolean)
   )].slice(0, 100);
 };
+
+const toBoolean = (value, fallback = false) => {
+  if (typeof value === 'boolean') return value;
+  if (value === null || value === undefined) return fallback;
+  const lowered = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(lowered)) return true;
+  if (['0', 'false', 'no', 'off'].includes(lowered)) return false;
+  return fallback;
+};
+
+const ERROR_CODE_HINTS = {
+  OK: '配置可用',
+  MISSING_PROFILE_NAME: '请填写配置档案名称',
+  PROFILE_NAME_TOO_LONG: '配置档案名称不应超过 60 个字符',
+  MISSING_BASE_URL: '请填写 API Base URL',
+  INVALID_BASE_URL: 'API Base URL 需以 http:// 或 https:// 开头',
+  BASE_URL_TOO_LONG: 'API Base URL 过长',
+  MISSING_MODEL: '请填写模型名称',
+  MODEL_NAME_TOO_LONG: '模型名称过长',
+  INVALID_ACCOUNT_TYPE: '账户类型无效',
+  INVALID_PROVIDER: '服务商类型无效',
+  AUTH_FAILED: '认证失败，请检查 API Key',
+  PERMISSION_DENIED: '无权限访问该模型',
+  RESOURCE_NOT_FOUND: '模型或接口不存在',
+  RATE_LIMITED: '请求过快，请稍后重试',
+  NETWORK_TIMEOUT: '网络超时，请检查网络或代理',
+  CONNECTION_REFUSED: '连接被拒绝，请确认服务是否启动',
+  CONFIG_IMPORT_FAILED: '导入失败，请检查文件内容',
+  CONFIG_SAVE_FAILED: '保存失败，请稍后重试',
+  INVALID_PARSER_CONFIG: '解析配置格式无效',
+  INVALID_PARSER_BACKEND: '解析后端仅支持 docling / marker / hybrid',
+  INVALID_HYBRID_NOISE_THRESHOLD: '噪声阈值必须是数字',
+  OUT_OF_RANGE_HYBRID_NOISE_THRESHOLD: '噪声阈值需在 0 到 1 之间',
+  INVALID_HYBRID_DOCLING_SKIP_SCORE: 'Docling 跳过分数必须是数字',
+  OUT_OF_RANGE_HYBRID_DOCLING_SKIP_SCORE: 'Docling 跳过分数需在 0 到 100 之间',
+  INVALID_HYBRID_SWITCH_MIN_DELTA: '切换分差阈值必须是数字',
+  OUT_OF_RANGE_HYBRID_SWITCH_MIN_DELTA: '切换分差阈值需在 0 到 50 之间',
+  INVALID_HYBRID_MARKER_MIN_LENGTH: 'Marker 最小长度必须是整数',
+  OUT_OF_RANGE_HYBRID_MARKER_MIN_LENGTH: 'Marker 最小长度需在 0 到 1000000 之间',
+};
+
+const getErrorHint = (code, fallback = '') => ERROR_CODE_HINTS[code] || fallback || '操作失败，请检查配置';
 
 const createProfile = (overrides = {}) => ({
   id: overrides.id || makeProfileId(),
@@ -92,13 +151,77 @@ const activeProfileModels = computed(() => {
 
 const requiresApiKey = computed(() => !isOllamaUrl(config.value.base_url));
 const hasUsableApiKey = computed(() => !requiresApiKey.value || Boolean(config.value.api_key?.trim() || config.value.has_api_key));
-const canTestConfig = computed(() => Boolean(config.value.base_url?.trim() && config.value.model?.trim()));
+const isHybridParser = computed(() => parserConfig.value.parser_backend === 'hybrid');
+const usesMarkerPath = computed(() => ['marker', 'hybrid'].includes(parserConfig.value.parser_backend));
+
+const fieldErrors = computed(() => {
+  const errors = {};
+
+  const name = config.value.name?.trim() || '';
+  if (!name) errors.name = '配置档案名称不能为空';
+  else if (name.length > 60) errors.name = '配置档案名称长度不能超过 60';
+
+  const baseUrl = config.value.base_url?.trim() || '';
+  if (!baseUrl) {
+    errors.base_url = 'API Base URL 不能为空';
+  } else {
+    try {
+      const parsed = new URL(baseUrl);
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        errors.base_url = 'API Base URL 必须使用 http:// 或 https://';
+      }
+    } catch {
+      errors.base_url = 'API Base URL 格式错误';
+    }
+    if (baseUrl.length > 200) errors.base_url = 'API Base URL 长度不能超过 200';
+  }
+
+  const model = config.value.model?.trim() || '';
+  if (!model) errors.model = '模型名称不能为空';
+  else if (model.length > 120) errors.model = '模型名称长度不能超过 120';
+
+  if (requiresApiKey.value && !hasUsableApiKey.value) {
+    errors.api_key = '当前服务商需要 API Key';
+  }
+
+  const manualModels = normalizeManualModels(config.value.manual_models_text);
+  if (manualModels.some((item) => item.length > 120)) {
+    errors.manual_models = '手动白名单中模型名长度不能超过 120';
+  }
+
+  const parserBackend = String(parserConfig.value.parser_backend || '').trim().toLowerCase();
+  if (!['docling', 'marker', 'hybrid'].includes(parserBackend)) {
+    errors.parser_backend = '解析后端仅支持 docling / marker / hybrid';
+  }
+
+  const noiseThreshold = Number(parserConfig.value.hybrid_noise_threshold);
+  if (!Number.isFinite(noiseThreshold) || noiseThreshold < 0 || noiseThreshold > 1) {
+    errors.hybrid_noise_threshold = '噪声阈值需在 0 到 1 之间';
+  }
+
+  const skipScore = Number(parserConfig.value.hybrid_docling_skip_score);
+  if (!Number.isFinite(skipScore) || skipScore < 0 || skipScore > 100) {
+    errors.hybrid_docling_skip_score = 'Docling 跳过分数需在 0 到 100 之间';
+  }
+
+  const switchDelta = Number(parserConfig.value.hybrid_switch_min_delta);
+  if (!Number.isFinite(switchDelta) || switchDelta < 0 || switchDelta > 50) {
+    errors.hybrid_switch_min_delta = '切换分差阈值需在 0 到 50 之间';
+  }
+
+  const markerMinLen = Number(parserConfig.value.hybrid_marker_min_length);
+  if (!Number.isInteger(markerMinLen) || markerMinLen < 0 || markerMinLen > 1000000) {
+    errors.hybrid_marker_min_length = 'Marker 最小长度需为 0 到 1000000 的整数';
+  }
+
+  return errors;
+});
+
+const hasValidationErrors = computed(() => Object.keys(fieldErrors.value).length > 0);
+const canTestConfig = computed(() => Boolean(config.value.base_url?.trim() && config.value.model?.trim()) && !Boolean(fieldErrors.value.base_url || fieldErrors.value.model || fieldErrors.value.api_key));
 const isSaveDisabled = computed(() => {
   if (configLoading.value) return true;
-  if (!config.value.name?.trim()) return true;
-  if (!config.value.base_url?.trim()) return true;
-  if (!config.value.model?.trim()) return true;
-  return !hasUsableApiKey.value;
+  return hasValidationErrors.value;
 });
 
 // 检测是否为 MiniMax 2.5 系列模型
@@ -173,8 +296,17 @@ const applyProviderPreset = () => {
 
 const buildConfigStorePayload = () => {
   persistEditorProfile();
+  const parser = {
+    parser_backend: String(parserConfig.value.parser_backend || 'docling').trim().toLowerCase(),
+    hybrid_noise_threshold: Number(parserConfig.value.hybrid_noise_threshold ?? 0.2),
+    hybrid_docling_skip_score: Number(parserConfig.value.hybrid_docling_skip_score ?? 70),
+    hybrid_switch_min_delta: Number(parserConfig.value.hybrid_switch_min_delta ?? 2),
+    hybrid_marker_min_length: Number(parserConfig.value.hybrid_marker_min_length ?? 200),
+    marker_prefer_api: Boolean(parserConfig.value.marker_prefer_api)
+  };
   return {
     active_profile_id: activeProfileId.value,
+    parser,
     profiles: profiles.value.map((item) => ({
       id: item.id,
       name: item.name?.trim() || 'Unnamed Profile',
@@ -201,6 +333,82 @@ const buildSingleProfilePayload = () => ({
   }
 });
 
+const normalizeBackendError = async (response, fallbackMessage) => {
+  try {
+    const data = await response.json();
+    const detail = data?.detail || data;
+    if (typeof detail === 'string') return { code: 'UNKNOWN_ERROR', message: detail };
+    return {
+      code: detail?.code || data?.code || 'UNKNOWN_ERROR',
+      message: detail?.message || data?.message || fallbackMessage,
+      field: detail?.field
+    };
+  } catch {
+    return { code: 'UNKNOWN_ERROR', message: fallbackMessage };
+  }
+};
+
+const exportConfig = async () => {
+  persistEditorProfile();
+  try {
+    const response = await fetch('/api/config/export');
+    if (!response.ok) {
+      const err = await normalizeBackendError(response, '导出配置失败');
+      alert(`${getErrorHint(err.code, err.message)} (${err.code})`);
+      return;
+    }
+    const data = await response.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `filesmind-config-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    configOperationMsg.value = '配置已导出（不含明文密钥）';
+  } catch (err) {
+    alert(`导出配置失败: ${err.message}`);
+  }
+};
+
+const triggerImportConfig = () => {
+  if (configImportInput.value) {
+    configImportInput.value.value = '';
+    configImportInput.value.click();
+  }
+};
+
+const importConfigFromFile = async (event) => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    const payload = {
+      active_profile_id: parsed?.active_profile_id || '',
+      profiles: Array.isArray(parsed?.profiles) ? parsed.profiles : [],
+      parser: parsed?.parser || defaultParserConfig()
+    };
+    const response = await fetch('/api/config/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      const err = await normalizeBackendError(response, '导入配置失败');
+      alert(`${getErrorHint(err.code, err.message)} (${err.code})`);
+      return;
+    }
+    const result = await response.json();
+    await loadConfig();
+    configOperationMsg.value = `${result.message || '配置导入成功'}，请检查后保存`;
+  } catch (err) {
+    alert(`导入配置失败: ${err.message}`);
+  }
+};
+
 const normalizeConfigStore = (raw) => {
   // 兼容 legacy 单配置格式
   if (!raw?.profiles || !Array.isArray(raw.profiles)) {
@@ -214,7 +422,11 @@ const normalizeConfigStore = (raw) => {
       account_type: raw?.account_type || 'free',
       manual_models: []
     });
-    return { active_profile_id: fallback.id, profiles: [fallback] };
+    return {
+      active_profile_id: fallback.id,
+      profiles: [fallback],
+      parser: defaultParserConfig()
+    };
   }
 
   const normalizedProfiles = raw.profiles.map((item) => createProfile({
@@ -224,9 +436,30 @@ const normalizeConfigStore = (raw) => {
   }));
 
   const active = normalizedProfiles.find((item) => item.id === raw.active_profile_id) || normalizedProfiles[0];
+  const parserRaw = raw?.parser || {};
+  const parser = {
+    parser_backend: ['docling', 'marker', 'hybrid'].includes(String(parserRaw.parser_backend || '').toLowerCase())
+      ? String(parserRaw.parser_backend).toLowerCase()
+      : 'docling',
+    hybrid_noise_threshold: Number.isFinite(Number(parserRaw.hybrid_noise_threshold))
+      ? Number(parserRaw.hybrid_noise_threshold)
+      : 0.2,
+    hybrid_docling_skip_score: Number.isFinite(Number(parserRaw.hybrid_docling_skip_score))
+      ? Number(parserRaw.hybrid_docling_skip_score)
+      : 70,
+    hybrid_switch_min_delta: Number.isFinite(Number(parserRaw.hybrid_switch_min_delta))
+      ? Number(parserRaw.hybrid_switch_min_delta)
+      : 2,
+    hybrid_marker_min_length: Number.isInteger(Number(parserRaw.hybrid_marker_min_length))
+      ? Number(parserRaw.hybrid_marker_min_length)
+      : 200,
+    marker_prefer_api: toBoolean(parserRaw.marker_prefer_api, false)
+  };
+
   return {
     active_profile_id: active?.id || '',
-    profiles: normalizedProfiles
+    profiles: normalizedProfiles,
+    parser
   };
 };
 
@@ -489,8 +722,13 @@ const loadConfig = async () => {
       const data = await response.json();
       const normalized = normalizeConfigStore(data);
       profiles.value = normalized.profiles;
+      parserConfig.value = normalized.parser;
       activeProfileId.value = normalized.active_profile_id;
       loadProfileIntoEditor(activeProfileId.value);
+      configOperationMsg.value = '';
+    } else {
+      const err = await normalizeBackendError(response, '加载配置失败');
+      console.error('加载配置失败:', err);
     }
   } catch (err) {
     console.error('加载配置失败:', err);
@@ -499,6 +737,11 @@ const loadConfig = async () => {
 
 // 保存配置
 const saveConfig = async () => {
+  if (hasValidationErrors.value) {
+    const firstMessage = Object.values(fieldErrors.value)[0] || '请先修正配置项';
+    alert(firstMessage);
+    return;
+  }
   configLoading.value = true;
   configTestResult.value = null;
   try {
@@ -513,10 +756,12 @@ const saveConfig = async () => {
       await loadConfig();
       showSettings.value = false;
       alert('配置已保存');
+      configOperationMsg.value = '配置已保存并生效';
     } else {
       const detail = data?.detail || data;
-      const message = typeof detail === 'string' ? detail : (detail?.message || '未知错误');
-      alert('保存失败: ' + message);
+      const code = detail?.code || data?.code || 'UNKNOWN_ERROR';
+      const message = typeof detail === 'string' ? detail : (detail?.message || data?.message || '未知错误');
+      alert(`保存失败: ${getErrorHint(code, message)} (${code})`);
     }
   } catch (err) {
     alert('保存失败: ' + err.message);
@@ -526,6 +771,11 @@ const saveConfig = async () => {
 
 // 测试配置
 const testConfig = async () => {
+  if (!canTestConfig.value) {
+    const firstMessage = Object.values(fieldErrors.value)[0] || '请先修正配置项';
+    alert(firstMessage);
+    return;
+  }
   configLoading.value = true;
   configTestResult.value = null;
   try {
@@ -534,7 +784,12 @@ const testConfig = async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(buildSingleProfilePayload())
     });
-    configTestResult.value = await response.json();
+    const result = await response.json();
+    configTestResult.value = {
+      ...result,
+      message: `${result.message || ''}${result.code ? ` (${result.code})` : ''}`,
+      hint: getErrorHint(result.code, result.message)
+    };
   } catch (err) {
     configTestResult.value = { success: false, message: err.message };
   }
@@ -542,6 +797,11 @@ const testConfig = async () => {
 };
 
 const loadModels = async () => {
+  if (!canTestConfig.value) {
+    const firstMessage = Object.values(fieldErrors.value)[0] || '请先修正配置项';
+    alert(firstMessage);
+    return;
+  }
   modelLoading.value = true;
   modelFetchResult.value = null;
   try {
@@ -557,6 +817,8 @@ const loadModels = async () => {
       if (!config.value.model && data.models.length > 0) {
         config.value.model = data.models[0];
       }
+    } else if (data?.code) {
+      modelFetchResult.value.message = `${data.message || ''} (${data.code})`;
     }
   } catch (err) {
     modelFetchResult.value = { success: false, message: err.message, source: 'none', code: 'NETWORK_ERROR' };
@@ -777,9 +1039,27 @@ const loadModels = async () => {
           </svg>
         </button>
       </div>
+      <input
+        ref="configImportInput"
+        type="file"
+        accept=".json,application/json"
+        class="hidden"
+        @change="importConfigFromFile"
+      />
 
       <!-- 弹窗内容 -->
       <div class="p-6 space-y-5 max-h-[70vh] overflow-y-auto">
+        <div class="flex items-center justify-between gap-2 p-3 bg-blue-50/60 border border-blue-100 rounded-xl">
+          <p class="text-xs text-slate-600">支持导出当前配置（不含明文密钥）并在本机或其他环境导入。</p>
+          <div class="flex items-center gap-2">
+            <button @click="triggerImportConfig" type="button" class="px-3 py-1.5 text-xs rounded-lg border border-slate-300 hover:bg-white">导入</button>
+            <button @click="exportConfig" type="button" class="px-3 py-1.5 text-xs rounded-lg border border-slate-300 hover:bg-white">导出</button>
+          </div>
+        </div>
+        <div v-if="configOperationMsg" class="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+          {{ configOperationMsg }}
+        </div>
+
         <!-- 配置档案 -->
         <div class="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
           <label class="flex items-center gap-2 text-sm font-medium text-slate-700">
@@ -804,6 +1084,7 @@ const loadModels = async () => {
             class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
             placeholder="配置档案名称"
           />
+          <p v-if="fieldErrors.name" class="text-xs text-red-600">{{ fieldErrors.name }}</p>
         </div>
 
         <!-- 服务商选择 -->
@@ -822,6 +1103,81 @@ const loadModels = async () => {
           </select>
         </div>
 
+        <!-- 解析引擎 -->
+        <div class="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+          <label class="flex items-center gap-2 text-sm font-medium text-slate-700">
+            解析引擎
+          </label>
+          <select
+            v-model="parserConfig.parser_backend"
+            class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+          >
+            <option v-for="opt in parserBackendOptions" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
+          </select>
+          <p v-if="fieldErrors.parser_backend" class="text-xs text-red-600">{{ fieldErrors.parser_backend }}</p>
+
+          <div v-if="isHybridParser" class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <label class="text-xs text-slate-600">噪声阈值 (0-1)</label>
+              <input
+                v-model.number="parserConfig.hybrid_noise_threshold"
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+              />
+              <p v-if="fieldErrors.hybrid_noise_threshold" class="text-xs text-red-600 mt-1">{{ fieldErrors.hybrid_noise_threshold }}</p>
+            </div>
+            <div>
+              <label class="text-xs text-slate-600">Docling 跳过分数 (0-100)</label>
+              <input
+                v-model.number="parserConfig.hybrid_docling_skip_score"
+                type="number"
+                min="0"
+                max="100"
+                step="0.5"
+                class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+              />
+              <p v-if="fieldErrors.hybrid_docling_skip_score" class="text-xs text-red-600 mt-1">{{ fieldErrors.hybrid_docling_skip_score }}</p>
+            </div>
+            <div>
+              <label class="text-xs text-slate-600">切换分差阈值 (0-50)</label>
+              <input
+                v-model.number="parserConfig.hybrid_switch_min_delta"
+                type="number"
+                min="0"
+                max="50"
+                step="0.5"
+                class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+              />
+              <p v-if="fieldErrors.hybrid_switch_min_delta" class="text-xs text-red-600 mt-1">{{ fieldErrors.hybrid_switch_min_delta }}</p>
+            </div>
+            <div>
+              <label class="text-xs text-slate-600">Marker 最小长度（字符）</label>
+              <input
+                v-model.number="parserConfig.hybrid_marker_min_length"
+                type="number"
+                min="0"
+                max="1000000"
+                step="1"
+                class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+              />
+              <p v-if="fieldErrors.hybrid_marker_min_length" class="text-xs text-red-600 mt-1">{{ fieldErrors.hybrid_marker_min_length }}</p>
+            </div>
+          </div>
+
+          <label v-if="usesMarkerPath" class="flex items-center justify-between gap-3 p-3 rounded-lg bg-white border border-slate-200">
+            <div>
+              <p class="text-sm text-slate-700">优先使用 Marker Python API</p>
+              <p class="text-xs text-slate-500">失败时自动回退到 CLI</p>
+            </div>
+            <input v-model="parserConfig.marker_prefer_api" type="checkbox" class="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500">
+          </label>
+        </div>
+
         <!-- Base URL -->
         <div>
           <label class="flex items-center gap-2 text-sm font-medium text-slate-700 mb-2">
@@ -833,6 +1189,7 @@ const loadModels = async () => {
             class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-white hover:border-slate-300 placeholder:text-slate-400"
             placeholder="https://api.deepseek.com"
           />
+          <p v-if="fieldErrors.base_url" class="text-xs text-red-600 mt-1">{{ fieldErrors.base_url }}</p>
         </div>
 
         <!-- 模型选择 -->
@@ -869,12 +1226,15 @@ const loadModels = async () => {
             class="w-full px-4 py-2 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-white hover:border-slate-300 placeholder:text-slate-400"
             placeholder="手动白名单（逗号或换行分隔），用于 /models 不可用时回退"
           ></textarea>
+          <p v-if="fieldErrors.model" class="text-xs text-red-600">{{ fieldErrors.model }}</p>
+          <p v-if="fieldErrors.manual_models" class="text-xs text-red-600">{{ fieldErrors.manual_models }}</p>
           <div
             v-if="modelFetchResult"
             class="text-xs p-2 rounded-lg border"
             :class="modelFetchResult.success ? 'bg-green-50 border-green-200 text-green-700' : 'bg-amber-50 border-amber-200 text-amber-700'"
           >
             {{ modelFetchResult.message }}<span v-if="modelFetchResult.source">（source: {{ modelFetchResult.source }}）</span>
+            <div v-if="modelFetchResult.code" class="mt-1 opacity-80">{{ getErrorHint(modelFetchResult.code) }}</div>
           </div>
         </div>
 
@@ -893,6 +1253,7 @@ const loadModels = async () => {
             <span>已保存密钥（未显示）。留空表示继续使用已保存密钥。</span>
             <button @click="clearStoredKey" type="button" class="text-red-600 hover:text-red-700">清空密钥</button>
           </div>
+          <p v-if="fieldErrors.api_key" class="text-xs text-red-600 mt-1">{{ fieldErrors.api_key }}</p>
         </div>
         <div v-else class="p-3 bg-blue-50 text-blue-700 text-xs rounded-xl flex items-center gap-2">
           Ollama 模式下无需 API Key（后台自动处理占位）。
@@ -924,7 +1285,10 @@ const loadModels = async () => {
             <path v-if="configTestResult.success" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
             <path v-else stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
           </svg>
-          {{ configTestResult.message }}
+          <div>
+            <div>{{ configTestResult.message }}</div>
+            <div v-if="configTestResult.code" class="text-xs opacity-80 mt-1">{{ configTestResult.hint }}</div>
+          </div>
         </div>
       </div>
 
