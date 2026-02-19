@@ -207,6 +207,76 @@ def reclassify_furniture_by_position(result) -> int:
         logger.warning("docling_core not available, skipping furniture reclassification")
         return 0
 
+    def _as_positive_float(value: Any) -> float | None:
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        return num if num > 0 else None
+
+    def _page_height_from_page(page: Any) -> float | None:
+        if page is None:
+            return None
+        height = getattr(page, "height", None)
+        if height is None:
+            size = getattr(page, "size", None)
+            height = getattr(size, "height", None) if size is not None else None
+        return _as_positive_float(height)
+
+    def _resolve_page(pages: Any, page_no: Any):
+        if pages is None or page_no is None:
+            return None
+
+        if isinstance(pages, dict):
+            if page_no in pages:
+                return pages.get(page_no)
+            try:
+                page_no_int = int(page_no)
+            except (TypeError, ValueError):
+                return None
+            if page_no_int in pages:
+                return pages.get(page_no_int)
+            # Handle possible 1-based <-> 0-based mismatch.
+            if (page_no_int - 1) in pages:
+                return pages.get(page_no_int - 1)
+            return None
+
+        if isinstance(pages, (list, tuple)):
+            try:
+                page_no_int = int(page_no)
+            except (TypeError, ValueError):
+                return None
+            for idx in (page_no_int, page_no_int - 1):
+                if 0 <= idx < len(pages):
+                    return pages[idx]
+            return None
+
+        try:
+            return pages[page_no]
+        except Exception:
+            try:
+                page_no_int = int(page_no)
+            except (TypeError, ValueError):
+                return None
+            for key in (page_no_int, page_no_int - 1):
+                try:
+                    return pages[key]
+                except Exception:
+                    continue
+            return None
+
+    def _resolve_page_height(doc: Any, prov: Any) -> float | None:
+        # v1-style provenance may embed page object directly.
+        legacy_page = getattr(prov, "page", None)
+        legacy_height = _page_height_from_page(legacy_page)
+        if legacy_height is not None:
+            return legacy_height
+
+        # v2-style provenance links by page_no into doc.pages.
+        page_no = getattr(prov, "page_no", None)
+        page = _resolve_page(getattr(doc, "pages", None), page_no)
+        return _page_height_from_page(page)
+
     # Fraction of page height treated as header / footer zone
     _HEADER_ZONE_RATIO = 0.08   # top 8 %
     _FOOTER_ZONE_RATIO = 0.08   # bottom 8 %
@@ -235,13 +305,9 @@ def reclassify_furniture_by_position(result) -> int:
             if not prov:
                 continue
 
-            # Get page dimensions
-            page = prov.page
-            if not page:
-                continue
-            
-            page_h = page.height
-            if page_h <= 0:
+            # Resolve page height from provenance for both old and new doc models.
+            page_h = _resolve_page_height(doc, prov)
+            if page_h is None:
                 continue
 
             # Get bounding box(Docling uses bottom-left origin by default)

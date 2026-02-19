@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -180,6 +181,68 @@ class ParserMarkerFallbackTests(unittest.TestCase):
 
         # restore default for test isolation
         ps.update_parser_runtime_config(_runtime_config(parser_backend="docling"))
+
+
+class _FakeDoc:
+    def __init__(self, items, pages=None):
+        self._items = items
+        self.pages = pages
+
+    def iterate_items(self):
+        for item in self._items:
+            yield item, 0
+
+
+class _FakeResult:
+    def __init__(self, doc):
+        self.document = doc
+
+
+class ParserProvenanceCompatibilityTests(unittest.TestCase):
+    def test_reclassify_supports_v2_page_no_mapping(self):
+        from docling_core.types.doc.document import ContentLayer, DocItemLabel
+
+        item = SimpleNamespace(
+            label=DocItemLabel.TEXT,
+            prov=[SimpleNamespace(page_no=1, bbox=SimpleNamespace(t=980.0, b=940.0))],
+            content_layer=ContentLayer.BODY,
+        )
+        doc = _FakeDoc(items=[item], pages={1: SimpleNamespace(size=SimpleNamespace(height=1000.0))})
+
+        changed = ps.reclassify_furniture_by_position(_FakeResult(doc))
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(item.content_layer, ContentLayer.FURNITURE)
+
+    def test_reclassify_supports_legacy_page_object(self):
+        from docling_core.types.doc.document import ContentLayer, DocItemLabel
+
+        item = SimpleNamespace(
+            label=DocItemLabel.TEXT,
+            prov=[SimpleNamespace(page=SimpleNamespace(height=1000.0), bbox=SimpleNamespace(t=980.0, b=940.0))],
+            content_layer=ContentLayer.BODY,
+        )
+        doc = _FakeDoc(items=[item], pages=None)
+
+        changed = ps.reclassify_furniture_by_position(_FakeResult(doc))
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(item.content_layer, ContentLayer.FURNITURE)
+
+    def test_reclassify_handles_list_pages_with_one_based_page_no(self):
+        from docling_core.types.doc.document import ContentLayer, DocItemLabel
+
+        item = SimpleNamespace(
+            label=DocItemLabel.TEXT,
+            prov=[SimpleNamespace(page_no=1, bbox=SimpleNamespace(t=980.0, b=940.0))],
+            content_layer=ContentLayer.BODY,
+        )
+        doc = _FakeDoc(items=[item], pages=[SimpleNamespace(size=SimpleNamespace(height=1000.0))])
+
+        changed = ps.reclassify_furniture_by_position(_FakeResult(doc))
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(item.content_layer, ContentLayer.FURNITURE)
 
 
 if __name__ == "__main__":
