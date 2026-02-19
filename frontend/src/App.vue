@@ -136,6 +136,10 @@ const pollTaskStatus = async (taskId) => {
     const response = await fetch(`/api/task/${taskId}`);
     
     if (response.status === 404) {
+      cleanupPoll();
+      isLoading.value = false;
+      errorMsg.value = '任务状态不存在，可能是后端重启导致。请重新上传或从历史记录打开文件。';
+      await loadHistory();
       return;
     }
     
@@ -152,7 +156,9 @@ const pollTaskStatus = async (taskId) => {
     if (data.status === 'completed') {
       cleanupPoll();
       mindmapData.value = data.result;
-      currentFileId.value = data.file_id;
+      if (data.file_id) {
+        currentFileId.value = data.file_id;
+      }
       isLoading.value = false;
       if (fileInput.value) fileInput.value.value = '';
       await loadHistory();
@@ -539,7 +545,7 @@ const testConfig = async () => {
       <!-- 思维导图区域 -->
       <main class="flex-grow p-4 overflow-hidden">
         <div class="h-full bg-white rounded-2xl shadow-medium border border-slate-200/60 overflow-hidden gradient-border">
-          <MindMap :markdown="mindmapData" class="h-full" />
+          <MindMap :markdown="mindmapData" :file-id="currentFileId || ''" class="h-full" />
         </div>
       </main>
     </div>

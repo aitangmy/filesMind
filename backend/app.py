@@ -10,6 +10,7 @@ import hashlib
 import json
 from datetime import datetime
 import re
+import threading
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -286,8 +287,9 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
 
 class Task:
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, file_id: Optional[str] = None):
         self.task_id = task_id
+        self.file_id = file_id
         self.status = TaskStatus.PENDING
         self.progress = 0
         self.message = "等待处理..."
@@ -308,9 +310,9 @@ class FileRecord(BaseModel):
 # 注意：服务重启后任务状态丢失，这对单用户桌面应用是可接受的
 tasks: Dict[str, "Task"] = {}
 
-def create_task(task_id: str) -> "Task":
+def create_task(task_id: str, file_id: Optional[str] = None) -> "Task":
     """创建并注册新任务"""
-    task = Task(task_id)
+    task = Task(task_id, file_id=file_id)
     tasks[task_id] = task
     return task
 
@@ -329,20 +331,20 @@ def get_file_hash(file_path: str) -> str:
     return h.hexdigest()
 
 # ==================== 历史记录管理 ====================
-# 使用 JSON 文件持久化，asyncio.Lock 防止并发写入冲突
-
-_history_lock = asyncio.Lock()
+# 使用 JSON 文件持久化，RLock 防止并发读写冲突
+_history_lock = threading.RLock()
 
 def load_history() -> List[Dict]:
-    """同步读取历史记录（读操作不需要锁）"""
-    if not os.path.exists(HISTORY_FILE):
-        return []
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"读取历史记录失败: {e}")
-        return []
+    """同步读取历史记录（加锁避免读写竞争）"""
+    with _history_lock:
+        if not os.path.exists(HISTORY_FILE):
+            return []
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"读取历史记录失败: {e}")
+            return []
 
 def _save_history_sync(history: List[Dict]):
     """同步写入历史记录（内部使用）"""
@@ -360,51 +362,55 @@ def add_file_record(
     task_id: str = None,
 ):
     """添加或更新文件记录（同步，调用方已在后台任务中）"""
-    history = load_history()
+    with _history_lock:
+        history = load_history()
 
-    # 如果已存在同 file_id 的记录，先移除旧记录
-    history = [item for item in history if item.get("file_id") != file_id]
+        # 如果已存在同 file_id 的记录，先移除旧记录
+        history = [item for item in history if item.get("file_id") != file_id]
 
-    record = {
-        "file_id": file_id,
-        "task_id": task_id,
-        "filename": filename,
-        "file_hash": file_hash,
-        "pdf_path": pdf_path,
-        "md_path": md_path,
-        "created_at": datetime.now().isoformat(),
-        "status": status,
-    }
-    history.append(record)
-    _save_history_sync(history)
+        record = {
+            "file_id": file_id,
+            "task_id": task_id,
+            "filename": filename,
+            "file_hash": file_hash,
+            "pdf_path": pdf_path,
+            "md_path": md_path,
+            "created_at": datetime.now().isoformat(),
+            "status": status,
+        }
+        history.append(record)
+        _save_history_sync(history)
     logger.info(f"文件记录已保存: {file_id} ({status})")
 
 def update_file_status(file_id: str, status: str, md_path: str = None):
     """更新文件处理状态"""
-    history = load_history()
-    for item in history:
-        if item.get("file_id") == file_id:
-            item["status"] = status
-            if md_path:
-                item["md_path"] = md_path
-            break
-    _save_history_sync(history)
+    with _history_lock:
+        history = load_history()
+        for item in history:
+            if item.get("file_id") == file_id:
+                item["status"] = status
+                if md_path:
+                    item["md_path"] = md_path
+                break
+        _save_history_sync(history)
 
 def delete_file_record(file_id: str) -> bool:
     """删除文件记录，返回是否成功"""
-    history = load_history()
-    new_history = [item for item in history if item.get("file_id") != file_id]
-    if len(new_history) == len(history):
-        return False  # 未找到
-    _save_history_sync(new_history)
-    return True
+    with _history_lock:
+        history = load_history()
+        new_history = [item for item in history if item.get("file_id") != file_id]
+        if len(new_history) == len(history):
+            return False  # 未找到
+        _save_history_sync(new_history)
+        return True
 
 def check_file_exists(file_hash: str) -> Dict:
     """根据 MD5 检查文件是否已存在，返回记录或 None"""
-    history = load_history()
-    for item in history:
-        if item.get("file_hash") == file_hash:
-            return item
+    with _history_lock:
+        history = load_history()
+        for item in history:
+            if item.get("file_hash") == file_hash:
+                return item
     return None
 
 # ==================== 后台任务 ====================
@@ -421,6 +427,7 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         return
 
     try:
+        task.file_id = file_id
         # 阶段 1: PDF 解析 (0-10%)
         task.status = TaskStatus.PROCESSING
         task.progress = 5
@@ -546,6 +553,7 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
 
 class TaskResponse(BaseModel):
     task_id: str
+    file_id: Optional[str] = None
     status: str
     progress: int
     message: str
@@ -639,7 +647,7 @@ async def upload_document(file: UploadFile = File(...)):
                 add_file_record(old_file_id, existing['filename'], file_hash, pdf_path, md_path, "processing", task_id=task_id)
 
                 # 创建新任务，使用原有 PDF 路径
-                task = create_task(task_id)
+                task = create_task(task_id, file_id=old_file_id)
                 asyncio.create_task(process_document_task(task_id, pdf_path, old_file_id, existing['filename']))
 
                 logger.info(f"检测到失败任务，重新处理：{file.filename}, file_id={old_file_id}")
@@ -649,6 +657,50 @@ async def upload_document(file: UploadFile = File(...)):
                     status="processing",
                     message="检测到之前处理失败，正在重新处理..."
                 )
+        elif existing_status == 'processing':
+            # 情况 3: 已在处理中的重复上传，复用正在运行任务；若任务丢失则自动重启
+            old_file_id = existing['file_id']
+            old_task_id = existing.get('task_id')
+            pdf_path = existing.get('pdf_path')
+
+            # 删除本次临时上传文件，避免重复占用磁盘
+            os.remove(temp_file)
+
+            existing_task = get_task(old_task_id) if old_task_id else None
+            if existing_task and existing_task.status in {TaskStatus.PENDING, TaskStatus.PROCESSING}:
+                logger.info(f"检测到处理中重复文件，复用任务：task_id={old_task_id}, file_id={old_file_id}")
+                return UploadResponse(
+                    task_id=old_task_id,
+                    file_id=old_file_id,
+                    status="processing",
+                    message="文件正在处理中，已连接到现有任务",
+                    is_duplicate=True
+                )
+
+            if pdf_path and os.path.exists(pdf_path):
+                restarted_task_id = str(uuid.uuid4())
+                md_path = os.path.join(MD_DIR, f"{old_file_id}.md")
+                add_file_record(
+                    old_file_id,
+                    existing['filename'],
+                    file_hash,
+                    pdf_path,
+                    md_path,
+                    "processing",
+                    task_id=restarted_task_id
+                )
+                create_task(restarted_task_id, file_id=old_file_id)
+                asyncio.create_task(process_document_task(restarted_task_id, pdf_path, old_file_id, existing['filename']))
+                logger.info(f"历史处理中任务已失效，自动重启：task_id={restarted_task_id}, file_id={old_file_id}")
+                return UploadResponse(
+                    task_id=restarted_task_id,
+                    file_id=old_file_id,
+                    status="processing",
+                    message="检测到历史任务已失效，已自动重新处理",
+                    is_duplicate=True
+                )
+
+            logger.warning(f"处理中记录缺失源 PDF，按新文件处理：file_id={old_file_id}")
 
     # 新文件：移动到正式目录
     pdf_path = os.path.join(PDF_DIR, f"{file_id}_{file.filename}")
@@ -659,7 +711,7 @@ async def upload_document(file: UploadFile = File(...)):
     add_file_record(file_id, file.filename, file_hash, pdf_path, md_path, "processing", task_id=task_id)
 
     # 创建任务
-    task = create_task(task_id)
+    task = create_task(task_id, file_id=file_id)
 
     # 启动后台任务
     asyncio.create_task(process_document_task(task_id, pdf_path, file_id, file.filename))
@@ -685,6 +737,7 @@ async def get_task_status(task_id: str):
 
     return TaskResponse(
         task_id=task.task_id,
+        file_id=task.file_id,
         status=task.status,
         progress=task.progress,
         message=task.message,
@@ -737,9 +790,30 @@ async def delete_file(file_id: str):
     """
     删除文件记录
     """
+    history = load_history()
+    record = next((item for item in history if item.get("file_id") == file_id), None)
+    if not record:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    # 先清理磁盘文件，再删除历史记录
+    for path in [record.get("pdf_path"), record.get("md_path")]:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                logger.warning(f"删除文件失败 ({path}): {e}")
+
+    image_dir = os.path.join(IMAGES_DIR, file_id)
+    if os.path.isdir(image_dir):
+        try:
+            shutil.rmtree(image_dir)
+        except Exception as e:
+            logger.warning(f"删除图片目录失败 ({image_dir}): {e}")
+
+    tasks.pop(record.get("task_id"), None)
     if delete_file_record(file_id):
         return {"message": "文件已删除"}
-    raise HTTPException(status_code=404, detail="文件不存在")
+    raise HTTPException(status_code=500, detail="删除历史记录失败")
 
 @app.get("/export/xmind/{file_id}")
 async def export_xmind(file_id: str):
@@ -808,7 +882,6 @@ async def check_hardware_status():
     info = get_hardware_info()
     logger.info(f"前端查询硬件状态: {info}")
     return info
-    return {"status": "ok", "tasks_count": len(tasks)}
 
 # ==================== 配置 API ====================
 @app.get("/config")

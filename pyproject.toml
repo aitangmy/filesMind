@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [
+    "certifi>=2025.1.31",
     "docling>=2.73.1",
     "fastapi[standard]>=0.115.0",
     "openai>=2.21.0",

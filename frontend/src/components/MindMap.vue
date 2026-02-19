@@ -10,6 +10,10 @@ const props = defineProps({
     type: String,
     required: true,
     default: ''
+  },
+  fileId: {
+    type: String,
+    default: ''
   }
 });
 
@@ -43,26 +47,32 @@ const exportXMind = async () => {
   if (!props.markdown) return;
   
   try {
-    const response = await fetch('/api/export/xmind', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        content: props.markdown,
-        filename: 'mindmap'
-      })
-    });
+    const response = props.fileId
+      ? await fetch(`/api/export/xmind/${props.fileId}`)
+      : await fetch('/api/export/xmind', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            content: props.markdown,
+            filename: 'mindmap'
+          })
+        });
     
     if (!response.ok) {
       throw new Error('导出失败');
     }
     
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const filenameMatch = disposition.match(/filename="?([^"]+)"?/i);
+    const downloadName = filenameMatch ? filenameMatch[1] : 'mindmap.xmind';
+
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'mindmap.xmind';
+    a.download = downloadName;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);

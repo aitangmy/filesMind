@@ -29,7 +29,6 @@ ENV/
 env/
 
 # uv lock file
-uv.lock
 
 # PyCharm
 .idea/
