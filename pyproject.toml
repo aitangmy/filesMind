@@ -8,6 +8,8 @@ dependencies = [
     "certifi>=2025.1.31",
     "docling>=2.73.1",
     "fastapi[standard]>=0.115.0",
+    "filelock>=3.19.1",
+    "marker-pdf",
     "openai>=2.21.0",
     "python-dotenv>=1.2.1",
     "torch>=2.4.0",
@@ -16,14 +18,4 @@ dependencies = [
     "python-multipart>=0.0.20",
     "docling-hierarchical-pdf>=0.0.1",
     "cryptography>=44.0.0",
-]
-
-
-
-[tool.uv.sources]
-torch = [
-  { url = "https://download.pytorch.org/whl/cu121/torch-2.5.1%2Bcu121-cp312-cp312-win_amd64.whl", marker = "sys_platform == 'win32'" }
-]
-torchvision = [
-  { url = "https://download.pytorch.org/whl/cu121/torchvision-0.20.1%2Bcu121-cp312-cp312-win_amd64.whl", marker = "sys_platform == 'win32'" }
 ]

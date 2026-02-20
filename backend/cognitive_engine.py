@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import atexit
+import json
 try:
     from openai import AsyncOpenAI
 except ImportError:
@@ -243,21 +244,18 @@ class RateLimiter:
     """
     def __init__(self, rpm):
         self.interval = 60.0 / rpm
-        self.last_request_time = 0
+        self.last_request_time = 0.0
         self.lock = asyncio.Lock()
 
     async def acquire(self):
         async with self.lock:
             now = time.time()
-            # 计算自上次请求以来经过的时间
-            elapsed = now - self.last_request_time
+            target_time = max(now, self.last_request_time + self.interval)
+            self.last_request_time = target_time
+            wait_time = target_time - now
             
-            # 如果经过时间小于最小间隔，则等待
-            if elapsed < self.interval:
-                wait_time = self.interval - elapsed
-                await asyncio.sleep(wait_time)
-            
-            self.last_request_time = time.time()
+        if wait_time > 0.001:
+            await asyncio.sleep(wait_time)
 
 # 全局限流器和信号量
 _rate_limiter = None
@@ -399,8 +397,13 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
     max_retries = strategy.get("max_retries", 3) if strategy["type"] == "adaptive" else 1
     base_delay = strategy.get("base_delay", 1.0)
 
+    if task and getattr(task, 'cancel_requested', False):
+        raise asyncio.CancelledError("Task was cancelled by user")
+
     async with semaphore:
         for attempt in range(max_retries + 1):
+            if task and getattr(task, 'cancel_requested', False):
+                raise asyncio.CancelledError("Task was cancelled by user")
             try:
                 # 1. 严格限流 (MiniMax)
                 if rate_limiter:
@@ -824,16 +827,74 @@ async def _create_refine_completion(client, request_kwargs: dict, use_response_f
         raise
 
 
+def _extract_first_json_payload(text: str) -> str:
+    if not text:
+        return ""
+
+    start = -1
+    for i, ch in enumerate(text):
+        if ch in "[{":
+            start = i
+            break
+    if start == -1:
+        return ""
+
+    stack = []
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in "[{":
+            stack.append(ch)
+            continue
+        if ch in "]}":
+            if not stack:
+                return ""
+            opener = stack.pop()
+            if (opener == "[" and ch != "]") or (opener == "{" and ch != "}"):
+                return ""
+            if not stack:
+                return text[start:i + 1]
+    return ""
+
+
+def _normalize_refine_response_text(content: str) -> str:
+    if not isinstance(content, str):
+        return ""
+
+    cleaned = content.replace("```json", "").replace("```", "").strip()
+    if not cleaned:
+        return ""
+
+    # MiniMax/OpenAI-compatible responses may carry chain-of-thought in <think> blocks.
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE).strip()
+    if not cleaned:
+        return ""
+
+    payload = _extract_first_json_payload(cleaned)
+    return payload or cleaned
+
+
 def _parse_refine_response(content: str, node_title: str) -> list:
     """Parse model output to list[dict]."""
     if not content:
         return []
 
-    cleaned = content.replace("```json", "").replace("```", "").strip()
+    cleaned = _normalize_refine_response_text(content)
     if not cleaned:
         return []
-
-    import json
 
     try:
         data = json.loads(cleaned)
@@ -906,6 +967,7 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
     try:
         client = get_client()
         model = get_model()
+        is_minimax = _is_minimax_backend(model, client)
 
         request_kwargs = {
             "model": model,
@@ -916,10 +978,26 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
             "temperature": 0.3,
             "max_tokens": 2000,
         }
+        if is_minimax:
+            extra_body = dict(request_kwargs.get("extra_body") or {})
+            extra_body["reasoning_split"] = True
+            request_kwargs["extra_body"] = extra_body
 
         use_response_format = _should_use_response_format(model, client)
         response = await _create_refine_completion(client, request_kwargs, use_response_format)
         content = response.choices[0].message.content
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text") or part.get("content")
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+                elif isinstance(part, str):
+                    parts.append(part)
+            content = "\n".join(parts).strip()
+        elif not isinstance(content, str):
+            content = str(content or "")
         return _parse_refine_response(content, node_title)
             
     except Exception as e:

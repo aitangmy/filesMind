@@ -5,6 +5,10 @@ import logging
 import os
 import shutil
 import subprocess
+import unicodedata
+import json
+import uuid
+from difflib import SequenceMatcher
 # 解决 Windows 下 OpenMP 多重加载冲突 (OMP: Error #15)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -26,13 +30,29 @@ import certifi
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 os.environ["CURL_CA_BUNDLE"] = certifi.where()
 
-# 尝试禁用 SSL 验证（仅作为备选）
-try:
-    _create_unverified_https_context = ssl._create_unverified_context
-except AttributeError:
-    pass
-else:
-    ssl._create_default_https_context = _create_unverified_https_context
+# SSL validation left active to ensure secure connections.
+
+
+def _atomic_write_text(path: Path | str, content: str):
+    dst = Path(path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dst.with_name(f"{dst.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, dst)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _atomic_write_json(path: Path | str, payload: Any):
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False))
 
 
 # ====== Markdown层级修复函数 ======
@@ -88,14 +108,33 @@ def fix_markdown_hierarchy(markdown_content):
 # ====== 层级修复函数结束 ======
 
 
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
-from docling.datamodel.base_models import InputFormat
-import torch
+_DOCLING_AVAILABLE = True
+_DOCLING_IMPORT_ERROR = None
+try:
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
+    from docling.datamodel.base_models import InputFormat
+except Exception as exc:
+    _DOCLING_AVAILABLE = False
+    _DOCLING_IMPORT_ERROR = exc
+    DocumentConverter = None
+    PdfFormatOption = None
+    PdfPipelineOptions = None
+    AcceleratorOptions = None
+    AcceleratorDevice = None
+    InputFormat = None
+
+try:
+    import torch
+except Exception:
+    torch = None
 
 # 设置日志，方便运维监控
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("MacMiniParser")
+
+if not _DOCLING_AVAILABLE:
+    logger.warning(f"Docling 依赖不可用，Docling 解析路径将不可用: {_DOCLING_IMPORT_ERROR}")
 
 
 def _env_float(name: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
@@ -157,6 +196,7 @@ HYBRID_DOCLING_SKIP_SCORE = _env_float("HYBRID_DOCLING_SKIP_SCORE", 70.0, min_va
 HYBRID_SWITCH_MIN_DELTA = _env_float("HYBRID_SWITCH_MIN_DELTA", 2.0, min_value=0.0, max_value=50.0)
 HYBRID_MARKER_MIN_LENGTH = _env_int("HYBRID_MARKER_MIN_LENGTH", 200, min_value=0, max_value=1000000)
 MARKER_PREFER_API = _env_bool("MARKER_PREFER_API", False)
+HIERARCHY_POSTPROCESS_MAX_PAGES = _env_int("HIERARCHY_POSTPROCESS_MAX_PAGES", 400, min_value=0, max_value=20000)
 
 _parser_runtime_config: Dict[str, Any] = {
     "parser_backend": PARSER_BACKEND,
@@ -167,15 +207,146 @@ _parser_runtime_config: Dict[str, Any] = {
     "marker_prefer_api": MARKER_PREFER_API,
 }
 
+
+def _normalize_toc_text(value: str) -> str:
+    if not value:
+        return ""
+    normalized = unicodedata.normalize("NFKC", str(value)).lower()
+    return "".join(ch for ch in normalized if unicodedata.category(ch).startswith(("L", "N")))
+
+
+def _toc_titles_match(toc_title: str, item_title: str) -> bool:
+    left = _normalize_toc_text(toc_title)
+    right = _normalize_toc_text(item_title)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+
+    short, long = (left, right) if len(left) <= len(right) else (right, left)
+    if len(short) >= 6 and short in long and (len(short) / len(long)) >= 0.70:
+        return True
+
+    if len(short) >= 10 and SequenceMatcher(None, left, right).ratio() >= 0.90:
+        return True
+
+    return False
+
+
+_HIERARCHICAL_RUNTIME_PATCHED = False
+
+
+def _patch_hierarchical_runtime() -> None:
+    global _HIERARCHICAL_RUNTIME_PATCHED
+    if _HIERARCHICAL_RUNTIME_PATCHED:
+        return
+
+    try:
+        from docling_core.types.doc import ListItem, TextItem
+        from hierarchical.hierarchy_builder_metadata import (
+            HeaderNotFoundException,
+            HierarchyBuilderMetadata,
+            ImplausibleHeadingStructureException,
+            logger as hierarchical_logger,
+        )
+        from hierarchical.types.hierarchical_header import HierarchicalHeader
+    except Exception as exc:
+        logger.warning(f"docling-hierarchical-pdf runtime patch failed to import dependencies: {exc}")
+        return
+
+    if getattr(HierarchyBuilderMetadata, "_filesmind_patched", False):
+        _HIERARCHICAL_RUNTIME_PATCHED = True
+        return
+
+    # docling-hierarchical-pdf emits many benign TOC lookup warnings on noisy PDFs.
+    # Keep them out of production logs; hard failures still raise exceptions.
+    hierarchical_logger.setLevel(logging.ERROR)
+
+    def _candidate_pages(doc: Any, page: Any) -> list[int]:
+        try:
+            base = int(page)
+        except (TypeError, ValueError):
+            return []
+        candidates = []
+        for delta in (0, 1, -1, 2, -2):
+            candidate = base + delta
+            if candidate < 1:
+                continue
+            candidates.append(candidate)
+
+        pages = getattr(doc, "pages", None)
+        if isinstance(pages, dict) and pages:
+            valid = {int(k) for k in pages.keys() if isinstance(k, int) or str(k).isdigit()}
+            if valid:
+                candidates = [p for p in candidates if p in valid]
+        return candidates
+
+    def _infer_patched(self) -> Any:
+        # Reuse cached toc to avoid duplicate extraction/logging.
+        heading_to_level = self.toc
+        root = HierarchicalHeader()
+        current = root
+        doc = self.conv_res.document
+
+        for level, title, page, add_info in heading_to_level:
+            new_parent = None
+            this_item = None
+
+            for candidate_page in _candidate_pages(doc, page):
+                for item, _ in doc.iterate_items(page_no=candidate_page):
+                    item_orig = getattr(item, "orig", "")
+                    if isinstance(item, (TextItem, ListItem)) and _toc_titles_match(title, item_orig):
+                        this_item = item
+                        break
+                if this_item is not None:
+                    break
+
+            if this_item is None:
+                if self.raise_on_error:
+                    raise HeaderNotFoundException(add_info)
+                # Keep this as a soft miss; fallback clustering can still recover structure.
+                continue
+
+            if current.level_toc is None or level > current.level_toc:
+                new_parent = current
+            elif level == current.level_toc:
+                if current.parent is not None:
+                    new_parent = current.parent
+                else:
+                    raise ImplausibleHeadingStructureException()
+            else:
+                new_parent = current
+                while new_parent.parent is not None and (level <= new_parent.level_toc):
+                    new_parent = new_parent.parent
+
+            new_obj = HierarchicalHeader(
+                text=this_item.orig,
+                parent=new_parent,
+                level_toc=level,
+                doc_ref=this_item.self_ref,
+            )
+            new_parent.children.append(new_obj)
+            current = new_obj
+
+        return root
+
+    HierarchyBuilderMetadata.infer = _infer_patched
+    HierarchyBuilderMetadata._filesmind_patched = True
+    _HIERARCHICAL_RUNTIME_PATCHED = True
+    logger.info("Applied hierarchical runtime patch: cached TOC + tolerant heading matching + reduced TOC warning noise.")
+
+
 # ── docling-hierarchical-pdf 集成 ──────────────────────────────────────────
 # 该库通过分析字体大小、加粗、PDF 书签来推断正确的标题层级，
 # 解决 Docling 将所有标题识别为同一级别（全 ##）的问题。
 # 安装：pip install docling-hierarchical-pdf
+ResultPostprocessor = None
 try:
     from hierarchical.postprocessor import ResultPostprocessor
+    _patch_hierarchical_runtime()
     _HIERARCHICAL_AVAILABLE = True
     logger.info("docling-hierarchical-pdf 已加载，将自动修正标题层级")
-except ImportError:
+except Exception:
     _HIERARCHICAL_AVAILABLE = False
     logger.warning("docling-hierarchical-pdf 未安装，跳过层级后处理（pip install docling-hierarchical-pdf）")
 # ──────────────────────────────────────────────────────────────────────────
@@ -356,6 +527,16 @@ def apply_hierarchy_postprocessor(result, file_path: str) -> None:
         return
 
     try:
+        pages = getattr(getattr(result, "document", None), "pages", None)
+        page_count = len(pages) if pages is not None else 0
+        if HIERARCHY_POSTPROCESS_MAX_PAGES > 0 and page_count > HIERARCHY_POSTPROCESS_MAX_PAGES:
+            logger.info(
+                "跳过层级后处理：page_count=%s 超过阈值 %s（可通过 HIERARCHY_POSTPROCESS_MAX_PAGES 调整）",
+                page_count,
+                HIERARCHY_POSTPROCESS_MAX_PAGES,
+            )
+            return
+
         postprocessor = ResultPostprocessor(result=result, source=file_path)
         postprocessor.process()
         logger.info("层级后处理完成：标题层级已根据字体/书签修正")
@@ -838,10 +1019,10 @@ def _run_marker_pipeline_api(file_path: Path, output_dir: str, file_id: str, do_
 
     md_content = _copy_marker_api_images_and_rewrite(md_content, rendered, data_dir, file_id)
     md_content = fix_markdown_hierarchy(md_content)
+    md_content = re.sub(r'^(#+\s+.*)$', r'\1 <!-- fm_anchor:none -->', md_content, flags=re.MULTILINE)
 
     output_file = Path(output_dir) / f"{file_id}.md"
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text(md_content, encoding="utf-8")
+    _atomic_write_text(output_file, md_content)
     logger.info(f"Marker API 解析完成，输出至: {output_file}")
     return md_content, data_dir
 
@@ -869,12 +1050,18 @@ def _run_marker_pipeline_cli(file_path: Path, output_dir: str, file_id: str, do_
         command_variants[0].append("--force_ocr")
         command_variants[1].append("--force_ocr")
 
+    settings = get_parser_runtime_config()
+    timeout_seconds = int(settings.get("task_timeout_seconds", 600))
+    
     last_error = ""
     for command in command_variants:
         logger.info(f"Marker 解析开始: {' '.join(command)}")
-        proc = subprocess.run(command, capture_output=True, text=True)
-        if proc.returncode == 0:
-            break
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds)
+            if proc.returncode == 0:
+                break
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Marker CLI 解析超时 ({timeout_seconds}秒)")
 
         stderr = (proc.stderr or "").strip()
         stdout = (proc.stdout or "").strip()
@@ -897,10 +1084,10 @@ def _run_marker_pipeline_cli(file_path: Path, output_dir: str, file_id: str, do_
     md_content = markdown_path.read_text(encoding="utf-8", errors="ignore")
     md_content = _copy_marker_images_and_rewrite(md_content, marker_root, data_dir, file_id)
     md_content = fix_markdown_hierarchy(md_content)
+    md_content = re.sub(r'^(#+\s+.*)$', r'\1 <!-- fm_anchor:none -->', md_content, flags=re.MULTILINE)
 
     output_file = Path(output_dir) / f"{file_id}.md"
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text(md_content, encoding="utf-8")
+    _atomic_write_text(output_file, md_content)
 
     logger.info(f"Marker 解析完成，输出至: {output_file}")
     return md_content, data_dir
@@ -929,6 +1116,8 @@ def get_optimal_device():
     自动检测最佳设备
     使用统一的硬件检测逻辑映射到 Docling 设备类型
     """
+    if not _DOCLING_AVAILABLE or AcceleratorDevice is None:
+        return "cpu"
     info = get_hardware_info()
     device_type = info["device_type"]
     
@@ -950,6 +1139,9 @@ def get_optimized_converter(do_ocr: bool = True):
     - CPU: 降级运行
     :param do_ocr: 是否开启 OCR (默认开启，处理纯文本 PDF 可关闭以提升速度)
     """
+    if not _DOCLING_AVAILABLE:
+        raise RuntimeError(f"Docling 依赖不可用: {_DOCLING_IMPORT_ERROR}")
+
     # 自动检测最佳设备
     device = get_optimal_device()
     
@@ -1057,12 +1249,58 @@ def extract_and_save_images(result, output_dir: Path, file_id: str) -> dict:
     return image_map
 
 
+def _resolve_doc_page(doc: Any, page_no: Any) -> Any:
+    pages = getattr(doc, "pages", None)
+    if pages is None:
+        return None
+    try:
+        page_no_int = int(page_no)
+    except (TypeError, ValueError):
+        return None
+
+    if isinstance(pages, (list, tuple)):
+        for idx in (page_no_int, page_no_int - 1):
+            if 0 <= idx < len(pages):
+                return pages[idx]
+        return None
+
+    for key in (page_no_int, page_no_int - 1):
+        try:
+            return pages[key]
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_page_height_for_prov(doc: Any, prov: Any) -> float | None:
+    legacy_page = getattr(prov, "page", None)
+    legacy_size = getattr(legacy_page, "size", None) if legacy_page is not None else None
+    legacy_height = getattr(legacy_page, "height", None)
+    if legacy_height is None and legacy_size is not None:
+        legacy_height = getattr(legacy_size, "height", None)
+    if isinstance(legacy_height, (int, float)) and legacy_height > 0:
+        return float(legacy_height)
+
+    page = _resolve_doc_page(doc, getattr(prov, "page_no", None))
+    page_size = getattr(page, "size", None) if page is not None else None
+    page_height = getattr(page, "height", None)
+    if page_height is None and page_size is not None:
+        page_height = getattr(page_size, "height", None)
+    if isinstance(page_height, (int, float)) and page_height > 0:
+        return float(page_height)
+    return None
+
+
 def _run_docling_pipeline(file_path: Path, output_dir: str, file_id: str, do_ocr: bool):
     """
     分块处理逻辑，防止 OOM
     :param file_id: 文件唯一ID，用于隔离图片存储
     :param do_ocr: 是否开启 OCR (建议纯文本 PDF 关闭)
     """
+    if not _DOCLING_AVAILABLE:
+        logger.error(f"Docling 依赖不可用，无法解析: {_DOCLING_IMPORT_ERROR}")
+        return None, None
+
     try:
         device = get_optimal_device()
         logger.info(f"开始解析: {file_path} on {device} Backend (OCR={do_ocr})")
@@ -1082,6 +1320,54 @@ def _run_docling_pipeline(file_path: Path, output_dir: str, file_id: str, do_ocr
         data_dir = _resolve_data_dir(output_dir)
         
         image_map = extract_and_save_images(result, data_dir, file_id)
+        # ──────────────────────────────────────────────────────────────────
+
+        # ── 提取文本元素 PDF 坐标映射 (Step 1.5) ──────────────────────────
+        try:
+            position_indexes = []
+            for item, _ in result.document.iterate_items():
+                if hasattr(item, "text") and item.text and hasattr(item, "prov") and item.prov:
+                    for p in item.prov:
+                        if hasattr(p, "page_no"):
+                            bbox = None
+                            if hasattr(p, "bbox") and p.bbox:
+                                if hasattr(p.bbox, "model_dump"):
+                                    bbox = p.bbox.model_dump()
+                                elif hasattr(p.bbox, "dict"):
+                                    bbox = p.bbox.dict()
+                                else:
+                                    bbox = {
+                                        "l": getattr(p.bbox, "l", None),
+                                        "t": getattr(p.bbox, "t", None),
+                                        "r": getattr(p.bbox, "r", None),
+                                        "b": getattr(p.bbox, "b", None),
+                                    }
+                            page_height = _resolve_page_height_for_prov(result.document, p)
+                            
+                            position_indexes.append({
+                                "text": item.text[:100],  # 截取前100字符作为匹配依据
+                                "page_no": p.page_no,
+                                "bbox": bbox,
+                                "page_height": page_height,
+                            })
+                            
+                            # Inject deterministic anchor
+                            anchor_payload = {
+                                "page_no": p.page_no,
+                                "bbox": bbox,
+                                "page_height": page_height
+                            }
+                            # Ensure no newline before the comment so it stays with the heading/text
+                            item.text = f"{item.text} <!-- fm_anchor:{json.dumps(anchor_payload)} -->"
+                            
+                            break # 只取第一个 provenance
+                            
+            if position_indexes:
+                index_path = data_dir / f"{file_id}_pdf_index.json"
+                _atomic_write_json(index_path, position_indexes)
+                logger.info(f"PDF 物理位置索引保存完成: {index_path} ({len(position_indexes)} items)")
+        except Exception as e:
+            logger.warning(f"提取 PDF 物理位置失败 (不影响正常解析): {e}")
         # ──────────────────────────────────────────────────────────────────
 
         # ── 导出 Markdown ─────────────────────────────────────────────────
@@ -1143,9 +1429,7 @@ def _run_docling_pipeline(file_path: Path, output_dir: str, file_id: str, do_ocr
         # ====== 层级修复完成 ======
 
         output_file = Path(output_dir) / f"{file_id}.md"
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(md_content)
+        _atomic_write_text(output_file, md_content)
             
         logger.info(f"解析完成，输出至: {output_file}")
         

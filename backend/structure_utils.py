@@ -1,5 +1,6 @@
 import re
 import json
+import hashlib
 from collections import Counter
 
 # =============================================================================
@@ -162,7 +163,7 @@ def _detect_toc_region(lines: list) -> tuple:
 
 # ── Enhancement 2: Split-heading detection ───────────────────────────────────
 _SPLIT_HEADING_RE = re.compile(
-    r'^(#+)\s*'
+    r'^\s*(#{1,6})\s*'
     r'(?:'
     r'Q?\d+(?:\.\d+)*\.?'
     r'|[A-Z]\d*'
@@ -207,6 +208,12 @@ _DIAGRAM_LABEL_RE = re.compile(r'^[A-Za-z]{1,4}\s*\([^)]{1,30}\)$')
 _SENTENCE_PUNCT_RE = re.compile(r'[，。！？；?!;]')
 _LONG_DIGIT_PREFIX_2_RE = re.compile(r'^\d{4,}(\d{2}(?:\.\d+)+(?:\.?\s*.*)?)$')
 _LONG_DIGIT_PREFIX_1_RE = re.compile(r'^\d{4,}(\d(?:\.\d+)+(?:\.?\s*.*)?)$')
+_WEAK_END_PUNCT_RE = re.compile(r'[。！？；，、：:]$')
+_WEAK_OPERATOR_PHRASE_RE = re.compile(r'\s+[+＝=]\s+')
+_WEAK_SHORT_PAREN_TERM_RE = re.compile(
+    r'^[\u4e00-\u9fffA-Za-z0-9]{1,4}\s*[（(][^）)]{1,12}[）)]$'
+)
+_WEAK_TWO_TOKEN_CN_RE = re.compile(r'^[\u4e00-\u9fff]{1,4}\s+[\u4e00-\u9fff]{2,8}$')
 
 # ── Phase 2 Enhancement: Additional noise patterns ───────────────────────────
 _WATERMARK_RE = re.compile(
@@ -375,6 +382,127 @@ def _has_structured_prefix(topic: str) -> bool:
     )
 
 
+def _extract_numeric_segments(topic: str):
+    m = _STRICT_NUMERIC_RE.match(topic)
+    if not m:
+        return None
+    parts = []
+    for seg in m.group(1).split('.'):
+        if not seg:
+            continue
+        try:
+            parts.append(int(seg))
+        except ValueError:
+            return None
+    return tuple(parts) if parts else None
+
+
+def _is_weak_unstructured_heading(topic: str) -> bool:
+    """
+    Identify low-confidence heading text that often comes from OCR/body fragments.
+
+    Important: this is only used with context checks (sandwiched between related
+    numbered headings), to avoid over-filtering real short titles.
+    """
+    if _has_structured_prefix(topic):
+        return False
+
+    normalized = re.sub(r'\s+', ' ', topic).strip()
+
+    if _WEAK_END_PUNCT_RE.search(normalized):
+        return True
+
+    if _WEAK_OPERATOR_PHRASE_RE.search(normalized):
+        return True
+
+    if _WEAK_SHORT_PAREN_TERM_RE.match(normalized):
+        return True
+
+    if _WEAK_TWO_TOKEN_CN_RE.match(normalized):
+        return True
+
+    return False
+
+
+def _should_demote_bridge_heading(heading_meta: list, pos: int) -> bool:
+    """
+    Demote weak unstructured headings that are between related numeric headings.
+
+    Example:
+      11.2. 内存管理
+      段号 + 段内地址。      <- demote to content
+      11.2.2. 虚拟内存
+    """
+    current = heading_meta[pos]
+    if not current.get("valid"):
+        return False
+    if current.get("numeric") is not None:
+        return False
+    if not _is_weak_unstructured_heading(current.get("topic", "")):
+        return False
+
+    next_meta = None
+    for i in range(pos + 1, len(heading_meta)):
+        if heading_meta[i].get("valid") and heading_meta[i].get("numeric") is not None:
+            next_meta = heading_meta[i]
+            break
+
+    if not next_meta:
+        return False
+
+    next_num = next_meta.get("numeric")
+    if next_num is None:
+        return False
+
+    prev_numeric_meta = None
+    for i in range(pos - 1, -1, -1):
+        if heading_meta[i].get("valid") and heading_meta[i].get("numeric") is not None:
+            prev_numeric_meta = heading_meta[i]
+            break
+
+    # Find nearest previous numeric heading that can serve as ancestor anchor
+    # of next_num (not necessarily the immediate previous heading).
+    anchor_num = None
+    for i in range(pos - 1, -1, -1):
+        if not heading_meta[i].get("valid"):
+            continue
+        candidate = heading_meta[i].get("numeric")
+        if candidate is None:
+            continue
+        if len(candidate) < len(next_num) and next_num[:len(candidate)] == candidate:
+            anchor_num = candidate
+            break
+
+    # Cross-chapter fallback:
+    # Sometimes OCR emits a short glue phrase between chapter N and chapter N+1.
+    # Example:
+    #   12.11. 数据分片
+    #   分片类型 定义与条件
+    #   13. 信息安全
+    # Demote only when signals are strong and conservative.
+    if anchor_num is None and prev_numeric_meta is not None:
+        prev_num = prev_numeric_meta.get("numeric")
+        if (
+            isinstance(prev_num, tuple)
+            and len(prev_num) >= 2
+            and len(next_num) == 1
+            and prev_num[0] != next_num[0]
+            and current.get("level", 0) < prev_numeric_meta.get("level", 0)
+            and current.get("level", 0) <= next_meta.get("level", 0)
+        ):
+            return True
+
+    if anchor_num is None:
+        return False
+
+    # Keep demotion conservative: current weak heading should not be deeper than
+    # the next numeric heading; it often appears as an OCR bridge line.
+    if current.get("level", 0) > next_meta.get("level", 0):
+        return False
+
+    return True
+
+
 def is_valid_heading(topic: str) -> bool:
     """
     Heuristic filter: decide whether a Markdown heading line is a genuine
@@ -539,8 +667,13 @@ def preprocess_markdown(text: str) -> str:
     while i < len(lines):
         line = lines[i]
         if _is_split_heading(line):
-            hashes = re.match(r'^(#+)', line).group(1)
-            label  = line.strip().lstrip('#').strip()
+            hash_match = re.match(r'^\s*(#+)', line)
+            if not hash_match:
+                merged.append(line)
+                i += 1
+                continue
+            hashes = hash_match.group(1)
+            label  = re.sub(r'^\s*#+\s*', '', line).strip()
 
             j = i + 1
             while j < len(lines) and not lines[j].strip():
@@ -565,13 +698,17 @@ def preprocess_markdown(text: str) -> str:
 
 class TreeNode:
     def __init__(self, topic, level, parent=None):
-        self.id = str(id(self))
+        self.id = ""
         self.topic = topic
         self.level = level
         self.content_lines = []
         self.children = []
         self.ai_details = []
         self.parent = parent
+        self.source_line_start = 0
+        self.source_line_end = 0
+        self.pdf_page_no = None
+        self.pdf_y_ratio = None
 
     @property
     def full_content(self):
@@ -592,8 +729,13 @@ class TreeNode:
 
     def to_dict(self):
         return {
+            "id": self.id,
             "topic": self.topic,
             "level": self.level,
+            "source_line_start": self.source_line_start,
+            "source_line_end": self.source_line_end,
+            "pdf_page_no": self.pdf_page_no,
+            "pdf_y_ratio": self.pdf_y_ratio,
             "content_length": len(self.full_content),
             "children": [child.to_dict() for child in self.children]
         }
@@ -614,19 +756,50 @@ def build_hierarchy_tree(markdown_text):
     lines = markdown_text.split('\n')
 
     root  = TreeNode("Root", 0)
+    root.id = "root"
+    root.source_line_start = 1
     stack = [root]
 
     # Pre-scan for numeric inference threshold
     raw_header_topics = []
     valid_header_topics = []
-    for line in lines:
+    heading_meta = []
+    heading_pos_by_line_index = {}
+    import json
+    for line_index, line in enumerate(lines):
         m = re.match(r'^(#+)\s+(.*)', line)
         if not m:
             continue
-        topic = _normalize_heading_topic(m.group(2).strip())
+        
+        raw_topic = m.group(2).strip()
+        anchor_match = re.search(r'<!--\s*fm_anchor:(.*?)\s*-->', raw_topic)
+        anchor_data = None
+        if anchor_match:
+            try:
+                anchor_data = json.loads(anchor_match.group(1))
+            except Exception:
+                pass
+            raw_topic = (raw_topic[:anchor_match.start()] + raw_topic[anchor_match.end():]).strip()
+            
+        topic = _normalize_heading_topic(raw_topic)
+        markdown_level = len(m.group(1))
+        valid = is_valid_heading(topic)
+        numeric = _extract_numeric_segments(topic) if valid else None
+
         raw_header_topics.append(topic)
-        if is_valid_heading(topic):
+        if valid:
             valid_header_topics.append(topic)
+
+        heading_pos_by_line_index[line_index] = len(heading_meta)
+        heading_meta.append(
+            {
+                "topic": topic,
+                "level": markdown_level,
+                "valid": valid,
+                "numeric": numeric,
+                "anchor_data": anchor_data
+            }
+        )
 
     numbered_count = sum(
         1 for topic in valid_header_topics
@@ -655,16 +828,28 @@ def build_hierarchy_tree(markdown_text):
         f"{'Numeric inference ON' if use_numbering_inference else 'Markdown # count mode'}"
     )
 
-    for line in lines:
+    for line_index, line in enumerate(lines):
         header_match = re.match(r'^(#+)\s+(.*)', line)
 
         if header_match:
+            raw_topic = header_match.group(2).strip()
+            anchor_match = re.search(r'<!--\s*fm_anchor:(.*?)\s*-->', raw_topic)
+            if anchor_match:
+                raw_topic = (raw_topic[:anchor_match.start()] + raw_topic[anchor_match.end():]).strip()
+                
             markdown_level = len(header_match.group(1))
-            topic = _normalize_heading_topic(header_match.group(2).strip())
+            topic = _normalize_heading_topic(raw_topic.strip())
 
             if not is_valid_heading(topic):
                 if topic:
                     stack[-1].content_lines.append(topic)
+                    stack[-1].source_line_end = max(stack[-1].source_line_end, line_index + 1)
+                continue
+
+            heading_pos = heading_pos_by_line_index.get(line_index)
+            if heading_pos is not None and _should_demote_bridge_heading(heading_meta, heading_pos):
+                stack[-1].content_lines.append(topic)
+                stack[-1].source_line_end = max(stack[-1].source_line_end, line_index + 1)
                 continue
 
             if use_numbering_inference:
@@ -673,19 +858,98 @@ def build_hierarchy_tree(markdown_text):
                 level = markdown_level
 
             new_node = TreeNode(topic, level)
+            new_node.source_line_start = line_index + 1
+            new_node.source_line_end = line_index + 1
 
             while len(stack) > 1 and stack[-1].level >= level:
-                stack.pop()
+                finished = stack.pop()
+                finished.source_line_end = max(finished.source_line_end, line_index)
+
+            # Assign anchor to new node if available
+            heading_pos = heading_pos_by_line_index.get(line_index)
+            if heading_pos is not None:
+                meta = heading_meta[heading_pos]
+                if meta.get("anchor_data"):
+                    anchor = meta["anchor_data"]
+                    new_node.pdf_page_no = anchor.get("page_no")
+                    bbox = anchor.get("bbox")
+                    page_height = anchor.get("page_height", 1000)
+                    if bbox and page_height:
+                        origin = str(bbox.get("coord_origin", "BOTTOM_LEFT")).upper()
+                        t_coord = float(bbox.get("t", bbox.get("top", 0)))
+                        y_ratio = (1.0 - (t_coord / float(page_height))) if origin == "BOTTOM_LEFT" else (t_coord / float(page_height))
+                        new_node.pdf_y_ratio = round(max(0.0, min(1.0, float(y_ratio))), 4)
 
             stack[-1].add_child(new_node)
             stack.append(new_node)
 
         else:
             line = line.strip()
+            # remove anchor tag from content lines
+            anchor_match = re.search(r'<!--\s*fm_anchor:(.*?)\s*-->', line)
+            while anchor_match:
+                if not getattr(stack[-1], "pdf_page_no", None):
+                    try:
+                        anchor = json.loads(anchor_match.group(1))
+                        stack[-1].pdf_page_no = anchor.get("page_no")
+                        bbox = anchor.get("bbox")
+                        page_height = anchor.get("page_height", 1000)
+                        if bbox and page_height:
+                            origin = str(bbox.get("coord_origin", "BOTTOM_LEFT")).upper()
+                            t_coord = float(bbox.get("t", bbox.get("top", 0)))
+                            y_ratio = (1.0 - (t_coord / float(page_height))) if origin == "BOTTOM_LEFT" else (t_coord / float(page_height))
+                            stack[-1].pdf_y_ratio = round(max(0.0, min(1.0, float(y_ratio))), 4)
+                    except Exception:
+                        pass
+                
+                line = (line[:anchor_match.start()] + line[anchor_match.end():]).strip()
+                anchor_match = re.search(r'<!--\s*fm_anchor:(.*?)\s*-->', line)
+
             if line:
                 stack[-1].content_lines.append(line)
+                stack[-1].source_line_end = max(stack[-1].source_line_end, line_index + 1)
+
+    total_lines = len(lines)
+    while len(stack) > 1:
+        finished = stack.pop()
+        finished.source_line_end = max(finished.source_line_end, total_lines)
+    root.source_line_end = max(root.source_line_end, total_lines)
 
     return root
+
+
+def assign_stable_node_ids(root: TreeNode, file_id: str = ""):
+    """
+    Assign deterministic node ids so frontend click mapping remains stable
+    across reloads and restarts for the same parsed structure.
+    """
+    root.id = "root"
+
+    def walk(parent: TreeNode, path: list):
+        for sibling_index, child in enumerate(parent.children):
+            new_path = path + [child.topic]
+            key = (
+                f"{file_id}|{' > '.join(new_path)}|{sibling_index}|"
+                f"{child.source_line_start}|{child.source_line_end}"
+            )
+            digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+            child.id = f"n_{digest}"
+            walk(child, new_path)
+
+    walk(root, [])
+
+
+def flatten_tree_nodes(root: TreeNode) -> list:
+    """Return pre-order flattened list (excluding root)."""
+    flattened = []
+
+    def walk(node: TreeNode):
+        for child in node.children:
+            flattened.append(child)
+            walk(child)
+
+    walk(root)
+    return flattened
 
 
 # ── Export helper ─────────────────────────────────────────────────────────────
