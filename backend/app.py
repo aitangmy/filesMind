@@ -2,6 +2,7 @@
 FilesMind 服务协议
 支持异步任务、进度追踪和文件历史记录
 """
+
 import os
 import uuid
 import asyncio
@@ -17,21 +18,23 @@ from contextlib import asynccontextmanager
 from concurrent.futures import ProcessPoolExecutor
 
 # 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("FilesMind")
 
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List, Any, Tuple
 from urllib.parse import urlparse
 import shutil
 from cryptography.fernet import Fernet, InvalidToken
+
 try:
     from filelock import FileLock
 except Exception:
+
     class FileLock:  # type: ignore[override]
         def __init__(self, *_args, **_kwargs):
             pass
@@ -42,32 +45,33 @@ except Exception:
         def __exit__(self, _exc_type, _exc, _tb):
             return False
 
+
 # 导入扩展模块
 from parser_service import process_pdf_safely, get_parser_runtime_config, update_parser_runtime_config
-from cognitive_engine import generate_mindmap_structure, update_client_config, test_connection, set_model, set_account_type
-
+from cognitive_engine import update_client_config, test_connection, set_model, set_account_type
 
 
 # ==================== 辅助函数 ====================
 def count_headers(text: str) -> Dict[str, int]:
     """统计 Markdown 文本中各级标题数量"""
     counts = {"h1": 0, "h2": 0, "h3": 0, "h4": 0, "h5": 0, "h6": 0, "total": 0}
-    for line in text.split('\n'):
+    for line in text.split("\n"):
         stripped = line.strip()
-        if stripped.startswith('#'):
-            match = re.match(r'^(#{1,6})\s', stripped)
+        if stripped.startswith("#"):
+            match = re.match(r"^(#{1,6})\s", stripped)
             if match:
                 level = len(match.group(1))
                 counts[f"h{level}"] += 1
                 counts["total"] += 1
     return counts
 
+
 # ==================== 智能分块函数 ====================
 def parse_markdown_chunks(md_content: str) -> List[Dict]:
     """
     智能分块：基于大小和结构的动态分块
     目标：将文档合并为较大的语义块（约 15k 字符），减少碎片化，提升 AI 上下文理解能力。
-    
+
     关键修复：
     1. 引入标题栈 (Header Stack) 维护层级上下文
     2. 返回结构改为 List[Dict] 以携带 context
@@ -76,40 +80,40 @@ def parse_markdown_chunks(md_content: str) -> List[Dict]:
         return []
 
     TARGET_CHUNK_SIZE = 6000
-    lines = md_content.split('\n')
-    
+    lines = md_content.split("\n")
+
     chunks = []
     current_chunk_lines = []
     current_size = 0
-    
+
     # 核心：维护标题栈 [{'level': 1, 'text': 'Chapter 1'}, ...]
-    header_stack = [] 
-    header_pattern = re.compile(r'^(#{1,6})\s+(.*)')
+    header_stack = []
+    header_pattern = re.compile(r"^(#{1,6})\s+(.*)")
 
     for line in lines:
         stripped = line.strip()
         header_match = header_pattern.match(stripped)
-        
+
         # --- 1. 维护上下文栈 ---
         if header_match:
             level = len(header_match.group(1))
             text = header_match.group(2).strip()
-            
+
             # 弹出所有级别 >= 当前级别的标题（保持层级树的正确性）
-            while header_stack and header_stack[-1]['level'] >= level:
+            while header_stack and header_stack[-1]["level"] >= level:
                 header_stack.pop()
-            
-            header_stack.append({'level': level, 'text': text})
+
+            header_stack.append({"level": level, "text": text})
 
         # --- 2. 决定是否切分 ---
-        line_len = len(line) + 1 # +1 for newline
-        
+        line_len = len(line) + 1  # +1 for newline
+
         # 触发切分的条件：
-        # 1. 大小超标 
+        # 1. 大小超标
         # 2. 且当前行是标题（尽量在章节处切断）
         # 3. 或者当前块实在太大了（超过 2 倍目标），强制切分
-        flag_split_at_header = (current_size >= TARGET_CHUNK_SIZE and header_match)
-        flag_force_split = (current_size >= TARGET_CHUNK_SIZE * 2)
+        flag_split_at_header = current_size >= TARGET_CHUNK_SIZE and header_match
+        flag_force_split = current_size >= TARGET_CHUNK_SIZE * 2
 
         if flag_split_at_header or flag_force_split:
             if current_chunk_lines:
@@ -117,55 +121,63 @@ def parse_markdown_chunks(md_content: str) -> List[Dict]:
                 # 策略调整：
                 # 如果是 Header 触发的切分，stack 包含了新 Header，Context 应为新 Header 的父级 (stack[:-1])
                 # 如果是强制切分，stack 是当前上下文，Context 应为完整 stack (stack[:]) 以保留当前位置
-                
+
                 # 用户原始逻辑使用 stack[:-1]，我们在此微调以增强鲁棒性：
                 # 但遵循用户的 Draft 代码为主，此处稍微优化 'split reason' 判断
-                
+
                 use_parent_context = True if header_match else False
                 context_source = header_stack[:-1] if (use_parent_context and len(header_stack) > 1) else header_stack
-                context_str = " > ".join([h['text'] for h in context_source])
-                
+                context_str = " > ".join([h["text"] for h in context_source])
+
                 if not context_str and header_stack:
-                     context_str = header_stack[0]['text']
+                    context_str = header_stack[0]["text"]
 
                 # 计算 context 深度和建议的起始标题级别
                 context_depth = len(context_source) if context_source else (1 if header_stack else 0)
                 expected_start_level = min(context_depth + 2, 6)  # H1=root, context占用后续级别
 
-                chunks.append({
-                    "content": '\n'.join(current_chunk_lines),
-                    "context": context_str,
-                    "context_depth": context_depth,
-                    "expected_start_level": expected_start_level
-                })
+                chunks.append(
+                    {
+                        "content": "\n".join(current_chunk_lines),
+                        "context": context_str,
+                        "context_depth": context_depth,
+                        "expected_start_level": expected_start_level,
+                    }
+                )
                 current_chunk_lines = []
                 current_size = 0
-        
+
         current_chunk_lines.append(line)
         current_size += line_len
 
     # 处理最后一个块
     if current_chunk_lines:
-        context_str = " > ".join([h['text'] for h in header_stack])
+        context_str = " > ".join([h["text"] for h in header_stack])
         context_depth = len(header_stack)
         expected_start_level = min(context_depth + 2, 6)
-        chunks.append({
-            "content": '\n'.join(current_chunk_lines),
-            "context": context_str,
-            "context_depth": context_depth,
-            "expected_start_level": expected_start_level
-        })
+        chunks.append(
+            {
+                "content": "\n".join(current_chunk_lines),
+                "context": context_str,
+                "context_depth": context_depth,
+                "expected_start_level": expected_start_level,
+            }
+        )
 
     # 标题统计日志
     total_headers = count_headers(md_content)
     logger.info(f"智能分块完成，共 {len(chunks)} 个章节 (Target: {TARGET_CHUNK_SIZE} chars)")
-    logger.info(f"原文标题统计: H1={total_headers['h1']}, H2={total_headers['h2']}, H3={total_headers['h3']}, H4={total_headers['h4']}, H5={total_headers['h5']}, H6={total_headers['h6']}, 总计={total_headers['total']}")
+    logger.info(
+        f"原文标题统计: H1={total_headers['h1']}, H2={total_headers['h2']}, H3={total_headers['h3']}, H4={total_headers['h4']}, H5={total_headers['h5']}, H6={total_headers['h6']}, 总计={total_headers['total']}"
+    )
     for i, chunk in enumerate(chunks):
-        chunk_headers = count_headers(chunk.get('content', ''))
-        ctx = chunk.get('context', 'N/A')
-        esl = chunk.get('expected_start_level', '?')
-        if chunk_headers['total'] > 0:
-            logger.info(f"Chunk {i}: {chunk_headers['total']} 个标题 (H2={chunk_headers['h2']}, H3={chunk_headers['h3']}, H4={chunk_headers['h4']}) | Context=[{ctx[:40]}] | StartLevel=H{esl}")
+        chunk_headers = count_headers(chunk.get("content", ""))
+        ctx = chunk.get("context", "N/A")
+        esl = chunk.get("expected_start_level", "?")
+        if chunk_headers["total"] > 0:
+            logger.info(
+                f"Chunk {i}: {chunk_headers['total']} 个标题 (H2={chunk_headers['h2']}, H3={chunk_headers['h3']}, H4={chunk_headers['h4']}) | Context=[{ctx[:40]}] | StartLevel=H{esl}"
+            )
     return chunks
 
 
@@ -176,7 +188,7 @@ def fallback_chunking(md_content: str, chunk_size: int = 15000) -> list:
 
     chunks = []
     # 按双换行（段落）分割
-    paragraphs = md_content.split('\n\n')
+    paragraphs = md_content.split("\n\n")
     current_chunk = ""
 
     for para in paragraphs:
@@ -190,7 +202,7 @@ def fallback_chunking(md_content: str, chunk_size: int = 15000) -> list:
             # 如果单个段落本身就超长，强制切分
             if len(para) > chunk_size:
                 # 递归切分超长段落
-                sub_chunks = [para[i:i+chunk_size] for i in range(0, len(para), chunk_size)]
+                sub_chunks = [para[i : i + chunk_size] for i in range(0, len(para), chunk_size)]
                 chunks.extend(sub_chunks)
             else:
                 current_chunk = para + "\n\n"
@@ -243,13 +255,15 @@ async def app_lifespan(_app: FastAPI):
 
 app = FastAPI(lifespan=app_lifespan)
 
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Global unhandled exception: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"success": False, "code": "INTERNAL_SERVER_ERROR", "message": f"服务器内部错误: {str(exc)}"}
+        content={"success": False, "code": "INTERNAL_SERVER_ERROR", "message": f"服务器内部错误: {str(exc)}"},
     )
+
 
 # ==================== 配置管理 ====================
 # 使用绝对路径，确保在任何目录启动都能找到配置
@@ -281,6 +295,7 @@ def _atomic_write_text(path: str, content: str):
 
 def _atomic_write_json(path: str, payload: Any):
     _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
 
 DEFAULT_PROVIDER_PRESETS = {
     "minimax": {"base_url": "https://api.minimaxi.com/v1", "model": "MiniMax-M2.5"},
@@ -327,6 +342,7 @@ class ParserSettingsPayload(BaseModel):
     hybrid_marker_min_length: int = 200
     marker_prefer_api: bool = False
     task_timeout_seconds: int = 600
+
 
 class AdvancedSettingsPayload(BaseModel):
     engine_concurrency: int = 5
@@ -516,7 +532,7 @@ def _decrypt_secret(secret: str) -> str:
     if not secret.startswith(ENCRYPTION_PREFIX):
         return secret
     cipher = _get_config_cipher()
-    token = secret[len(ENCRYPTION_PREFIX):]
+    token = secret[len(ENCRYPTION_PREFIX) :]
     try:
         return cipher.decrypt(token.encode("utf-8")).decode("utf-8")
     except InvalidToken:
@@ -757,7 +773,9 @@ def _validate_profile(profile: Dict[str, Any], field_prefix: str = "profile") ->
 
     account_type = str(profile.get("account_type", "free")).strip().lower() or "free"
     if account_type not in {"free", "paid"}:
-        raise ConfigValidationError("INVALID_ACCOUNT_TYPE", "账户类型仅支持 free 或 paid", f"{field_prefix}.account_type")
+        raise ConfigValidationError(
+            "INVALID_ACCOUNT_TYPE", "账户类型仅支持 free 或 paid", f"{field_prefix}.account_type"
+        )
 
     provider = str(profile.get("provider", "custom")).strip().lower() or "custom"
     if provider not in DEFAULT_PROVIDER_PRESETS:
@@ -784,12 +802,14 @@ def _validate_profile(profile: Dict[str, Any], field_prefix: str = "profile") ->
 
 def _migrate_legacy_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     profile = _default_profile()
-    profile.update({
-        "base_url": str(raw.get("base_url") or profile["base_url"]).strip(),
-        "model": str(raw.get("model") or profile["model"]).strip(),
-        "api_key": str(raw.get("api_key", "")),
-        "account_type": str(raw.get("account_type", "free")).strip().lower() or "free",
-    })
+    profile.update(
+        {
+            "base_url": str(raw.get("base_url") or profile["base_url"]).strip(),
+            "model": str(raw.get("model") or profile["model"]).strip(),
+            "api_key": str(raw.get("api_key", "")),
+            "account_type": str(raw.get("account_type", "free")).strip().lower() or "free",
+        }
+    )
     profile = _validate_profile(profile, "profiles[0]")
     parser = _validate_parser_config(raw.get("parser", _default_parser_config()), "parser")
     advanced = _validate_advanced_config(raw.get("advanced", _default_advanced_config()), "advanced")
@@ -820,7 +840,9 @@ def _normalize_config_store(raw: Any) -> Dict[str, Any]:
             raise ConfigValidationError("INVALID_PROFILE", "配置档案格式无效", f"profiles[{idx}]")
         cleaned = _validate_profile(item, f"profiles[{idx}]")
         if cleaned["id"] in seen_ids:
-            raise ConfigValidationError("DUPLICATE_PROFILE_ID", f"配置档案 ID 重复: {cleaned['id']}", f"profiles[{idx}].id")
+            raise ConfigValidationError(
+                "DUPLICATE_PROFILE_ID", f"配置档案 ID 重复: {cleaned['id']}", f"profiles[{idx}].id"
+            )
         seen_ids.add(cleaned["id"])
         profiles.append(cleaned)
 
@@ -931,18 +953,20 @@ def _config_to_view(config_store: Dict[str, Any]) -> ConfigStoreView:
 def _config_export_payload(config_store: Dict[str, Any]) -> Dict[str, Any]:
     profiles = []
     for profile in config_store.get("profiles", []):
-        profiles.append({
-            "id": profile.get("id", ""),
-            "name": profile.get("name", ""),
-            "provider": profile.get("provider", "custom"),
-            "base_url": profile.get("base_url", ""),
-            "model": profile.get("model", ""),
-            "account_type": profile.get("account_type", "free"),
-            "manual_models": profile.get("manual_models", []),
-            # 导出不含明文密钥；仅标记是否存在，导入后可复用同 id 的已有密钥
-            "api_key": "",
-            "has_api_key": bool(profile.get("api_key", "")),
-        })
+        profiles.append(
+            {
+                "id": profile.get("id", ""),
+                "name": profile.get("name", ""),
+                "provider": profile.get("provider", "custom"),
+                "base_url": profile.get("base_url", ""),
+                "model": profile.get("model", ""),
+                "account_type": profile.get("account_type", "free"),
+                "manual_models": profile.get("manual_models", []),
+                # 导出不含明文密钥；仅标记是否存在，导入后可复用同 id 的已有密钥
+                "api_key": "",
+                "has_api_key": bool(profile.get("api_key", "")),
+            }
+        )
     return {
         "schema_version": CONFIG_SCHEMA_VERSION,
         "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -1048,6 +1072,7 @@ app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
 
 from enum import Enum
 
+
 class TaskStatus(str, Enum):
     PENDING = "pending"
     PROCESSING = "processing"
@@ -1067,6 +1092,7 @@ class TaskTimeoutExceeded(TaskControlError):
 class TaskCancelled(TaskControlError):
     pass
 
+
 class Task:
     def __init__(self, task_id: str, file_id: Optional[str] = None):
         self.task_id = task_id
@@ -1082,6 +1108,7 @@ class Task:
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.worker: Optional[asyncio.Task] = None
 
+
 class FileRecord(BaseModel):
     file_id: str
     task_id: Optional[str] = None
@@ -1091,6 +1118,7 @@ class FileRecord(BaseModel):
     md_path: str
     created_at: str
     status: str  # "completed", "processing", "failed"
+
 
 # ==================== 任务存储（内存） ====================
 # 注意：服务重启后任务状态丢失，这对单用户桌面应用是可接受的
@@ -1165,6 +1193,7 @@ def _sync_cancel_flag_from_snapshot(task: "Task"):
         if reason:
             task.cancel_reason = reason[:200]
 
+
 def cleanup_old_tasks():
     now = datetime.now(timezone.utc)
     to_remove = []
@@ -1180,6 +1209,7 @@ def cleanup_old_tasks():
         tasks.pop(tid, None)
         _remove_task_snapshot(tid)
 
+
 def create_task(task_id: str, file_id: Optional[str] = None) -> "Task":
     """创建并注册新任务"""
     cleanup_old_tasks()
@@ -1188,11 +1218,14 @@ def create_task(task_id: str, file_id: Optional[str] = None) -> "Task":
     _persist_task_snapshot(task)
     return task
 
+
 def get_task(task_id: str) -> Optional["Task"]:
     """根据 task_id 获取任务，不存在则返回 None"""
     return tasks.get(task_id)
 
+
 # ==================== 文件 Hash ====================
+
 
 def get_file_hash(file_path: str) -> str:
     """计算文件 MD5，用于去重检测"""
@@ -1202,9 +1235,11 @@ def get_file_hash(file_path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
 # ==================== 历史记录管理 ====================
 # 使用 JSON 文件持久化，RLock 防止并发读写冲突
 _history_lock = threading.RLock()
+
 
 def _history_lock_file() -> str:
     return f"{HISTORY_FILE}.lock"
@@ -1228,10 +1263,12 @@ def load_history() -> List[Dict]:
         with FileLock(_history_lock_file()):
             return _load_history_sync_unlocked()
 
+
 def _save_history_sync(history: List[Dict]):
     """同步写入历史记录（内部使用）"""
     os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
     _atomic_write_json(HISTORY_FILE, history)
+
 
 def add_file_record(
     file_id: str,
@@ -1264,6 +1301,7 @@ def add_file_record(
             _save_history_sync(history)
     logger.info(f"文件记录已保存: {file_id} ({status})")
 
+
 def update_file_status(file_id: str, status: str, md_path: str = None):
     """更新文件处理状态"""
     with _history_lock:
@@ -1277,6 +1315,7 @@ def update_file_status(file_id: str, status: str, md_path: str = None):
                     break
             _save_history_sync(history)
 
+
 def delete_file_record(file_id: str) -> bool:
     """删除文件记录，返回是否成功"""
     with _history_lock:
@@ -1287,6 +1326,7 @@ def delete_file_record(file_id: str) -> bool:
                 return False  # 未找到
             _save_history_sync(new_history)
             return True
+
 
 def check_file_exists(file_hash: str) -> Optional[Dict]:
     """根据 MD5 检查文件是否已存在，返回记录或 None"""
@@ -1357,33 +1397,33 @@ def _persist_source_index(file_id: str, root_node, source_md_path: str, parser_b
             "anchor_version": "1.0",
             "has_precise_anchor": any(n.get("pdf_page_no") is not None for n in flat_nodes),
             "parser_backend": parser_backend,
-        }
+        },
     }
     index_path = _source_index_path(file_id)
     _atomic_write_json(index_path, index_payload)
     return index_payload
 
 
-_MD_HEADING_RE = re.compile(r'^(#{1,6})\s+(.*)$')
-_MD_LIST_RE = re.compile(r'^(?P<indent>\s*)(?P<marker>[-*+]|\d+[.)])\s+(?P<body>\S.*)$')
-_MD_NUMERIC_RE = re.compile(r'^(\d+(?:\.\d+)*)\s*[\.、):：-]\s*(.+)$')
-_MD_TABLE_RULE_RE = re.compile(r'^\s*\|?[\-:\s]{3,}\|[\-:\s|]+\s*$')
-_MD_ANCHOR_RE = re.compile(r'<!--\s*fm_anchor:.*?-->', flags=re.IGNORECASE)
-_MD_STRONG_RE = re.compile(r'(\*\*|__|`|~~)')
-_MD_LINK_RE = re.compile(r'!\[([^\]]*)\]\([^)]*\)|\[([^\]]+)\]\([^)]*\)')
-_MD_DOT_LEADER_RE = re.compile(r'[.\u2026·•]{3,}\s*\d+\s*$')
-_MD_TRAILING_PAGE_RE = re.compile(r'\s+\d+\s*$')
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_MD_LIST_RE = re.compile(r"^(?P<indent>\s*)(?P<marker>[-*+]|\d+[.)])\s+(?P<body>\S.*)$")
+_MD_NUMERIC_RE = re.compile(r"^(\d+(?:\.\d+)*)\s*[\.、):：-]\s*(.+)$")
+_MD_TABLE_RULE_RE = re.compile(r"^\s*\|?[\-:\s]{3,}\|[\-:\s|]+\s*$")
+_MD_ANCHOR_RE = re.compile(r"<!--\s*fm_anchor:.*?-->", flags=re.IGNORECASE)
+_MD_STRONG_RE = re.compile(r"(\*\*|__|`|~~)")
+_MD_LINK_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)|\[([^\]]+)\]\([^)]*\)")
+_MD_DOT_LEADER_RE = re.compile(r"[.\u2026·•]{3,}\s*\d+\s*$")
+_MD_TRAILING_PAGE_RE = re.compile(r"\s+\d+\s*$")
 _MAX_FALLBACK_INDEX_NODES = 220
 
 
 def _clean_markdown_topic(raw: str) -> str:
-    text = _MD_ANCHOR_RE.sub('', str(raw or ''))
+    text = _MD_ANCHOR_RE.sub("", str(raw or ""))
     text = html.unescape(text)
-    text = _MD_LINK_RE.sub(lambda m: m.group(1) or m.group(2) or '', text)
-    text = _MD_STRONG_RE.sub('', text)
-    text = text.replace('\\_', '_')
-    text = text.strip().strip('|').strip()
-    text = re.sub(r'\s+', ' ', text)
+    text = _MD_LINK_RE.sub(lambda m: m.group(1) or m.group(2) or "", text)
+    text = _MD_STRONG_RE.sub("", text)
+    text = text.replace("\\_", "_")
+    text = text.strip().strip("|").strip()
+    text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
@@ -1392,17 +1432,17 @@ def _is_valid_outline_topic(topic: str) -> bool:
         return False
     if len(topic) < 1 or len(topic) > 140:
         return False
-    if not re.search(r'[A-Za-z0-9\u4e00-\u9fff]', topic):
+    if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", topic):
         return False
-    if re.fullmatch(r'[★☆\-\s\|\.]+', topic):
+    if re.fullmatch(r"[★☆\-\s\|\.]+", topic):
         return False
     return True
 
 
 def _parse_outline_topic_level(topic: str, has_heading: bool) -> Tuple[str, Optional[int]]:
     normalized = _clean_markdown_topic(topic)
-    normalized = _MD_DOT_LEADER_RE.sub('', normalized)
-    normalized = _MD_TRAILING_PAGE_RE.sub('', normalized)
+    normalized = _MD_DOT_LEADER_RE.sub("", normalized)
+    normalized = _MD_TRAILING_PAGE_RE.sub("", normalized)
     normalized = normalized.strip()
     if not _is_valid_outline_topic(normalized):
         return "", None
@@ -1417,7 +1457,7 @@ def _parse_outline_topic_level(topic: str, has_heading: bool) -> Tuple[str, Opti
         return normalized, None
 
     level_offset = 1 if has_heading else 0
-    level = min(6, max(1, len(serial.split('.')) + level_offset))
+    level = min(6, max(1, len(serial.split(".")) + level_offset))
     return f"{serial} {title}".strip(), level
 
 
@@ -1432,7 +1472,7 @@ def _collect_markdown_structure_entries(file_id: str, markdown: str) -> List[Dic
     def append_entry(topic: str, level: int, line_no: int, kind: str):
         if len(entries) >= _MAX_FALLBACK_INDEX_NODES:
             return
-        topic_norm = re.sub(r'\s+', ' ', topic).strip()
+        topic_norm = re.sub(r"\s+", " ", topic).strip()
         if not _is_valid_outline_topic(topic_norm):
             return
         signature = (line_no, topic_norm.lower())
@@ -1454,7 +1494,7 @@ def _collect_markdown_structure_entries(file_id: str, markdown: str) -> List[Dic
         )
 
     for line_no, raw in enumerate(lines, start=1):
-        line = _MD_ANCHOR_RE.sub('', raw or '')
+        line = _MD_ANCHOR_RE.sub("", raw or "")
         if not line.strip():
             continue
         stripped = line.strip()
@@ -1473,7 +1513,7 @@ def _collect_markdown_structure_entries(file_id: str, markdown: str) -> List[Dic
         list_match = _MD_LIST_RE.match(line)
         if list_match:
             body = _clean_markdown_topic(list_match.group("body"))
-            indent = len((list_match.group("indent") or '').replace('\t', '    '))
+            indent = len((list_match.group("indent") or "").replace("\t", "    "))
             list_depth = (indent // 2) + 1
             parent_level = last_heading_level if has_heading else 0
             level = min(6, max(1, parent_level + list_depth))
@@ -1481,10 +1521,10 @@ def _collect_markdown_structure_entries(file_id: str, markdown: str) -> List[Dic
             continue
 
         # TOC/table fallback: extract candidate cells and map numeric entries to hierarchy.
-        if stripped.startswith('|') or _MD_DOT_LEADER_RE.search(stripped):
+        if stripped.startswith("|") or _MD_DOT_LEADER_RE.search(stripped):
             cells = [stripped]
-            if stripped.startswith('|'):
-                cells = [cell.strip() for cell in stripped.strip('|').split('|') if cell.strip()]
+            if stripped.startswith("|"):
+                cells = [cell.strip() for cell in stripped.strip("|").split("|") if cell.strip()]
             for cell in cells:
                 topic, parsed_level = _parse_outline_topic_level(cell, has_heading)
                 if not topic:
@@ -1541,13 +1581,15 @@ def _build_index_from_markdown_headings(file_id: str, markdown: str, source_md_p
         stack[-1]["children"].append(node)
         stack.append(node)
 
-    flat_nodes = [{
-        "node_id": root["node_id"],
-        "topic": root["topic"],
-        "level": root["level"],
-        "source_line_start": root["source_line_start"],
-        "source_line_end": root["source_line_end"],
-    }] + [
+    flat_nodes = [
+        {
+            "node_id": root["node_id"],
+            "topic": root["topic"],
+            "level": root["level"],
+            "source_line_start": root["source_line_start"],
+            "source_line_end": root["source_line_end"],
+        }
+    ] + [
         {
             "node_id": item["node_id"],
             "topic": item["topic"],
@@ -1621,11 +1663,7 @@ def rebuild_source_indexes_batch(
     verbose: bool = False,
 ) -> Dict[str, Any]:
     started_at = datetime.now(timezone.utc).isoformat()
-    target_ids = {
-        str(item).strip()
-        for item in (file_ids or [])
-        if str(item).strip()
-    }
+    target_ids = {str(item).strip() for item in (file_ids or []) if str(item).strip()}
     history = load_history()
 
     scanned = 0
@@ -1655,10 +1693,12 @@ def rebuild_source_indexes_batch(
 
         if status != "completed":
             skipped += 1
-            item.update({
-                "action": "skipped",
-                "reason": f"status={status or 'unknown'}",
-            })
+            item.update(
+                {
+                    "action": "skipped",
+                    "reason": f"status={status or 'unknown'}",
+                }
+            )
             if verbose:
                 logger.info(f"[rebuild] skip {file_id}: {item['reason']}")
             items.append(item)
@@ -1666,10 +1706,12 @@ def rebuild_source_indexes_batch(
 
         if not md_path or not os.path.exists(md_path):
             failed += 1
-            item.update({
-                "action": "failed",
-                "reason": f"md_not_found:{md_path}",
-            })
+            item.update(
+                {
+                    "action": "failed",
+                    "reason": f"md_not_found:{md_path}",
+                }
+            )
             items.append(item)
             continue
 
@@ -1688,11 +1730,13 @@ def rebuild_source_indexes_batch(
             )
             if not should_rebuild:
                 skipped += 1
-                item.update({
-                    "action": "skipped",
-                    "reason": reason,
-                    "old_nodes": old_nodes,
-                })
+                item.update(
+                    {
+                        "action": "skipped",
+                        "reason": reason,
+                        "old_nodes": old_nodes,
+                    }
+                )
                 if verbose:
                     logger.info(f"[rebuild] skip {file_id}: {reason}")
                 items.append(item)
@@ -1710,13 +1754,15 @@ def rebuild_source_indexes_batch(
 
             rebuilt += 1
             action = "would_rebuild" if dry_run else "rebuilt"
-            item.update({
-                "action": action,
-                "reason": reason,
-                "old_nodes": old_nodes,
-                "new_nodes": new_nodes,
-                "index_mode": index_mode,
-            })
+            item.update(
+                {
+                    "action": action,
+                    "reason": reason,
+                    "old_nodes": old_nodes,
+                    "new_nodes": new_nodes,
+                    "index_mode": index_mode,
+                }
+            )
             if verbose:
                 logger.info(
                     f"[rebuild] {action} {file_id}: old_nodes={old_nodes}, new_nodes={new_nodes}, reason={reason}"
@@ -1724,10 +1770,12 @@ def rebuild_source_indexes_batch(
             items.append(item)
         except Exception as exc:
             failed += 1
-            item.update({
-                "action": "failed",
-                "reason": f"{type(exc).__name__}: {exc}",
-            })
+            item.update(
+                {
+                    "action": "failed",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
             items.append(item)
 
     finished_at = datetime.now(timezone.utc).isoformat()
@@ -1815,7 +1863,9 @@ def _ensure_source_index(file_id: str, markdown_path: str) -> Dict[str, Any]:
     logger.info(f"source index 缺失，开始重建: file_id={file_id}")
     return _rebuild_source_index_from_markdown(file_id, markdown_path)
 
+
 # ==================== 后台任务 ====================
+
 
 async def process_document_task(task_id: str, file_location: str, file_id: str, original_filename: str):
     """
@@ -1856,9 +1906,10 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
 
         # CPU 密集任务优先使用进程池，避免阻塞事件循环
         import functools
+
         md_content, image_map = await loop.run_in_executor(
             _parse_process_pool,
-            functools.partial(process_pdf_safely, file_location, output_dir=MD_DIR, file_id=file_id)
+            functools.partial(process_pdf_safely, file_location, output_dir=MD_DIR, file_id=file_id),
         )
         ensure_task_active()
 
@@ -1886,8 +1937,8 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
 
         # Phase 2 End: Clean tags out before saving the visible `.md` proxy
         source_md_path = _source_md_path(file_id)
-        clean_md = re.sub(r'<!--\s*fm_anchor:.*?\s*-->', '', md_content)
-        clean_md = re.sub(r'\n{3,}', '\n\n', clean_md)
+        clean_md = re.sub(r"<!--\s*fm_anchor:.*?\s*-->", "", md_content)
+        clean_md = re.sub(r"\n{3,}", "\n\n", clean_md)
         _atomic_write_text(source_md_path, clean_md)
 
         _persist_source_index(file_id, root_node, source_md_path, parser_backend)
@@ -1924,9 +1975,7 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
                     context_path = node.get_breadcrumbs()
 
                     details = await refine_node_content(
-                        node_title=node.topic,
-                        content_chunk=node.full_content,
-                        context_path=context_path
+                        node_title=node.topic, content_chunk=node.full_content, context_path=context_path
                     )
                     ensure_task_active()
 
@@ -1963,14 +2012,14 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         commit_state()
 
         final_md = tree_to_markdown(root_node)
-        doc_title = original_filename.replace('.pdf', '')
-        if not final_md.startswith('# '):
+        doc_title = original_filename.replace(".pdf", "")
+        if not final_md.startswith("# "):
             final_md = f"# {doc_title}\n\n{final_md}"
 
         md_path = os.path.join(MD_DIR, f"{file_id}.md")
         _atomic_write_text(md_path, final_md)
 
-        update_file_status(file_id, 'completed', md_path)
+        update_file_status(file_id, "completed", md_path)
         task.status = TaskStatus.COMPLETED
         task.progress = 100
         task.message = "处理完成！"
@@ -1985,14 +2034,14 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         task.status = TaskStatus.CANCELLED
         task.error = "TASK_TIMEOUT"
         task.message = str(e)
-        update_file_status(file_id, 'cancelled')
+        update_file_status(file_id, "cancelled")
         commit_state()
     except TaskCancelled as e:
         logger.info(f"任务 {task_id} 已取消：{e}")
         task.status = TaskStatus.CANCELLED
         task.error = "TASK_CANCELLED"
         task.message = str(e)
-        update_file_status(file_id, 'cancelled')
+        update_file_status(file_id, "cancelled")
         commit_state()
     except asyncio.CancelledError:
         reason = task.cancel_reason or "任务已取消"
@@ -2001,20 +2050,22 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         task.status = TaskStatus.CANCELLED
         task.error = "TASK_CANCELLED"
         task.message = reason
-        update_file_status(file_id, 'cancelled')
+        update_file_status(file_id, "cancelled")
         commit_state()
     except Exception as e:
         logger.error(f"任务 {task_id} 处理失败：{e}", exc_info=True)
         task.status = TaskStatus.FAILED
         task.error = str(e)
         task.message = f"处理失败：{str(e)}"
-        update_file_status(file_id, 'failed')
+        update_file_status(file_id, "failed")
         commit_state()
     finally:
         task.worker = None
         commit_state()
 
+
 # ==================== API 路由 ====================
+
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -2025,6 +2076,7 @@ class TaskResponse(BaseModel):
     result: Optional[str] = None
     error: Optional[str] = None
 
+
 class UploadResponse(BaseModel):
     task_id: str
     file_id: str
@@ -2032,6 +2084,7 @@ class UploadResponse(BaseModel):
     message: str
     is_duplicate: bool = False
     existing_md: Optional[str] = None
+
 
 class HistoryItem(BaseModel):
     file_id: str
@@ -2045,6 +2098,7 @@ class HistoryItem(BaseModel):
 def _get_history_record(file_id: str) -> Optional[Dict[str, Any]]:
     history = load_history()
     return next((item for item in history if item.get("file_id") == file_id), None)
+
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_document(file: UploadFile = File(...)):
@@ -2076,33 +2130,33 @@ async def upload_document(file: UploadFile = File(...)):
     # 检查是否重复
     existing = check_file_exists(file_hash)
     if existing:
-        existing_status = existing.get('status')
+        existing_status = existing.get("status")
 
-        if existing_status == 'completed':
+        if existing_status == "completed":
             # 情况 1: 已完成，直接复用 MD 结果
             # 删除临时文件
             os.remove(temp_file)
 
             # 获取已存在的 MD
             existing_md = ""
-            if os.path.exists(existing['md_path']):
-                with open(existing['md_path'], 'r', encoding='utf-8') as f:
+            if os.path.exists(existing["md_path"]):
+                with open(existing["md_path"], "r", encoding="utf-8") as f:
                     existing_md = f.read()
 
             logger.info(f"检测到重复文件（已完成）：{file.filename}")
             return UploadResponse(
                 task_id=task_id,
-                file_id=existing['file_id'],
+                file_id=existing["file_id"],
                 status="completed",
                 message="文件已存在，直接加载",
                 is_duplicate=True,
-                existing_md=existing_md
+                existing_md=existing_md,
             )
 
-        elif existing_status in {'failed', 'cancelled'}:
+        elif existing_status in {"failed", "cancelled"}:
             # 情况 2: 之前处理失败，复用 PDF 文件，重新创建任务
-            old_file_id = existing['file_id']
-            pdf_path = existing.get('pdf_path')
+            old_file_id = existing["file_id"]
+            pdf_path = existing.get("pdf_path")
 
             if not pdf_path or not os.path.exists(pdf_path):
                 # PDF 文件不存在，删除临时文件并当作新文件处理
@@ -2114,11 +2168,15 @@ async def upload_document(file: UploadFile = File(...)):
 
                 # 更新原记录状态为 processing
                 md_path = os.path.join(MD_DIR, f"{old_file_id}.md")
-                add_file_record(old_file_id, existing['filename'], file_hash, pdf_path, md_path, "processing", task_id=task_id)
+                add_file_record(
+                    old_file_id, existing["filename"], file_hash, pdf_path, md_path, "processing", task_id=task_id
+                )
 
                 # 创建新任务，使用原有 PDF 路径
                 task = create_task(task_id, file_id=old_file_id)
-                task.worker = asyncio.create_task(process_document_task(task_id, pdf_path, old_file_id, existing['filename']))
+                task.worker = asyncio.create_task(
+                    process_document_task(task_id, pdf_path, old_file_id, existing["filename"])
+                )
                 _persist_task_snapshot(task)
 
                 logger.info(f"检测到失败任务，重新处理：{file.filename}, file_id={old_file_id}")
@@ -2126,13 +2184,13 @@ async def upload_document(file: UploadFile = File(...)):
                     task_id=task_id,
                     file_id=old_file_id,
                     status="processing",
-                    message="检测到之前处理失败，正在重新处理..."
+                    message="检测到之前处理失败，正在重新处理...",
                 )
-        elif existing_status == 'processing':
+        elif existing_status == "processing":
             # 情况 3: 已在处理中的重复上传，复用正在运行任务；若任务丢失则自动重启
-            old_file_id = existing['file_id']
-            old_task_id = existing.get('task_id')
-            pdf_path = existing.get('pdf_path')
+            old_file_id = existing["file_id"]
+            old_task_id = existing.get("task_id")
+            pdf_path = existing.get("pdf_path")
 
             # 删除本次临时上传文件，避免重复占用磁盘
             os.remove(temp_file)
@@ -2145,7 +2203,7 @@ async def upload_document(file: UploadFile = File(...)):
                     file_id=old_file_id,
                     status="processing",
                     message="文件正在处理中，已连接到现有任务",
-                    is_duplicate=True
+                    is_duplicate=True,
                 )
 
             if pdf_path and os.path.exists(pdf_path):
@@ -2153,16 +2211,16 @@ async def upload_document(file: UploadFile = File(...)):
                 md_path = os.path.join(MD_DIR, f"{old_file_id}.md")
                 add_file_record(
                     old_file_id,
-                    existing['filename'],
+                    existing["filename"],
                     file_hash,
                     pdf_path,
                     md_path,
                     "processing",
-                    task_id=restarted_task_id
+                    task_id=restarted_task_id,
                 )
                 restarted_task = create_task(restarted_task_id, file_id=old_file_id)
                 restarted_task.worker = asyncio.create_task(
-                    process_document_task(restarted_task_id, pdf_path, old_file_id, existing['filename'])
+                    process_document_task(restarted_task_id, pdf_path, old_file_id, existing["filename"])
                 )
                 _persist_task_snapshot(restarted_task)
                 logger.info(f"历史处理中任务已失效，自动重启：task_id={restarted_task_id}, file_id={old_file_id}")
@@ -2171,7 +2229,7 @@ async def upload_document(file: UploadFile = File(...)):
                     file_id=old_file_id,
                     status="processing",
                     message="检测到历史任务已失效，已自动重新处理",
-                    is_duplicate=True
+                    is_duplicate=True,
                 )
 
             logger.warning(f"处理中记录缺失源 PDF，按新文件处理：file_id={old_file_id}")
@@ -2192,12 +2250,8 @@ async def upload_document(file: UploadFile = File(...)):
     _persist_task_snapshot(task)
     logger.info(f"后台任务已创建：{task_id}")
 
-    return UploadResponse(
-        task_id=task_id,
-        file_id=file_id,
-        status="processing",
-        message="任务已创建，正在处理..."
-    )
+    return UploadResponse(task_id=task_id, file_id=file_id, status="processing", message="任务已创建，正在处理...")
+
 
 @app.get("/task/{task_id}", response_model=TaskResponse)
 async def get_task_status(task_id: str):
@@ -2228,7 +2282,7 @@ async def get_task_status(task_id: str):
         progress=task.progress,
         message=task.message,
         result=task.result,
-        error=task.error
+        error=task.error,
     )
 
 
@@ -2286,6 +2340,7 @@ async def cancel_task(task_id: str, request: Request):
         "message": "已发送取消请求",
     }
 
+
 @app.get("/history", response_model=List[HistoryItem])
 async def get_history():
     """
@@ -2295,15 +2350,16 @@ async def get_history():
     # 只需要关键字段
     return [
         HistoryItem(
-            file_id=item['file_id'],
-            filename=item['filename'],
-            file_hash=item['file_hash'],
-            md_path=item['md_path'],
-            created_at=item['created_at'],
-            status=item['status']
+            file_id=item["file_id"],
+            filename=item["filename"],
+            file_hash=item["file_hash"],
+            md_path=item["md_path"],
+            created_at=item["created_at"],
+            status=item["status"],
         )
         for item in history
     ]
+
 
 @app.get("/file/{file_id}")
 async def get_file_content(file_id: str):
@@ -2312,17 +2368,17 @@ async def get_file_content(file_id: str):
     """
     history = load_history()
     for item in history:
-        if item['file_id'] == file_id:
-            if item['status'] != 'completed':
+        if item["file_id"] == file_id:
+            if item["status"] != "completed":
                 raise HTTPException(status_code=400, detail="文件尚未处理完成")
 
-            if not os.path.exists(item['md_path']):
+            if not os.path.exists(item["md_path"]):
                 raise HTTPException(status_code=404, detail="文件内容不存在")
 
-            with open(item['md_path'], 'r', encoding='utf-8') as f:
+            with open(item["md_path"], "r", encoding="utf-8") as f:
                 content = f.read()
 
-            return {"content": content, "filename": item['filename']}
+            return {"content": content, "filename": item["filename"]}
 
     raise HTTPException(status_code=404, detail="文件记录不存在")
 
@@ -2409,11 +2465,9 @@ async def get_node_source(file_id: str, node_id: str, context_lines: int = 2, ma
     # 查找 PDF 物理页码映射
     pdf_page_no = node_meta.get("pdf_page_no")
     pdf_y_ratio = node_meta.get("pdf_y_ratio")
-    capabilities = source_index.get("capabilities", {
-        "anchor_version": "1.0",
-        "parser_backend": "unknown",
-        "has_precise_anchor": False
-    })
+    capabilities = source_index.get(
+        "capabilities", {"anchor_version": "1.0", "parser_backend": "unknown", "has_precise_anchor": False}
+    )
 
     return {
         "file_id": file_id,
@@ -2430,25 +2484,28 @@ async def get_node_source(file_id: str, node_id: str, context_lines: int = 2, ma
         "capabilities": capabilities,
     }
 
+
 @app.get("/file/{file_id}/pdf")
 async def get_pdf_file(file_id: str):
     """
     提供原始 PDF 文件的静态访问
     """
     from fastapi.responses import FileResponse
+
     record = _get_history_record(file_id)
     if not record:
         raise HTTPException(status_code=404, detail="文件记录不存在")
     pdf_path = record.get("pdf_path")
     if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="原始 PDF 文件不存在")
-        
+
     return FileResponse(
         pdf_path,
         media_type="application/pdf",
         filename=record.get("filename", "document.pdf"),
-        content_disposition_type="inline"
+        content_disposition_type="inline",
     )
+
 
 @app.delete("/file/{file_id}")
 async def delete_file(file_id: str):
@@ -2467,7 +2524,7 @@ async def delete_file(file_id: str):
         _source_md_path(file_id),
         _source_index_path(file_id),
         os.path.join(DATA_DIR, f"{file_id}_pdf_index.json"),
-        os.path.join(DATA_DIR, f"{file_id}_anchor_index.json")
+        os.path.join(DATA_DIR, f"{file_id}_anchor_index.json"),
     ]
     for path in paths_to_remove:
         if path and os.path.exists(path):
@@ -2491,12 +2548,15 @@ async def delete_file(file_id: str):
         return {"message": "文件已删除"}
     raise HTTPException(status_code=500, detail="删除历史记录失败")
 
+
 @app.get("/health")
 async def health_check():
     """健康检查"""
     return {"status": "ok"}
 
+
 from hardware_utils import get_hardware_info
+
 
 @app.get("/system/hardware")
 async def check_hardware_status():
@@ -2505,14 +2565,12 @@ async def check_hardware_status():
     logger.info(f"前端查询硬件状态: {info}")
     return info
 
+
 @app.get("/system/features")
 async def get_system_features():
     """抛出当前系统的功能特性开关"""
     settings = get_parser_runtime_config()
-    return {
-        "FEATURE_VIRTUAL_PDF": bool(settings.get("feature_virtual_pdf", True)),
-        "FEATURE_SIDECAR_ANCHOR": False
-    }
+    return {"FEATURE_VIRTUAL_PDF": bool(settings.get("feature_virtual_pdf", True)), "FEATURE_SIDECAR_ANCHOR": False}
 
 
 @app.post("/admin/source-index/rebuild")
@@ -2541,6 +2599,7 @@ async def admin_rebuild_source_index(payload: SourceIndexRebuildPayload):
             },
         )
 
+
 # ==================== 配置 API ====================
 @app.get("/config", response_model=ConfigStoreView)
 async def get_config():
@@ -2562,12 +2621,14 @@ async def import_config(payload: ConfigImportPayload):
     try:
         raw_payload = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
         # 支持导出文件中的附加字段（如 exported_at）
-        normalized = _normalize_config_store({
-            "active_profile_id": raw_payload.get("active_profile_id", ""),
-            "profiles": raw_payload.get("profiles", []),
-            "parser": raw_payload.get("parser", _default_parser_config()),
-            "advanced": raw_payload.get("advanced", _default_advanced_config()),
-        })
+        normalized = _normalize_config_store(
+            {
+                "active_profile_id": raw_payload.get("active_profile_id", ""),
+                "profiles": raw_payload.get("profiles", []),
+                "parser": raw_payload.get("parser", _default_parser_config()),
+                "advanced": raw_payload.get("advanced", _default_advanced_config()),
+            }
+        )
         existing = _load_config_store()
 
         # 导入数据中 api_key 为空但标注 has_api_key=true 时，自动尝试保留旧密钥
@@ -2667,7 +2728,9 @@ async def load_models(request: ModelListRequest):
     """动态拉取模型列表；失败时返回手动白名单作为降级来源"""
     try:
         existing = _load_config_store()
-        profile_payload = request.profile.model_dump() if hasattr(request.profile, "model_dump") else request.profile.dict()
+        profile_payload = (
+            request.profile.model_dump() if hasattr(request.profile, "model_dump") else request.profile.dict()
+        )
         profile = _extract_profile_payload({"profile": profile_payload}, existing)
         runtime_profile = _profile_to_runtime(profile)
 
@@ -2705,7 +2768,20 @@ async def load_models(request: ModelListRequest):
             "code": _map_error_code(fetch_result.get("error", "")),
         }
     except ConfigValidationError as e:
-        return {"success": False, "source": "none", "models": [], "code": e.code, "message": e.message, "field": e.field}
+        return {
+            "success": False,
+            "source": "none",
+            "models": [],
+            "code": e.code,
+            "message": e.message,
+            "field": e.field,
+        }
     except Exception as e:
         logger.error(f"拉取模型列表失败：{e}")
-        return {"success": False, "source": "none", "models": [], "code": "INTERNAL_ERROR", "message": f"内部错误：{str(e)}"}
+        return {
+            "success": False,
+            "source": "none",
+            "models": [],
+            "code": "INTERNAL_ERROR",
+            "message": f"内部错误：{str(e)}",
+        }

@@ -5,7 +5,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from cognitive_engine import generate_mindmap_structure
 
-async def test_pipeline_logic():
+async def _test_pipeline_logic():
     print("Testing Pipeline Logic...")
     
     # Mock Data
@@ -44,7 +44,7 @@ async def test_pipeline_logic():
         else:
             print("\nFAILURE: Hierarchy lost or flattened.")
 
-async def test_generated_files():
+async def _test_generated_files():
     print("\n\nTesting Generated Files...")
     test_files = [
         "test_docs/doc_shallow.md",
@@ -111,6 +111,12 @@ async def test_generated_files():
                 else:
                     print("  FAILURE: Deep hierarchy lost.")
 
+def test_pipeline_logic_sync():
+    asyncio.run(_test_pipeline_logic())
+
+def test_generated_files_sync():
+    asyncio.run(_test_generated_files())
+
 if __name__ == "__main__":
-    asyncio.run(test_pipeline_logic())
-    asyncio.run(test_generated_files())
+    asyncio.run(_test_pipeline_logic())
+    asyncio.run(_test_generated_files())

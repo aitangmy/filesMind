@@ -7,6 +7,7 @@ try:
 except Exception:
     torch = None
 
+
 def get_hardware_info():
     """
     检测当前硬件环境
@@ -24,12 +25,9 @@ def get_hardware_info():
     else:
         device_type = "cpu"
         device_name = "CPU"
-    
-    return {
-        "device_type": device_type,
-        "name": device_name,
-        "details": f"Running on {device_name}"
-    }
+
+    return {"device_type": device_type, "name": device_name, "details": f"Running on {device_name}"}
+
 
 def is_accelerator_available():
     """如果可用 GPU 或 MPS，返回 True"""

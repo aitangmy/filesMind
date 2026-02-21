@@ -9,6 +9,15 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import parser_service as ps  # noqa: E402
 
+try:
+    from docling_core.types.doc.document import ContentLayer, DocItemLabel
+
+    _HAS_DOCLING_CORE = True
+except Exception:
+    ContentLayer = None
+    DocItemLabel = None
+    _HAS_DOCLING_CORE = False
+
 
 def _score_payload(score: float, total: int = 10, valid: int = 8, levels=None):
     if levels is None:
@@ -98,27 +107,50 @@ class ParserQualityScoreTests(unittest.TestCase):
         self.assertGreater(good["valid_headings"], bad["valid_headings"])
 
 
+class TocMatchingTests(unittest.TestCase):
+    def test_toc_titles_match_chinese_symbols(self):
+        toc = "12.5.1.E-R图转换关系模式（重点★★★★★）"
+        item = "12.5.1 E-R图转换关系模式（重点）"
+        self.assertTrue(ps._toc_titles_match(toc, item))
+
+    def test_toc_titles_match_chinese_with_spacing(self):
+        toc = "10.1.5.1.模拟数据编码（次重点 ★★★★☆）"
+        item = "10.1.5.1 模拟 数据 编码（次重点）"
+        self.assertTrue(ps._toc_titles_match(toc, item))
+
+    def test_toc_titles_match_rejects_unrelated_titles(self):
+        toc = "10.1.5.1.模拟数据编码（次重点 ★★★★☆）"
+        item = "12.5.1 E-R图转换关系模式（重点）"
+        self.assertFalse(ps._toc_titles_match(toc, item))
+
+
 class ParserHybridDecisionTests(unittest.TestCase):
     def test_hybrid_skips_marker_when_docling_score_is_high(self):
         with patch.object(ps, "_run_docling_pipeline", return_value=("doc-md", Path("/tmp/data"))):
             with patch.object(ps, "_compute_quality_score", return_value=_score_payload(75.0)):
                 with patch.object(ps, "_run_marker_pipeline") as mock_marker:
                     with patch.object(ps, "get_parser_runtime_config", return_value=_runtime_config()):
-                        result = ps.process_pdf_safely("a.pdf", output_dir="/tmp/out", file_id="f1", parser_backend="hybrid")
+                        result = ps.process_pdf_safely(
+                            "a.pdf", output_dir="/tmp/out", file_id="f1", parser_backend="hybrid"
+                        )
         self.assertEqual(result[0], "doc-md")
         mock_marker.assert_not_called()
 
     def test_hybrid_selects_marker_when_score_gap_is_large_enough(self):
         with patch.object(ps, "_run_docling_pipeline", return_value=("doc-md", Path("/tmp/data"))):
             with patch.object(ps, "_is_marker_available", return_value=True):
-                with patch.object(ps, "_run_marker_pipeline", return_value=("m" * 600, Path("/tmp/data"))) as mock_marker:
+                with patch.object(
+                    ps, "_run_marker_pipeline", return_value=("m" * 600, Path("/tmp/data"))
+                ) as mock_marker:
                     with patch.object(
                         ps,
                         "_compute_quality_score",
                         side_effect=[_score_payload(60.0), _score_payload(66.0)],
                     ):
                         with patch.object(ps, "get_parser_runtime_config", return_value=_runtime_config()):
-                            result = ps.process_pdf_safely("a.pdf", output_dir="/tmp/out", file_id="f1", parser_backend="hybrid")
+                            result = ps.process_pdf_safely(
+                                "a.pdf", output_dir="/tmp/out", file_id="f1", parser_backend="hybrid"
+                            )
         self.assertEqual(result[0], "m" * 600)
         mock_marker.assert_called_once()
 
@@ -132,7 +164,9 @@ class ParserHybridDecisionTests(unittest.TestCase):
                         side_effect=[_score_payload(60.0), _score_payload(61.5)],
                     ):
                         with patch.object(ps, "get_parser_runtime_config", return_value=_runtime_config()):
-                            result = ps.process_pdf_safely("a.pdf", output_dir="/tmp/out", file_id="f1", parser_backend="hybrid")
+                            result = ps.process_pdf_safely(
+                                "a.pdf", output_dir="/tmp/out", file_id="f1", parser_backend="hybrid"
+                            )
         self.assertEqual(result[0], "doc-md")
 
     def test_hybrid_keeps_docling_when_marker_unavailable(self):
@@ -141,7 +175,9 @@ class ParserHybridDecisionTests(unittest.TestCase):
                 with patch.object(ps, "_is_marker_api_available", return_value=False):
                     with patch.object(ps, "get_parser_runtime_config", return_value=_runtime_config()):
                         with patch.object(ps, "_compute_quality_score", return_value=_score_payload(55.0)):
-                            result = ps.process_pdf_safely("a.pdf", output_dir="/tmp/out", file_id="f1", parser_backend="hybrid")
+                            result = ps.process_pdf_safely(
+                                "a.pdf", output_dir="/tmp/out", file_id="f1", parser_backend="hybrid"
+                            )
         self.assertEqual(result[0], "doc-md")
 
 
@@ -198,10 +234,9 @@ class _FakeResult:
         self.document = doc
 
 
+@unittest.skipUnless(_HAS_DOCLING_CORE, "docling_core 不可用")
 class ParserProvenanceCompatibilityTests(unittest.TestCase):
     def test_reclassify_supports_v2_page_no_mapping(self):
-        from docling_core.types.doc.document import ContentLayer, DocItemLabel
-
         item = SimpleNamespace(
             label=DocItemLabel.TEXT,
             prov=[SimpleNamespace(page_no=1, bbox=SimpleNamespace(t=980.0, b=940.0))],
@@ -215,8 +250,6 @@ class ParserProvenanceCompatibilityTests(unittest.TestCase):
         self.assertEqual(item.content_layer, ContentLayer.FURNITURE)
 
     def test_reclassify_supports_legacy_page_object(self):
-        from docling_core.types.doc.document import ContentLayer, DocItemLabel
-
         item = SimpleNamespace(
             label=DocItemLabel.TEXT,
             prov=[SimpleNamespace(page=SimpleNamespace(height=1000.0), bbox=SimpleNamespace(t=980.0, b=940.0))],
@@ -230,8 +263,6 @@ class ParserProvenanceCompatibilityTests(unittest.TestCase):
         self.assertEqual(item.content_layer, ContentLayer.FURNITURE)
 
     def test_reclassify_handles_list_pages_with_one_based_page_no(self):
-        from docling_core.types.doc.document import ContentLayer, DocItemLabel
-
         item = SimpleNamespace(
             label=DocItemLabel.TEXT,
             prov=[SimpleNamespace(page_no=1, bbox=SimpleNamespace(t=980.0, b=940.0))],
@@ -243,6 +274,25 @@ class ParserProvenanceCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(changed, 1)
         self.assertEqual(item.content_layer, ContentLayer.FURNITURE)
+
+
+class HierarchyPostprocessorGuardTests(unittest.TestCase):
+    def test_skip_hierarchy_postprocess_for_large_page_count(self):
+        result = _FakeResult(_FakeDoc(items=[], pages=[object(), object(), object()]))
+        with patch.object(ps, "_HIERARCHICAL_AVAILABLE", True):
+            with patch.object(ps, "HIERARCHY_POSTPROCESS_MAX_PAGES", 2):
+                with patch.object(ps, "ResultPostprocessor") as mock_post:
+                    ps.apply_hierarchy_postprocessor(result, "dummy.pdf")
+        mock_post.assert_not_called()
+
+    def test_run_hierarchy_postprocess_when_page_count_within_limit(self):
+        result = _FakeResult(_FakeDoc(items=[], pages=[object(), object()]))
+        with patch.object(ps, "_HIERARCHICAL_AVAILABLE", True):
+            with patch.object(ps, "HIERARCHY_POSTPROCESS_MAX_PAGES", 10):
+                with patch.object(ps, "ResultPostprocessor") as mock_post:
+                    mock_post.return_value.process.return_value = None
+                    ps.apply_hierarchy_postprocessor(result, "dummy.pdf")
+        mock_post.assert_called_once()
 
 
 if __name__ == "__main__":

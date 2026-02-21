@@ -29,17 +29,17 @@ from collections import Counter
 #
 # This is 100% universal — no keyword lists, no language assumptions.
 
-_HF_MIN_PAGE_FRACTION = 0.40   # line must appear in ≥ 40% of pages
-_HF_APPROX_LINES_PER_PAGE = 30 # used when no page-break markers are present
-_HF_MIN_PAGES = 2              # need at least 2 pages for reliable detection
-_HF_MAX_LINE_LEN = 120         # very long lines are never headers/footers
-_HF_POSITION_ZONE = 0.30       # top/bottom 30% of each page segment = HF zone
+_HF_MIN_PAGE_FRACTION = 0.40  # line must appear in ≥ 40% of pages
+_HF_APPROX_LINES_PER_PAGE = 30  # used when no page-break markers are present
+_HF_MIN_PAGES = 2  # need at least 2 pages for reliable detection
+_HF_MAX_LINE_LEN = 120  # very long lines are never headers/footers
+_HF_POSITION_ZONE = 0.30  # top/bottom 30% of each page segment = HF zone
 
 
 def _normalise_hf_line(line: str) -> str:
     """Normalise a line for frequency comparison."""
-    line = re.sub(r'^#+\s*', '', line)   # strip heading markers
-    line = re.sub(r'\s+', ' ', line)     # collapse whitespace
+    line = re.sub(r"^#+\s*", "", line)  # strip heading markers
+    line = re.sub(r"\s+", " ", line)  # collapse whitespace
     return line.strip().lower()
 
 
@@ -58,7 +58,7 @@ def detect_and_remove_headers_footers(lines: list) -> tuple:
     Returns (cleaned_lines, hf_fingerprints).
     """
     # ── Step 1: Split into page segments ─────────────────────────────────────
-    PAGE_BREAK_RE = re.compile(r'<!--\s*page.?break\s*-->', re.IGNORECASE)
+    PAGE_BREAK_RE = re.compile(r"<!--\s*page.?break\s*-->", re.IGNORECASE)
 
     segments = []
     current = []
@@ -77,7 +77,7 @@ def detect_and_remove_headers_footers(lines: list) -> tuple:
         all_lines = segments[0] if segments else lines
         n = len(all_lines)
         page_size = max(5, _HF_APPROX_LINES_PER_PAGE)
-        segments = [all_lines[i: i + page_size] for i in range(0, n, page_size)]
+        segments = [all_lines[i : i + page_size] for i in range(0, n, page_size)]
 
     num_pages = len(segments)
     if num_pages < _HF_MIN_PAGES:
@@ -108,10 +108,7 @@ def detect_and_remove_headers_footers(lines: list) -> tuple:
 
     # ── Step 4: Identify header/footer fingerprints ───────────────────────────
     threshold = max(2, int(num_pages * _HF_MIN_PAGE_FRACTION))
-    hf_fingerprints = {
-        norm for norm, count in pos_page_count.items()
-        if count >= threshold
-    }
+    hf_fingerprints = {norm for norm, count in pos_page_count.items() if count >= threshold}
 
     if hf_fingerprints:
         print(
@@ -125,7 +122,7 @@ def detect_and_remove_headers_footers(lines: list) -> tuple:
     for raw in lines:
         norm = _normalise_hf_line(raw)
         if norm in hf_fingerprints:
-            cleaned.append('')
+            cleaned.append("")
         else:
             cleaned.append(raw)
 
@@ -133,7 +130,7 @@ def detect_and_remove_headers_footers(lines: list) -> tuple:
 
 
 # ── Enhancement 3: TOC detection ─────────────────────────────────────────────
-_TOC_LINE_RE = re.compile(r'(?:\.{3,}|…{2,})\s*\d+\s*$')
+_TOC_LINE_RE = re.compile(r"(?:\.{3,}|…{2,})\s*\d+\s*$")
 _TOC_DENSITY_THRESHOLD = 0.30
 _TOC_SCAN_LINES = 600
 
@@ -147,13 +144,13 @@ def _detect_toc_region(lines: list) -> tuple:
     toc_flags = [bool(_TOC_LINE_RE.search(l)) for l in scan]
 
     first = next((i for i, f in enumerate(toc_flags) if f), -1)
-    last  = next((i for i, f in enumerate(reversed(toc_flags)) if f), -1)
+    last = next((i for i, f in enumerate(reversed(toc_flags)) if f), -1)
     if first == -1:
         return (-1, -1)
     last = len(toc_flags) - 1 - last
 
     region_len = last - first + 1
-    density = sum(toc_flags[first:last + 1]) / max(region_len, 1)
+    density = sum(toc_flags[first : last + 1]) / max(region_len, 1)
     if density < _TOC_DENSITY_THRESHOLD:
         return (-1, -1)
 
@@ -163,12 +160,12 @@ def _detect_toc_region(lines: list) -> tuple:
 
 # ── Enhancement 2: Split-heading detection ───────────────────────────────────
 _SPLIT_HEADING_RE = re.compile(
-    r'^\s*(#{1,6})\s*'
-    r'(?:'
-    r'Q?\d+(?:\.\d+)*\.?'
-    r'|[A-Z]\d*'
-    r')\s*$',
-    re.IGNORECASE
+    r"^\s*(#{1,6})\s*"
+    r"(?:"
+    r"Q?\d+(?:\.\d+)*\.?"
+    r"|[A-Z]\d*"
+    r")\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -179,84 +176,80 @@ def _is_split_heading(line: str) -> bool:
 
 # ── Enhancement 4 + Fix 1: Strict numeric section regex ──────────────────────
 _STRICT_NUMERIC_RE = re.compile(
-    r'^(\d+(?:\.\d+)*)\.?\s*'
-    r'(?=[a-zA-Z\u4e00-\u9fff\uff08\u3010\[（【])'
+    r"^(\d+(?:\.\d+)*)\.?\s*"
+    r"(?=[a-zA-Z\u4e00-\u9fff\uff08\u3010\[（【])"
 )
 
 # ── Fix 2 helpers: body-text / formula detection ─────────────────────────────
 _BODY_TEXT_STARTERS = re.compile(
-    r'^['
-    r'=＝'
-    r'（('
-    r'①②③④⑤⑥⑦⑧⑨⑩'
-    r'πσ∈∉∪∩≡≠≤≥∀∃∧∨¬'
-    r'+-/*'
-    r']'
+    r"^["
+    r"=＝"
+    r"（("
+    r"①②③④⑤⑥⑦⑧⑨⑩"
+    r"πσ∈∉∪∩≡≠≤≥∀∃∧∨¬"
+    r"+-/*"
+    r"]"
 )
-_LIST_ITEM_RE   = re.compile(r'^\d+[）)、]')
+_LIST_ITEM_RE = re.compile(r"^\d+[）)、]")
 _FORMULA_PATTERNS = re.compile(
-    r'[=＝×÷±∈∉≡≠≤≥∧∨¬πσ]'
-    r'|\d+\s*[×÷]\s*\d+'
-    r'|\{[^}]{0,60}\}'
-    r'|\[[^\]]{0,60}\]'
+    r"[=＝×÷±∈∉≡≠≤≥∧∨¬πσ]"
+    r"|\d+\s*[×÷]\s*\d+"
+    r"|\{[^}]{0,60}\}"
+    r"|\[[^\]]{0,60}\]"
 )
 _MAX_HEADING_LENGTH = 60
-_PURE_SYMBOL_RE = re.compile(r'^[\s★☆*#\-_=~`·•\[\]【】()（）]+$')
-_PURE_DIGIT_RE = re.compile(r'^\d{2,}$')
-_SHORT_GARBAGE_TOKEN_RE = re.compile(r'^[A-Za-z]\d{0,3}[*#]?$')
-_DIAGRAM_LABEL_RE = re.compile(r'^[A-Za-z]{1,4}\s*\([^)]{1,30}\)$')
-_SENTENCE_PUNCT_RE = re.compile(r'[，。！？；?!;]')
-_LONG_DIGIT_PREFIX_2_RE = re.compile(r'^\d{4,}(\d{2}(?:\.\d+)+(?:\.?\s*.*)?)$')
-_LONG_DIGIT_PREFIX_1_RE = re.compile(r'^\d{4,}(\d(?:\.\d+)+(?:\.?\s*.*)?)$')
-_WEAK_END_PUNCT_RE = re.compile(r'[。！？；，、：:]$')
-_WEAK_OPERATOR_PHRASE_RE = re.compile(r'\s+[+＝=]\s+')
-_WEAK_SHORT_PAREN_TERM_RE = re.compile(
-    r'^[\u4e00-\u9fffA-Za-z0-9]{1,4}\s*[（(][^）)]{1,12}[）)]$'
-)
-_WEAK_TWO_TOKEN_CN_RE = re.compile(r'^[\u4e00-\u9fff]{1,4}\s+[\u4e00-\u9fff]{2,8}$')
+_PURE_SYMBOL_RE = re.compile(r"^[\s★☆*#\-_=~`·•\[\]【】()（）]+$")
+_PURE_DIGIT_RE = re.compile(r"^\d{2,}$")
+_SHORT_GARBAGE_TOKEN_RE = re.compile(r"^[A-Za-z]\d{0,3}[*#]?$")
+_DIAGRAM_LABEL_RE = re.compile(r"^[A-Za-z]{1,4}\s*\([^)]{1,30}\)$")
+_SENTENCE_PUNCT_RE = re.compile(r"[，。！？；?!;]")
+_LONG_DIGIT_PREFIX_2_RE = re.compile(r"^\d{4,}(\d{2}(?:\.\d+)+(?:\.?\s*.*)?)$")
+_LONG_DIGIT_PREFIX_1_RE = re.compile(r"^\d{4,}(\d(?:\.\d+)+(?:\.?\s*.*)?)$")
+_WEAK_END_PUNCT_RE = re.compile(r"[。！？；，、：:]$")
+_WEAK_OPERATOR_PHRASE_RE = re.compile(r"\s+[+＝=]\s+")
+_WEAK_SHORT_PAREN_TERM_RE = re.compile(r"^[\u4e00-\u9fffA-Za-z0-9]{1,4}\s*[（(][^）)]{1,12}[）)]$")
+_WEAK_TWO_TOKEN_CN_RE = re.compile(r"^[\u4e00-\u9fff]{1,4}\s+[\u4e00-\u9fff]{2,8}$")
 
 # ── Phase 2 Enhancement: Additional noise patterns ───────────────────────────
 _WATERMARK_RE = re.compile(
-    r'^(?:confidential|draft|internal|'
-    r'\u5185\u90e8|\u673a\u5bc6|\u4ec5\u4f9b\u53c2\u8003|\u4fdd\u5bc6|'
-    r'\u8349\u7a3f|\u5f85\u5ba1|\u672a\u5b9a\u7a3f)$',
-    re.IGNORECASE
+    r"^(?:confidential|draft|internal|"
+    r"\u5185\u90e8|\u673a\u5bc6|\u4ec5\u4f9b\u53c2\u8003|\u4fdd\u5bc6|"
+    r"\u8349\u7a3f|\u5f85\u5ba1|\u672a\u5b9a\u7a3f)$",
+    re.IGNORECASE,
 )
 _PAGE_NUMBER_RE = re.compile(
-    r'^(?:'
-    r'-\s*\d+\s*-'
-    r'|page\s+\d+'
-    r'|\u7b2c\s*\d+\s*\u9875'
-    r'|\d+\s*/\s*\d+'
-    r'|\d+\s+of\s+\d+'
-    r')$',
-    re.IGNORECASE
+    r"^(?:"
+    r"-\s*\d+\s*-"
+    r"|page\s+\d+"
+    r"|\u7b2c\s*\d+\s*\u9875"
+    r"|\d+\s*/\s*\d+"
+    r"|\d+\s+of\s+\d+"
+    r")$",
+    re.IGNORECASE,
 )
-_DECORATIVE_LINE_RE = re.compile(r'^[\s\-=_~*\u25a0\u25b2\u25cf\u25c6\u25cb\u25b3\u25c7\u2605\u2606\u2022\u00b7]{3,}$')
-_URL_RE = re.compile(r'^https?://', re.IGNORECASE)
-_FILE_PATH_RE = re.compile(r'^(?:[A-Z]:\\|/(?:usr|home|var|etc|opt|tmp)/)', re.IGNORECASE)
-_COPYRIGHT_RE = re.compile(r'^[\u00a9\xc2]|^copyright\s|^\u7248\u6743|^all\s+rights\s+reserved', re.IGNORECASE)
+_DECORATIVE_LINE_RE = re.compile(r"^[\s\-=_~*\u25a0\u25b2\u25cf\u25c6\u25cb\u25b3\u25c7\u2605\u2606\u2022\u00b7]{3,}$")
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+_FILE_PATH_RE = re.compile(r"^(?:[A-Z]:\\|/(?:usr|home|var|etc|opt|tmp)/)", re.IGNORECASE)
+_COPYRIGHT_RE = re.compile(r"^[\u00a9\xc2]|^copyright\s|^\u7248\u6743|^all\s+rights\s+reserved", re.IGNORECASE)
 _STANDALONE_NOISE_RE = re.compile(
-    r'^(?:'
-    r'-\s*\d+\s*-'
-    r'|page\s+\d+'
-    r'|\u7b2c\s*\d+\s*\u9875'
-    r'|\d+\s*/\s*\d+'
-    r'|\d+\s+of\s+\d+'
-    r')$',
-    re.IGNORECASE
+    r"^(?:"
+    r"-\s*\d+\s*-"
+    r"|page\s+\d+"
+    r"|\u7b2c\s*\d+\s*\u9875"
+    r"|\d+\s*/\s*\d+"
+    r"|\d+\s+of\s+\d+"
+    r")$",
+    re.IGNORECASE,
 )
 _REPEATED_DECORATIVE_MAX_LEN = 40
 _REPEATED_DECORATIVE_MIN_COUNT = 3
-_MD_TABLE_SEPARATOR_RE = re.compile(
-    r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$'
-)
-_PURE_DASH_LINE_RE = re.compile(r'^\s*-{5,}\s*$')
+_MD_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
+_PURE_DASH_LINE_RE = re.compile(r"^\s*-{5,}\s*$")
 
 
 def _normalise_repeated_noise_line(line: str) -> str:
-    line = re.sub(r'^#+\s*', '', line)
-    line = re.sub(r'\s+', ' ', line)
+    line = re.sub(r"^#+\s*", "", line)
+    line = re.sub(r"\s+", " ", line)
     return line.strip()
 
 
@@ -284,10 +277,7 @@ def detect_and_remove_repeated_decorative_lines(lines: list) -> tuple:
             candidates.append(text.lower())
 
     counter = Counter(candidates)
-    repeated_noise = {
-        text for text, count in counter.items()
-        if count >= _REPEATED_DECORATIVE_MIN_COUNT
-    }
+    repeated_noise = {text for text, count in counter.items() if count >= _REPEATED_DECORATIVE_MIN_COUNT}
 
     if repeated_noise:
         print(
@@ -299,7 +289,7 @@ def detect_and_remove_repeated_decorative_lines(lines: list) -> tuple:
     for raw in lines:
         text = _normalise_repeated_noise_line(raw).lower()
         if text in repeated_noise:
-            cleaned.append('')
+            cleaned.append("")
         else:
             cleaned.append(raw)
     return cleaned, repeated_noise
@@ -373,12 +363,12 @@ def _has_structured_prefix(topic: str) -> bool:
     return bool(
         _STRICT_NUMERIC_RE.match(topic)
         or re.match(
-            r'^\u7b2c[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\d]+'
-            r'[\u7ae0\u8282\u7bc7\u90e8]',
-            topic
+            r"^\u7b2c[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\d]+"
+            r"[\u7ae0\u8282\u7bc7\u90e8]",
+            topic,
         )
-        or re.match(r'^(?:Chapter|Section|Part|Appendix)\s+[\dIVXivx]+', topic, re.IGNORECASE)
-        or re.match(r'^Q\d+\s*[：:。\s]', topic, re.IGNORECASE)
+        or re.match(r"^(?:Chapter|Section|Part|Appendix)\s+[\dIVXivx]+", topic, re.IGNORECASE)
+        or re.match(r"^Q\d+\s*[：:。\s]", topic, re.IGNORECASE)
     )
 
 
@@ -387,7 +377,7 @@ def _extract_numeric_segments(topic: str):
     if not m:
         return None
     parts = []
-    for seg in m.group(1).split('.'):
+    for seg in m.group(1).split("."):
         if not seg:
             continue
         try:
@@ -407,7 +397,7 @@ def _is_weak_unstructured_heading(topic: str) -> bool:
     if _has_structured_prefix(topic):
         return False
 
-    normalized = re.sub(r'\s+', ' ', topic).strip()
+    normalized = re.sub(r"\s+", " ", topic).strip()
 
     if _WEAK_END_PUNCT_RE.search(normalized):
         return True
@@ -469,7 +459,7 @@ def _should_demote_bridge_heading(heading_meta: list, pos: int) -> bool:
         candidate = heading_meta[i].get("numeric")
         if candidate is None:
             continue
-        if len(candidate) < len(next_num) and next_num[:len(candidate)] == candidate:
+        if len(candidate) < len(next_num) and next_num[: len(candidate)] == candidate:
             anchor_num = candidate
             break
 
@@ -522,7 +512,7 @@ def is_valid_heading(topic: str) -> bool:
     if _PURE_DIGIT_RE.match(topic):
         return False
 
-    if len(topic) == 1 and re.match(r'[\u4e00-\u9fffA-Za-z0-9]', topic):
+    if len(topic) == 1 and re.match(r"[\u4e00-\u9fffA-Za-z0-9]", topic):
         return False
 
     if _SHORT_GARBAGE_TOKEN_RE.match(topic):
@@ -573,6 +563,7 @@ def is_valid_heading(topic: str) -> bool:
 
 # ── Solution C: numeric level inference ──────────────────────────────────────
 
+
 def infer_level_from_numbering(topic: str, markdown_level: int) -> int:
     """
     Infer the true heading level from numeric section numbering.
@@ -584,28 +575,29 @@ def infer_level_from_numbering(topic: str, markdown_level: int) -> int:
 
     numeric_match = _STRICT_NUMERIC_RE.match(topic)
     if numeric_match:
-        segments = numeric_match.group(1).split('.')
+        segments = numeric_match.group(1).split(".")
         depth = len([s for s in segments if s])
         return depth
 
     if re.match(
-        r'^\u7b2c[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\d]+'
-        r'[\u7ae0\u8282\u7bc7\u90e8]',
-        topic
+        r"^\u7b2c[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\d]+"
+        r"[\u7ae0\u8282\u7bc7\u90e8]",
+        topic,
     ):
         return 1
 
-    if re.match(r'^(?:Chapter|Section|Part|Appendix)\s+[\dIVXivx]+', topic, re.IGNORECASE):
+    if re.match(r"^(?:Chapter|Section|Part|Appendix)\s+[\dIVXivx]+", topic, re.IGNORECASE):
         return 1
 
     # Enhancement 4: Q-series FAQ headings
-    if re.match(r'^Q\d+\s*[：:。\s]', topic, re.IGNORECASE):
+    if re.match(r"^Q\d+\s*[：:。\s]", topic, re.IGNORECASE):
         return 2
 
     return markdown_level
 
 
 # ── Pre-processing pipeline ───────────────────────────────────────────────────
+
 
 def preprocess_markdown(text: str) -> str:
     """
@@ -615,7 +607,7 @@ def preprocess_markdown(text: str) -> str:
     Pass 2 — TOC region skipping
     Pass 3 — Split-heading merge
     """
-    lines = text.split('\n')
+    lines = text.split("\n")
 
     # ── Pass 0: Remove standalone noise lines (page numbers, watermarks,
     #    decorative dividers) that are NOT headings but pollute content ────────
@@ -624,7 +616,7 @@ def preprocess_markdown(text: str) -> str:
     for line in lines:
         stripped = line.strip()
         # Skip heading lines — they are handled by is_valid_heading later
-        if stripped.startswith('#'):
+        if stripped.startswith("#"):
             cleaned_lines.append(line)
             continue
         # Remove standalone noise
@@ -657,7 +649,7 @@ def preprocess_markdown(text: str) -> str:
     if toc_start >= 0:
         print(f"[preprocess] TOC detected at lines {toc_start}–{toc_end}")
         for i in range(toc_start, toc_end + 1):
-            m = re.match(r'^(#+)\s+(.*)', lines[i])
+            m = re.match(r"^(#+)\s+(.*)", lines[i])
             if m:
                 lines[i] = m.group(2)
 
@@ -667,13 +659,13 @@ def preprocess_markdown(text: str) -> str:
     while i < len(lines):
         line = lines[i]
         if _is_split_heading(line):
-            hash_match = re.match(r'^\s*(#+)', line)
+            hash_match = re.match(r"^\s*(#+)", line)
             if not hash_match:
                 merged.append(line)
                 i += 1
                 continue
             hashes = hash_match.group(1)
-            label  = re.sub(r'^\s*#+\s*', '', line).strip()
+            label = re.sub(r"^\s*#+\s*", "", line).strip()
 
             j = i + 1
             while j < len(lines) and not lines[j].strip():
@@ -681,7 +673,7 @@ def preprocess_markdown(text: str) -> str:
 
             if j < len(lines):
                 next_line = lines[j].strip()
-                next_text = re.sub(r'^#+\s*', '', next_line).strip()
+                next_text = re.sub(r"^#+\s*", "", next_line).strip()
                 if next_text:
                     merged.append(f"{hashes} {label}{next_text}")
                     i = j + 1
@@ -691,10 +683,11 @@ def preprocess_markdown(text: str) -> str:
         i += 1
     lines = merged
 
-    return '\n'.join(lines)
+    return "\n".join(lines)
 
 
 # ── Tree data structures ──────────────────────────────────────────────────────
+
 
 class TreeNode:
     def __init__(self, topic, level, parent=None):
@@ -737,11 +730,12 @@ class TreeNode:
             "pdf_page_no": self.pdf_page_no,
             "pdf_y_ratio": self.pdf_y_ratio,
             "content_length": len(self.full_content),
-            "children": [child.to_dict() for child in self.children]
+            "children": [child.to_dict() for child in self.children],
         }
 
 
 # ── Main parsing function ─────────────────────────────────────────────────────
+
 
 def build_hierarchy_tree(markdown_text):
     """
@@ -753,9 +747,9 @@ def build_hierarchy_tree(markdown_text):
       3. Main loop: validate headings, infer level, build tree
     """
     markdown_text = preprocess_markdown(markdown_text)
-    lines = markdown_text.split('\n')
+    lines = markdown_text.split("\n")
 
-    root  = TreeNode("Root", 0)
+    root = TreeNode("Root", 0)
     root.id = "root"
     root.source_line_start = 1
     stack = [root]
@@ -765,22 +759,21 @@ def build_hierarchy_tree(markdown_text):
     valid_header_topics = []
     heading_meta = []
     heading_pos_by_line_index = {}
-    import json
     for line_index, line in enumerate(lines):
-        m = re.match(r'^(#+)\s+(.*)', line)
+        m = re.match(r"^(#+)\s+(.*)", line)
         if not m:
             continue
-        
+
         raw_topic = m.group(2).strip()
-        anchor_match = re.search(r'<!--\s*fm_anchor:(.*?)\s*-->', raw_topic)
+        anchor_match = re.search(r"<!--\s*fm_anchor:(.*?)\s*-->", raw_topic)
         anchor_data = None
         if anchor_match:
             try:
                 anchor_data = json.loads(anchor_match.group(1))
             except Exception:
                 pass
-            raw_topic = (raw_topic[:anchor_match.start()] + raw_topic[anchor_match.end():]).strip()
-            
+            raw_topic = (raw_topic[: anchor_match.start()] + raw_topic[anchor_match.end() :]).strip()
+
         topic = _normalize_heading_topic(raw_topic)
         markdown_level = len(m.group(1))
         valid = is_valid_heading(topic)
@@ -792,35 +785,28 @@ def build_hierarchy_tree(markdown_text):
 
         heading_pos_by_line_index[line_index] = len(heading_meta)
         heading_meta.append(
-            {
-                "topic": topic,
-                "level": markdown_level,
-                "valid": valid,
-                "numeric": numeric,
-                "anchor_data": anchor_data
-            }
+            {"topic": topic, "level": markdown_level, "valid": valid, "numeric": numeric, "anchor_data": anchor_data}
         )
 
     numbered_count = sum(
-        1 for topic in valid_header_topics
+        1
+        for topic in valid_header_topics
         if re.match(
-            r'^(?:'
-            r'\d+(?:\.\d+)*\.?\s*(?=[a-zA-Z\u4e00-\u9fff\uff08\u3010\[（【])'
-            r'|\u7b2c[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\d]+[\u7ae0\u8282\u7bc7\u90e8]'
-            r'|(?:Chapter|Section|Part|Appendix)\s+[\dIVXivx]+'
-            r'|Q\d+\s*[：:。\s]'
-            r')',
-            topic, re.IGNORECASE
+            r"^(?:"
+            r"\d+(?:\.\d+)*\.?\s*(?=[a-zA-Z\u4e00-\u9fff\uff08\u3010\[（【])"
+            r"|\u7b2c[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\d]+[\u7ae0\u8282\u7bc7\u90e8]"
+            r"|(?:Chapter|Section|Part|Appendix)\s+[\dIVXivx]+"
+            r"|Q\d+\s*[：:。\s]"
+            r")",
+            topic,
+            re.IGNORECASE,
         )
     )
-    use_numbering_inference = (
-        len(valid_header_topics) > 0 and
-        (numbered_count / len(valid_header_topics)) >= 0.5
-    )
+    use_numbering_inference = len(valid_header_topics) > 0 and (numbered_count / len(valid_header_topics)) >= 0.5
 
-    total_raw   = len(raw_header_topics)
+    total_raw = len(raw_header_topics)
     total_valid = len(valid_header_topics)
-    demoted     = total_raw - total_valid
+    demoted = total_raw - total_valid
     print(
         f"[build_hierarchy_tree] Raw headings: {total_raw}, "
         f"Valid: {total_valid}, Demoted: {demoted}, "
@@ -829,14 +815,14 @@ def build_hierarchy_tree(markdown_text):
     )
 
     for line_index, line in enumerate(lines):
-        header_match = re.match(r'^(#+)\s+(.*)', line)
+        header_match = re.match(r"^(#+)\s+(.*)", line)
 
         if header_match:
             raw_topic = header_match.group(2).strip()
-            anchor_match = re.search(r'<!--\s*fm_anchor:(.*?)\s*-->', raw_topic)
+            anchor_match = re.search(r"<!--\s*fm_anchor:(.*?)\s*-->", raw_topic)
             if anchor_match:
-                raw_topic = (raw_topic[:anchor_match.start()] + raw_topic[anchor_match.end():]).strip()
-                
+                raw_topic = (raw_topic[: anchor_match.start()] + raw_topic[anchor_match.end() :]).strip()
+
             markdown_level = len(header_match.group(1))
             topic = _normalize_heading_topic(raw_topic.strip())
 
@@ -877,7 +863,11 @@ def build_hierarchy_tree(markdown_text):
                     if bbox and page_height:
                         origin = str(bbox.get("coord_origin", "BOTTOM_LEFT")).upper()
                         t_coord = float(bbox.get("t", bbox.get("top", 0)))
-                        y_ratio = (1.0 - (t_coord / float(page_height))) if origin == "BOTTOM_LEFT" else (t_coord / float(page_height))
+                        y_ratio = (
+                            (1.0 - (t_coord / float(page_height)))
+                            if origin == "BOTTOM_LEFT"
+                            else (t_coord / float(page_height))
+                        )
                         new_node.pdf_y_ratio = round(max(0.0, min(1.0, float(y_ratio))), 4)
 
             stack[-1].add_child(new_node)
@@ -886,7 +876,7 @@ def build_hierarchy_tree(markdown_text):
         else:
             line = line.strip()
             # remove anchor tag from content lines
-            anchor_match = re.search(r'<!--\s*fm_anchor:(.*?)\s*-->', line)
+            anchor_match = re.search(r"<!--\s*fm_anchor:(.*?)\s*-->", line)
             while anchor_match:
                 if not getattr(stack[-1], "pdf_page_no", None):
                     try:
@@ -897,13 +887,17 @@ def build_hierarchy_tree(markdown_text):
                         if bbox and page_height:
                             origin = str(bbox.get("coord_origin", "BOTTOM_LEFT")).upper()
                             t_coord = float(bbox.get("t", bbox.get("top", 0)))
-                            y_ratio = (1.0 - (t_coord / float(page_height))) if origin == "BOTTOM_LEFT" else (t_coord / float(page_height))
+                            y_ratio = (
+                                (1.0 - (t_coord / float(page_height)))
+                                if origin == "BOTTOM_LEFT"
+                                else (t_coord / float(page_height))
+                            )
                             stack[-1].pdf_y_ratio = round(max(0.0, min(1.0, float(y_ratio))), 4)
                     except Exception:
                         pass
-                
-                line = (line[:anchor_match.start()] + line[anchor_match.end():]).strip()
-                anchor_match = re.search(r'<!--\s*fm_anchor:(.*?)\s*-->', line)
+
+                line = (line[: anchor_match.start()] + line[anchor_match.end() :]).strip()
+                anchor_match = re.search(r"<!--\s*fm_anchor:(.*?)\s*-->", line)
 
             if line:
                 stack[-1].content_lines.append(line)
@@ -928,10 +922,7 @@ def assign_stable_node_ids(root: TreeNode, file_id: str = ""):
     def walk(parent: TreeNode, path: list):
         for sibling_index, child in enumerate(parent.children):
             new_path = path + [child.topic]
-            key = (
-                f"{file_id}|{' > '.join(new_path)}|{sibling_index}|"
-                f"{child.source_line_start}|{child.source_line_end}"
-            )
+            key = f"{file_id}|{' > '.join(new_path)}|{sibling_index}|{child.source_line_start}|{child.source_line_end}"
             digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
             child.id = f"n_{digest}"
             walk(child, new_path)
@@ -954,6 +945,7 @@ def flatten_tree_nodes(root: TreeNode) -> list:
 
 # ── Export helper ─────────────────────────────────────────────────────────────
 
+
 def tree_to_markdown(node, depth=0):
     """Recursively export the tree as Markdown."""
     lines = []
@@ -964,7 +956,7 @@ def tree_to_markdown(node, depth=0):
     if node.ai_details:
         for item in node.ai_details:
             lines.append(f"- **{item.get('topic', '')}**")
-            for det in item.get('details', []):
+            for det in item.get("details", []):
                 lines.append(f"  - {det}")
     elif node.content_lines:
         # 修复：如果没有 AI 细节（处理失败或节点不需要处理），保留原始正文

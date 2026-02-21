@@ -4,12 +4,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 def generate_anchor_index(
-    root_node,
-    source_lines: list[str],
-    pdf_index_path: str,
-    anchor_index_path: str,
-    parser_backend: str = "docling"
+    root_node, source_lines: list[str], pdf_index_path: str, anchor_index_path: str, parser_backend: str = "docling"
 ):
     """
     生成 node_id -> PDF物理位置 的映射索引 (Sidecar Index)
@@ -17,33 +14,33 @@ def generate_anchor_index(
     这里保留 source_lines 和 pdf_index_path 的入参只是为了兼容现有签名的调用。
     """
     mappings = {}
-    
+
     def process_node(node):
         node_id = getattr(node, "id", None)
         pdf_page_no = getattr(node, "pdf_page_no", None)
         pdf_y_ratio = getattr(node, "pdf_y_ratio", None)
-        
+
         if node_id and pdf_page_no is not None:
             mappings[node_id] = {
                 "pdf_page_no": max(1, int(pdf_page_no)),
-                "pdf_y_ratio": float(pdf_y_ratio) if pdf_y_ratio is not None else None
+                "pdf_y_ratio": float(pdf_y_ratio) if pdf_y_ratio is not None else None,
             }
-            
+
         if hasattr(node, "children"):
             for child in getattr(node, "children", []):
                 process_node(child)
-                
+
     process_node(root_node)
-    
+
     has_precise_anchor = len(mappings) > 0
-    
+
     sidecar_data = {
         "version": "1.0",
         "parser_backend": parser_backend,
         "has_precise_anchor": has_precise_anchor,
-        "mappings": mappings
+        "mappings": mappings,
     }
-    
+
     temp_path = f"{anchor_index_path}.tmp"
     try:
         os.makedirs(os.path.dirname(os.path.abspath(anchor_index_path)), exist_ok=True)

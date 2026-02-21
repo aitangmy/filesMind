@@ -114,3 +114,9 @@ Thumbs.db
 *.swo
 *~
 .cache/
+
+# testing caches
+.coverage
+.npm-cache/
+test-results/
+playwright-report/

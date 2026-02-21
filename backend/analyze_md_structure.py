@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """分析Markdown文件结构完整性"""
+
 import re
-import os
 
 md_file = r"F:\workspace\filesMind\test_output\test_architecture.md"
 
-with open(md_file, 'r', encoding='utf-8') as f:
+with open(md_file, "r", encoding="utf-8") as f:
     content = f.read()
 
-lines = content.split('\n')
+lines = content.split("\n")
 
 # 统计各类标题数量
 h1_count = 0
@@ -26,14 +26,14 @@ header_lines = []
 
 for line in lines:
     stripped = line.strip()
-    
+
     # 统计标题
-    h_match = re.match(r'^(#{1,6})\s+(.*)', stripped)
+    h_match = re.match(r"^(#{1,6})\s+(.*)", stripped)
     if h_match:
         level = len(h_match.group(1))
         title = h_match.group(2)[:50]  # 取前50字符
         header_lines.append((level, title))
-        
+
         if level == 1:
             h1_count += 1
         elif level == 2:
@@ -47,17 +47,17 @@ for line in lines:
         elif level == 6:
             h6_count += 1
         total_headers += 1
-    
+
     # 统计列表项
-    if stripped.startswith(('-', '*', '+')):
+    if stripped.startswith(("-", "*", "+")):
         list_items += 1
-    
+
     # 统计表格
-    if stripped.startswith('|'):
+    if stripped.startswith("|"):
         tables += 1
-    
+
     # 统计图片
-    if '<!-- image -->' in stripped or '![' in stripped:
+    if "<!-- image -->" in stripped or "![" in stripped:
         images += 1
 
 print("=" * 60)
@@ -65,7 +65,7 @@ print("Markdown结构分析报告")
 print("=" * 60)
 print(f"\n总行数: {len(lines)}")
 print(f"总标题数: {total_headers}")
-print(f"\n标题层级分布:")
+print("\n标题层级分布:")
 print(f"  H1 (#):    {h1_count}")
 print(f"  H2 (##):   {h2_count}")
 print(f"  H3 (###):  {h3_count}")
@@ -85,7 +85,7 @@ prev_level = 0
 jump_issues = []
 for i, (level, title) in enumerate(header_lines):
     if prev_level > 0 and level > prev_level + 1:
-        jump_issues.append(f"行{i+1}: {prev_level} -> {level}: {title[:30]}")
+        jump_issues.append(f"行{i + 1}: {prev_level} -> {level}: {title[:30]}")
     prev_level = level
 
 if jump_issues:

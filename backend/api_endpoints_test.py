@@ -10,6 +10,10 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 
+_STUBBED_MODULES = ("parser_service", "cognitive_engine", "hardware_utils")
+_ORIGINAL_MODULES = {name: sys.modules.get(name) for name in _STUBBED_MODULES}
+
+
 def _install_test_stubs():
     """Install lightweight stubs so app import does not require heavy runtime deps."""
     parser_service = types.ModuleType("parser_service")
@@ -21,6 +25,7 @@ def _install_test_stubs():
         "hybrid_switch_min_delta": 2.0,
         "hybrid_marker_min_length": 200,
         "marker_prefer_api": False,
+        "task_timeout_seconds": 600,
     }
     parser_service.update_parser_runtime_config = lambda *args, **kwargs: None
     sys.modules["parser_service"] = parser_service
@@ -35,6 +40,7 @@ def _install_test_stubs():
         return {"success": True, "message": "ok"}
 
     cognitive_engine.test_connection = _test_connection
+
     async def _fetch_models_detailed(*args, **kwargs):
         return {"success": True, "models": ["dummy-model"], "error": ""}
 
@@ -46,9 +52,19 @@ def _install_test_stubs():
     sys.modules["hardware_utils"] = hardware_utils
 
 
+def _restore_original_modules():
+    for name, module in _ORIGINAL_MODULES.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
+
 _install_test_stubs()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import app as app_module  # noqa: E402
+
+_restore_original_modules()
 
 
 def _swallow_background_task(coro):
@@ -72,6 +88,8 @@ class FastAPIEndpointTests(unittest.TestCase):
         app_module.PDF_DIR = str(self.base / "data" / "pdfs")
         app_module.MD_DIR = str(self.base / "data" / "mds")
         app_module.IMAGES_DIR = str(self.base / "data" / "images")
+        app_module.SOURCE_MD_DIR = str(self.base / "data" / "source_mds")
+        app_module.SOURCE_INDEX_DIR = str(self.base / "data" / "source_indexes")
         app_module.HISTORY_FILE = str(self.base / "data" / "history.json")
         app_module.CONFIG_FILE = str(self.base / "data" / "config.json")
         app_module.CONFIG_KEY_FILE = str(self.base / "data" / "config.key")
@@ -79,6 +97,8 @@ class FastAPIEndpointTests(unittest.TestCase):
         os.makedirs(app_module.PDF_DIR, exist_ok=True)
         os.makedirs(app_module.MD_DIR, exist_ok=True)
         os.makedirs(app_module.IMAGES_DIR, exist_ok=True)
+        os.makedirs(app_module.SOURCE_MD_DIR, exist_ok=True)
+        os.makedirs(app_module.SOURCE_INDEX_DIR, exist_ok=True)
         os.makedirs(os.path.dirname(app_module.HISTORY_FILE), exist_ok=True)
         with open(app_module.HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump([], f)
@@ -204,31 +224,340 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertEqual(app_module.load_history(), [])
         self.assertNotIn(task_id, app_module.tasks)
 
-    def test_export_xmind_by_file_id_passes_images_dir(self):
-        file_id = "file-export"
+    def test_get_file_tree_uses_source_index(self):
+        file_id = "file-tree"
         md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
-        md_path.write_text("# title\n- item", encoding="utf-8")
+        md_path.write_text("# title\n## a\nx", encoding="utf-8")
+        source_md = Path(app_module.SOURCE_MD_DIR) / f"{file_id}.md"
+        source_md.write_text("# title\n## a\nx", encoding="utf-8")
+        index_path = Path(app_module.SOURCE_INDEX_DIR) / f"{file_id}.json"
+        index_payload = {
+            "file_id": file_id,
+            "source_md_path": str(source_md),
+            "tree": {
+                "node_id": "root",
+                "topic": "Root",
+                "level": 0,
+                "source_line_start": 1,
+                "source_line_end": 3,
+                "children": [
+                    {
+                        "node_id": "n_1",
+                        "topic": "title",
+                        "level": 1,
+                        "source_line_start": 1,
+                        "source_line_end": 3,
+                        "children": [],
+                    }
+                ],
+            },
+            "flat_nodes": [
+                {
+                    "node_id": "n_1",
+                    "topic": "title",
+                    "level": 1,
+                    "source_line_start": 1,
+                    "source_line_end": 3,
+                }
+            ],
+            "node_index": {
+                "n_1": {
+                    "node_id": "n_1",
+                    "topic": "title",
+                    "level": 1,
+                    "source_line_start": 1,
+                    "source_line_end": 3,
+                }
+            },
+        }
+        index_path.write_text(json.dumps(index_payload, ensure_ascii=False), encoding="utf-8")
 
         app_module.add_file_record(
             file_id=file_id,
-            filename="paper.pdf",
-            file_hash="hash-export",
-            pdf_path=str(Path(app_module.PDF_DIR) / "paper.pdf"),
+            filename="tree.pdf",
+            file_hash="hash-tree",
+            pdf_path=str(Path(app_module.PDF_DIR) / "tree.pdf"),
             md_path=str(md_path),
             status="completed",
-            task_id="task-export",
+            task_id="task-tree",
         )
 
-        expected_images_dir = os.path.join(app_module.IMAGES_DIR, file_id)
-        with patch.object(app_module, "generate_xmind_content", return_value=b"XMIND") as mock_gen:
-            with TestClient(app_module.app) as client:
-                res = client.get(f"/export/xmind/{file_id}")
-
+        with TestClient(app_module.app) as client:
+            res = client.get(f"/file/{file_id}/tree")
         self.assertEqual(res.status_code, 200)
-        self.assertEqual(res.content, b"XMIND")
-        self.assertIn("attachment; filename=paper.xmind", res.headers.get("content-disposition", ""))
-        mock_gen.assert_called_once()
-        self.assertEqual(mock_gen.call_args.kwargs.get("images_dir"), expected_images_dir)
+        data = res.json()
+        self.assertEqual(data["file_id"], file_id)
+        self.assertEqual(data["flat_nodes"][0]["node_id"], "n_1")
+
+    def test_get_node_source_returns_excerpt(self):
+        file_id = "file-source"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        source_md = Path(app_module.SOURCE_MD_DIR) / f"{file_id}.md"
+        content = "\n".join(
+            [
+                "# Root",
+                "## Section A",
+                "Line A1",
+                "Line A2",
+                "## Section B",
+                "Line B1",
+            ]
+        )
+        md_path.write_text(content, encoding="utf-8")
+        source_md.write_text(content, encoding="utf-8")
+        index_path = Path(app_module.SOURCE_INDEX_DIR) / f"{file_id}.json"
+        index_payload = {
+            "file_id": file_id,
+            "source_md_path": str(source_md),
+            "tree": {},
+            "flat_nodes": [],
+            "capabilities": {"anchor_version": "1.0", "parser_backend": "docling", "has_precise_anchor": True},
+            "node_index": {
+                "n_section_a": {
+                    "node_id": "n_section_a",
+                    "topic": "Section A",
+                    "level": 2,
+                    "source_line_start": 2,
+                    "source_line_end": 4,
+                    "pdf_page_no": 3,
+                    "pdf_y_ratio": 0.1,
+                }
+            },
+        }
+        index_path.write_text(json.dumps(index_payload, ensure_ascii=False), encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="source.pdf",
+            file_hash="hash-source",
+            pdf_path=str(Path(app_module.PDF_DIR) / "source.pdf"),
+            md_path=str(md_path),
+            status="completed",
+            task_id="task-source",
+        )
+
+        with TestClient(app_module.app) as client:
+            res = client.get(f"/file/{file_id}/node/n_section_a/source?context_lines=1&max_lines=10")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["line_start"], 2)
+        self.assertEqual(data["line_end"], 4)
+        self.assertGreaterEqual(len(data["excerpt_lines"]), 3)
+        in_range = [line for line in data["excerpt_lines"] if line["in_range"]]
+        self.assertTrue(any("Section A" in line["text"] for line in in_range))
+        self.assertEqual(data["pdf_page_no"], 3)
+        self.assertAlmostEqual(data["pdf_y_ratio"], 0.1, places=2)
+
+    def test_get_pdf_file_uses_inline_disposition(self):
+        file_id = "file-inline"
+        pdf_path = Path(app_module.PDF_DIR) / "inline.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n")
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        md_path.write_text("# doc", encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="inline.pdf",
+            file_hash="hash-inline",
+            pdf_path=str(pdf_path),
+            md_path=str(md_path),
+            status="completed",
+            task_id="task-inline",
+        )
+
+        with TestClient(app_module.app) as client:
+            res = client.get(f"/file/{file_id}/pdf")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("inline;", res.headers.get("content-disposition", ""))
+
+    def test_get_file_tree_rebuilds_missing_index_from_markdown_headings(self):
+        file_id = "file-rebuild"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        md_path.write_text("# Root\n## A\n### A.1\n## B\nBody", encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="rebuild.pdf",
+            file_hash="hash-rebuild",
+            pdf_path=str(Path(app_module.PDF_DIR) / "rebuild.pdf"),
+            md_path=str(md_path),
+            status="completed",
+            task_id="task-rebuild",
+        )
+
+        with TestClient(app_module.app) as client:
+            res = client.get(f"/file/{file_id}/tree")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        flat = data.get("flat_nodes", [])
+        self.assertEqual(len(flat), 5)
+        self.assertEqual([item["topic"] for item in flat], ["Root", "Root", "A", "A.1", "B"])
+
+    def test_get_file_tree_rebuilds_missing_index_from_markdown_lists(self):
+        file_id = "file-rebuild-list"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        md_path.write_text("# Doc\n\n- **Section A**\n  - Point A1\n- Section B", encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="rebuild-list.pdf",
+            file_hash="hash-rebuild-list",
+            pdf_path=str(Path(app_module.PDF_DIR) / "rebuild-list.pdf"),
+            md_path=str(md_path),
+            status="completed",
+            task_id="task-rebuild-list",
+        )
+
+        with TestClient(app_module.app) as client:
+            res = client.get(f"/file/{file_id}/tree")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        flat = data.get("flat_nodes", [])
+        topics = [item["topic"] for item in flat]
+        self.assertIn("Section A", topics)
+        self.assertIn("Point A1", topics)
+        self.assertIn("Section B", topics)
+        self.assertGreaterEqual(len(flat), 5)
+
+    def test_get_file_tree_rebuilds_low_quality_existing_index(self):
+        file_id = "file-rebuild-low-quality"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        md_path.write_text("# Doc\n\n- **Section A**\n  - Point A1\n- Section B", encoding="utf-8")
+        index_path = Path(app_module.SOURCE_INDEX_DIR) / f"{file_id}.json"
+        shallow_index = {
+            "file_id": file_id,
+            "source_md_path": str(md_path),
+            "tree": {
+                "node_id": "root",
+                "topic": "Root",
+                "level": 0,
+                "source_line_start": 1,
+                "source_line_end": 1,
+                "children": [],
+            },
+            "flat_nodes": [
+                {
+                    "node_id": "root",
+                    "topic": "Root",
+                    "level": 0,
+                    "source_line_start": 1,
+                    "source_line_end": 1,
+                }
+            ],
+            "node_index": {
+                "root": {
+                    "node_id": "root",
+                    "topic": "Root",
+                    "level": 0,
+                    "source_line_start": 1,
+                    "source_line_end": 1,
+                }
+            },
+            "index_mode": "legacy_shallow",
+        }
+        index_path.write_text(json.dumps(shallow_index, ensure_ascii=False), encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="rebuild-low-quality.pdf",
+            file_hash="hash-rebuild-low-quality",
+            pdf_path=str(Path(app_module.PDF_DIR) / "rebuild-low-quality.pdf"),
+            md_path=str(md_path),
+            status="completed",
+            task_id="task-rebuild-low-quality",
+        )
+
+        with TestClient(app_module.app) as client:
+            res = client.get(f"/file/{file_id}/tree")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        flat = data.get("flat_nodes", [])
+        self.assertGreaterEqual(len(flat), 5)
+        self.assertIn("Section A", [item["topic"] for item in flat])
+
+        rebuilt_index = json.loads(index_path.read_text(encoding="utf-8"))
+        self.assertEqual(rebuilt_index.get("index_mode"), "markdown_outline_v2")
+
+    def test_admin_source_index_rebuild_endpoint_supports_dry_run_and_apply(self):
+        file_id = "file-admin-rebuild"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        md_path.write_text("# Doc\n\n- Section A\n  - Point A1\n- Section B", encoding="utf-8")
+        index_path = Path(app_module.SOURCE_INDEX_DIR) / f"{file_id}.json"
+        index_path.write_text(
+            json.dumps(
+                {
+                    "file_id": file_id,
+                    "source_md_path": str(md_path),
+                    "tree": {
+                        "node_id": "root",
+                        "topic": "Root",
+                        "level": 0,
+                        "source_line_start": 1,
+                        "source_line_end": 1,
+                        "children": [],
+                    },
+                    "flat_nodes": [
+                        {
+                            "node_id": "root",
+                            "topic": "Root",
+                            "level": 0,
+                            "source_line_start": 1,
+                            "source_line_end": 1,
+                        }
+                    ],
+                    "node_index": {
+                        "root": {
+                            "node_id": "root",
+                            "topic": "Root",
+                            "level": 0,
+                            "source_line_start": 1,
+                            "source_line_end": 1,
+                        }
+                    },
+                    "index_mode": "legacy_shallow",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="admin-rebuild.pdf",
+            file_hash="hash-admin-rebuild",
+            pdf_path=str(Path(app_module.PDF_DIR) / "admin-rebuild.pdf"),
+            md_path=str(md_path),
+            status="completed",
+            task_id="task-admin-rebuild",
+        )
+
+        with TestClient(app_module.app) as client:
+            dry_res = client.post(
+                "/admin/source-index/rebuild",
+                json={"dry_run": True, "file_ids": [file_id]},
+            )
+            self.assertEqual(dry_res.status_code, 200)
+            dry_data = dry_res.json()
+            self.assertTrue(dry_data.get("success"))
+            self.assertEqual(dry_data.get("summary", {}).get("rebuilt"), 1)
+            self.assertEqual(dry_data.get("items", [])[0].get("action"), "would_rebuild")
+
+            unchanged = json.loads(index_path.read_text(encoding="utf-8"))
+            self.assertEqual(unchanged.get("index_mode"), "legacy_shallow")
+
+            apply_res = client.post(
+                "/admin/source-index/rebuild",
+                json={"dry_run": False, "file_ids": [file_id]},
+            )
+            self.assertEqual(apply_res.status_code, 200)
+            apply_data = apply_res.json()
+            self.assertTrue(apply_data.get("success"))
+            self.assertEqual(apply_data.get("summary", {}).get("rebuilt"), 1)
+            self.assertEqual(apply_data.get("items", [])[0].get("action"), "rebuilt")
+
+        rebuilt = json.loads(index_path.read_text(encoding="utf-8"))
+        self.assertEqual(rebuilt.get("index_mode"), "markdown_outline_v2")
+        self.assertGreaterEqual(len(rebuilt.get("flat_nodes", [])), 4)
 
     def test_config_save_encrypts_api_key_and_get_masks(self):
         payload = {
@@ -264,6 +593,11 @@ class FastAPIEndpointTests(unittest.TestCase):
     def test_config_export_and_import_roundtrip_without_plaintext_key(self):
         initial_payload = {
             "active_profile_id": "p1",
+            "advanced": {
+                "engine_concurrency": 4,
+                "engine_temperature": 0.45,
+                "engine_max_tokens": 9000,
+            },
             "profiles": [
                 {
                     "id": "p1",
@@ -287,9 +621,13 @@ class FastAPIEndpointTests(unittest.TestCase):
             exported = export_res.json()
             self.assertEqual(exported["profiles"][0]["api_key"], "")
             self.assertTrue(exported["profiles"][0]["has_api_key"])
+            self.assertEqual(exported["advanced"]["engine_concurrency"], 4)
+            self.assertAlmostEqual(exported["advanced"]["engine_temperature"], 0.45, places=2)
+            self.assertEqual(exported["advanced"]["engine_max_tokens"], 9000)
 
             imported_payload = {
                 "active_profile_id": "p1",
+                "advanced": exported.get("advanced"),
                 "profiles": [
                     {
                         "id": "p1",
@@ -313,6 +651,9 @@ class FastAPIEndpointTests(unittest.TestCase):
             view = get_res.json()
             self.assertEqual(view["profiles"][0]["api_key"], "***")
             self.assertTrue(view["profiles"][0]["has_api_key"])
+            self.assertEqual(view["advanced"]["engine_concurrency"], 4)
+            self.assertAlmostEqual(view["advanced"]["engine_temperature"], 0.45, places=2)
+            self.assertEqual(view["advanced"]["engine_max_tokens"], 9000)
 
     def test_config_roundtrip_includes_parser_settings(self):
         payload = {
@@ -324,6 +665,12 @@ class FastAPIEndpointTests(unittest.TestCase):
                 "hybrid_switch_min_delta": 3,
                 "hybrid_marker_min_length": 300,
                 "marker_prefer_api": True,
+                "task_timeout_seconds": 1200,
+            },
+            "advanced": {
+                "engine_concurrency": 7,
+                "engine_temperature": 0.7,
+                "engine_max_tokens": 12000,
             },
             "profiles": [
                 {
@@ -349,6 +696,78 @@ class FastAPIEndpointTests(unittest.TestCase):
             self.assertEqual(parser.get("parser_backend"), "hybrid")
             self.assertEqual(parser.get("hybrid_marker_min_length"), 300)
             self.assertTrue(parser.get("marker_prefer_api"))
+            self.assertEqual(parser.get("task_timeout_seconds"), 1200)
+            advanced = get_res.json().get("advanced", {})
+            self.assertEqual(advanced.get("engine_concurrency"), 7)
+            self.assertAlmostEqual(advanced.get("engine_temperature"), 0.7, places=2)
+            self.assertEqual(advanced.get("engine_max_tokens"), 12000)
+
+    def test_config_rejects_non_integer_task_timeout(self):
+        payload = {
+            "active_profile_id": "p1",
+            "parser": {
+                "parser_backend": "docling",
+                "hybrid_noise_threshold": 0.2,
+                "hybrid_docling_skip_score": 70,
+                "hybrid_switch_min_delta": 2,
+                "hybrid_marker_min_length": 200,
+                "marker_prefer_api": False,
+                "task_timeout_seconds": 61.5,
+            },
+            "advanced": {
+                "engine_concurrency": 5,
+                "engine_temperature": 0.3,
+                "engine_max_tokens": 8192,
+            },
+            "profiles": [
+                {
+                    "id": "p1",
+                    "name": "default",
+                    "provider": "deepseek",
+                    "base_url": "https://api.deepseek.com",
+                    "model": "deepseek-chat",
+                    "api_key": "sk-test-999",
+                    "account_type": "free",
+                    "manual_models": ["deepseek-chat"],
+                }
+            ],
+        }
+
+        with TestClient(app_module.app) as client:
+            save_res = client.post("/config", json=payload)
+            self.assertEqual(save_res.status_code, 422)
+            detail = save_res.json().get("detail", {})
+            self.assertEqual(detail.get("code"), "INVALID_TASK_TIMEOUT_SECONDS")
+
+    def test_cancel_task_endpoint_marks_task_as_cancelling(self):
+        task = app_module.create_task("task-cancel", file_id="file-1")
+        task.status = app_module.TaskStatus.PROCESSING
+        task.progress = 55
+        task.message = "processing"
+
+        class _Worker:
+            def __init__(self):
+                self.cancelled = False
+
+            def done(self):
+                return False
+
+            def cancel(self):
+                self.cancelled = True
+
+        worker = _Worker()
+        task.worker = worker
+
+        with TestClient(app_module.app) as client:
+            res = client.post("/task/task-cancel/cancel", json={"reason": "test-cancel"})
+
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertTrue(data.get("success"))
+        self.assertEqual(data.get("status"), "cancelling")
+        self.assertTrue(task.cancel_requested)
+        self.assertEqual(task.cancel_reason, "test-cancel")
+        self.assertTrue(worker.cancelled)
 
 
 if __name__ == "__main__":

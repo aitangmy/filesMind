@@ -20,9 +20,7 @@ class StructureUtilsTests(unittest.TestCase):
         self.assertFalse(su.is_valid_heading("A7*"))
         self.assertFalse(su.is_valid_heading("it (InitialNode)"))
         self.assertFalse(su.is_valid_heading("2212"))
-        self.assertFalse(
-            su.is_valid_heading("的考点，重点，会不会就一个题库里这些老题反复考？显然不会。当然你会说，")
-        )
+        self.assertFalse(su.is_valid_heading("的考点，重点，会不会就一个题库里这些老题反复考？显然不会。当然你会说，"))
         self.assertTrue(su.is_valid_heading("前言"))
         self.assertEqual(su._normalize_heading_topic("7174811.2. 内存管理"), "11.2. 内存管理")
 
@@ -94,15 +92,17 @@ class StructureUtilsTests(unittest.TestCase):
         self.assertTrue(su.is_valid_heading("Chapter 3 Results"))
 
     def test_preprocess_removes_standalone_noise(self):
-        md = "\n".join([
-            "## 正文标题",
-            "一些内容",
-            "- 3 -",
-            "CONFIDENTIAL",
-            "---",
-            "更多内容",
-            "## 第二章",
-        ])
+        md = "\n".join(
+            [
+                "## 正文标题",
+                "一些内容",
+                "- 3 -",
+                "CONFIDENTIAL",
+                "---",
+                "更多内容",
+                "## 第二章",
+            ]
+        )
         result = su.preprocess_markdown(md)
         self.assertNotIn("- 3 -", result)
         self.assertNotIn("CONFIDENTIAL", result)
@@ -111,30 +111,34 @@ class StructureUtilsTests(unittest.TestCase):
         self.assertIn("更多内容", result)
 
     def test_preprocess_removes_repeated_decorative_lines(self):
-        md = "\n".join([
-            "## 正文标题",
-            "内容1",
-            "仅供参考",
-            "内容2",
-            "仅供参考",
-            "内容3",
-            "仅供参考",
-            "## 第二章",
-        ])
+        md = "\n".join(
+            [
+                "## 正文标题",
+                "内容1",
+                "仅供参考",
+                "内容2",
+                "仅供参考",
+                "内容3",
+                "仅供参考",
+                "## 第二章",
+            ]
+        )
         result = su.preprocess_markdown(md)
         self.assertNotIn("仅供参考", result)
         self.assertIn("正文标题", result)
         self.assertIn("第二章", result)
 
     def test_preprocess_removes_table_separator_lines(self):
-        md = "\n".join([
-            "## 表格章节",
-            "| 阶段 | 说明 |",
-            "|------|------|",
-            "| 需求分析阶段 | 明确目标 |",
-            "|------|------|",
-            "| 设计阶段 | 模块划分 |",
-        ])
+        md = "\n".join(
+            [
+                "## 表格章节",
+                "| 阶段 | 说明 |",
+                "|------|------|",
+                "| 需求分析阶段 | 明确目标 |",
+                "|------|------|",
+                "| 设计阶段 | 模块划分 |",
+            ]
+        )
         result = su.preprocess_markdown(md)
 
         self.assertIn("| 阶段 | 说明 |", result)
@@ -143,19 +147,84 @@ class StructureUtilsTests(unittest.TestCase):
         self.assertNotIn("|------|------|", result)
 
     def test_preprocess_removes_pure_dash_line_in_table_context(self):
-        md = "\n".join([
-            "## 表格章节",
-            "| 字段 | 含义 |",
-            "--------",
-            "| A | Alpha |",
-            "普通文本中的 ---- 不应被误删",
-        ])
+        md = "\n".join(
+            [
+                "## 表格章节",
+                "| 字段 | 含义 |",
+                "--------",
+                "| A | Alpha |",
+                "普通文本中的 ---- 不应被误删",
+            ]
+        )
         result = su.preprocess_markdown(md)
 
         self.assertIn("| 字段 | 含义 |", result)
         self.assertIn("| A | Alpha |", result)
         self.assertNotIn("\n--------\n", f"\n{result}\n")
         self.assertIn("普通文本中的 ---- 不应被误删", result)
+
+    def test_bridge_noise_headings_are_demoted_between_related_numeric_headings(self):
+        md = "\n".join(
+            [
+                "## 11.2. 内存管理",
+                "### 11.2.1. 内存映射",
+                "#### 11.2.1.2. 段式管理",
+                "## 段号 + 段内地址。",
+                "#### 11.2.2. 虚拟内存",
+                "## 12.6. 数据库的控制功能",
+                "## 幻读 （读插 入）",
+                "#### 12.6.4. 封锁技术",
+                "## 13.3. 认证技术",
+                "## 分类 具体内容",
+                "#### 13.3.1. 数字签名",
+            ]
+        )
+
+        tree = su.build_hierarchy_tree(md)
+        topics = _flatten_topics(tree)
+
+        self.assertIn("11.2. 内存管理", topics)
+        self.assertIn("11.2.2. 虚拟内存", topics)
+        self.assertIn("12.6. 数据库的控制功能", topics)
+        self.assertIn("12.6.4. 封锁技术", topics)
+        self.assertIn("13.3. 认证技术", topics)
+        self.assertIn("13.3.1. 数字签名", topics)
+
+        self.assertNotIn("段号 + 段内地址。", topics)
+        self.assertNotIn("幻读（读插入）", topics)
+        self.assertNotIn("幻读 （读插 入）", topics)
+        self.assertNotIn("分类 具体内容", topics)
+
+    def test_cross_chapter_weak_bridge_heading_is_demoted(self):
+        md = "\n".join(
+            [
+                "### 12.11. 数据分片",
+                "## 分片类型 定义与条件",
+                "## 13. 信息安全",
+                "### 13.1. 信息系统安全体系",
+            ]
+        )
+
+        tree = su.build_hierarchy_tree(md)
+        topics = _flatten_topics(tree)
+
+        self.assertIn("12.11. 数据分片", topics)
+        self.assertIn("13. 信息安全", topics)
+        self.assertIn("13.1. 信息系统安全体系", topics)
+        self.assertNotIn("分片类型 定义与条件", topics)
+
+    def test_valid_unstructured_heading_between_numeric_headings_is_kept(self):
+        md = "\n".join(
+            [
+                "## 12.6. 数据库的控制功能",
+                "### 锁兼容矩阵",
+                "### 12.6.4. 封锁技术",
+            ]
+        )
+
+        tree = su.build_hierarchy_tree(md)
+        topics = _flatten_topics(tree)
+        self.assertIn("锁兼容矩阵", topics)
 
 
 if __name__ == "__main__":

@@ -2,11 +2,12 @@
 认知引擎 - DeepSeek AI 处理模块
 优化版：适配付费 API + 正确的 temperature + 修复信号量泄漏 + 支持动态配置
 """
+
 import asyncio
-import os
 import re
 import atexit
 import json
+
 try:
     from openai import AsyncOpenAI
 except ImportError:
@@ -15,15 +16,12 @@ except ImportError:
         def __init__(self, api_key=None, base_url=None):
             pass
 
+
 # DeepSeek API 配置 - 使用全局客户端，支持动态更新
 _client = None
 
 # Advanced limits configuration
-_engine_settings = {
-    "concurrency": 5,
-    "temperature": 0.3,
-    "max_tokens": 8192
-}
+_engine_settings = {"concurrency": 5, "temperature": 0.3, "max_tokens": 8192}
 
 ENGINE_LIMITS = {
     "concurrency": {"min": 1, "max": 10, "default": 5},
@@ -31,16 +29,15 @@ ENGINE_LIMITS = {
     "max_tokens": {"min": 1000, "max": 16000, "default": 8192},
 }
 
+
 def get_client():
     """获取或创建全局客户端"""
     global _client
     if _client is None:
         # 默认使用空配置，等待 update_client_config 注入
-        _client = AsyncOpenAI(
-            api_key="",
-            base_url="https://api.deepseek.com"
-        )
+        _client = AsyncOpenAI(api_key="", base_url="https://api.deepseek.com")
     return _client
+
 
 def update_client_config(config: dict):
     """
@@ -51,7 +48,7 @@ def update_client_config(config: dict):
     api_key = config.get("api_key", "")
     model = config.get("model", "MiniMax-M2.5")
     advanced = config.get("advanced", {})
-    
+
     global _engine_settings
     if advanced:
         _engine_settings["concurrency"] = _clamp_int(
@@ -73,7 +70,7 @@ def update_client_config(config: dict):
             ENGINE_LIMITS["max_tokens"]["max"],
         )
         _reset_engine_runtime_limiter()
-    
+
     # 1. Base URL 规范化 (自动补全 /v1)
     if not base_url.endswith("/v1"):
         base_url = f"{base_url.rstrip('/')}/v1"
@@ -81,17 +78,14 @@ def update_client_config(config: dict):
     if not api_key:
         # 针对 Ollama 允许空 Key
         if "ollama" in base_url.lower() or "11434" in base_url:
-             api_key = "ollama" # 占位符
+            api_key = "ollama"  # 占位符
         else:
-             raise ValueError("API Key 不能为空")
-    
+            raise ValueError("API Key 不能为空")
+
     print(f"更新配置: base_url={base_url}, model={model}")
-    
+
     # 创建新客户端
-    _client = AsyncOpenAI(
-        api_key=api_key,
-        base_url=base_url
-    )
+    _client = AsyncOpenAI(api_key=api_key, base_url=base_url)
     # 更新模型
     set_model(model)
     print(f"Client updated: base_url={base_url}, model={model}")
@@ -118,6 +112,7 @@ def _reset_engine_runtime_limiter():
     _semaphore = None
     _rate_limiter = None
 
+
 async def fetch_models_detailed(base_url: str, api_key: str = "") -> dict:
     """从 API 获取模型列表，返回结构化结果"""
     try:
@@ -132,7 +127,7 @@ async def fetch_models_detailed(base_url: str, api_key: str = "") -> dict:
         temp_client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
-            timeout=5.0  # 短超时防止卡死
+            timeout=5.0,  # 短超时防止卡死
         )
 
         response = await temp_client.models.list()
@@ -148,6 +143,7 @@ async def fetch_models(base_url: str, api_key: str = "") -> list:
     result = await fetch_models_detailed(base_url, api_key)
     return result.get("models", [])
 
+
 async def test_connection(config: dict) -> dict:
     """
     测试配置是否可用 - 增强版
@@ -155,54 +151,47 @@ async def test_connection(config: dict) -> dict:
     base_url = config.get("base_url", "https://api.minimaxi.com/v1")
     api_key = config.get("api_key", "")
     model = config.get("model", "MiniMax-M2.5")
-    
+
     # 1. Base URL 规范化
     if not base_url.endswith("/v1"):
         base_url = f"{base_url.rstrip('/')}/v1"
-    
+
     # 针对 Ollama 允许空 Key
     if not api_key:
         if "ollama" in base_url.lower() or "11434" in base_url:
-             api_key = "ollama"
+            api_key = "ollama"
         else:
-             return {"success": False, "message": "API Key 不能为空"}
-    
+            return {"success": False, "message": "API Key 不能为空"}
+
     print(f"测试连接: base_url={base_url}, model={model}")
-    
+
     # 创建临时客户端测试
-    test_client = AsyncOpenAI(
-        api_key=api_key,
-        base_url=base_url
-    )
-    
+    test_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
     try:
         # 发送一个简单的测试请求
         response = await test_client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "Reply with exactly: 'OK'"}
+                {"role": "user", "content": "Reply with exactly: 'OK'"},
             ],
             max_tokens=10,
-            timeout=30  # 30秒超时
+            timeout=30,  # 30秒超时
         )
-        
+
         # 验证响应有效
         if response and response.choices and len(response.choices) > 0:
             content = response.choices[0].message.content
             print(f"测试响应: {content}")
-            return {
-                "success": True, 
-                "message": f"连接成功！模型响应: {content[:50]}...", 
-                "model": model
-            }
+            return {"success": True, "message": f"连接成功！模型响应: {content[:50]}...", "model": model}
         else:
             return {"success": False, "message": "API 响应格式异常"}
-            
+
     except Exception as e:
         error_msg = str(e)
         print(f"测试连接失败: {error_msg}")
-        
+
         # 提供更友好的错误信息
         if "401" in error_msg or "authentication" in error_msg.lower():
             return {"success": False, "message": "API Key 无效或已过期，请检查"}
@@ -215,9 +204,10 @@ async def test_connection(config: dict) -> dict:
         elif "timeout" in error_msg.lower():
             return {"success": False, "message": "请求超时，请检查网络"}
         elif "econnrefused" in error_msg.lower() or "connection refused" in error_msg.lower():
-             return {"success": False, "message": "连接被拒绝，请检查 Ollama 是否已启动 (ollama serve)"}
+            return {"success": False, "message": "连接被拒绝，请检查 Ollama 是否已启动 (ollama serve)"}
         else:
             return {"success": False, "message": f"连接失败: {error_msg[:100]}"}
+
 
 # 保留向后兼容的 client 引用
 client = property(lambda self: get_client())
@@ -225,32 +215,28 @@ client = property(lambda self: get_client())
 # 全局模型配置
 _current_model = "deepseek-chat"
 
+
 def set_model(model: str):
     """设置当前模型"""
     global _current_model
     _current_model = model
     _reset_engine_runtime_limiter()
 
+
 def get_model() -> str:
     """获取当前模型"""
     return _current_model
+
 
 # ==================== MiniMax 2.5 速率限制配置 ====================
 # MiniMax 2.5 文本模型速率限制 (RPM: 每分钟请求数)
 # 免费用户: 20 RPM
 # 充值用户: 500 RPM
-MINIMAX_2_5_RATE_LIMITS = {
-    "free": {"rpm": 20, "tpm": 1000000},
-    "paid": {"rpm": 500, "tpm": 20000000}
-}
+MINIMAX_2_5_RATE_LIMITS = {"free": {"rpm": 20, "tpm": 1000000}, "paid": {"rpm": 500, "tpm": 20000000}}
 
 # MiniMax 2.5 模型标识（支持多种命名）
-MINIMAX_2_5_MODELS = [
-    "MiniMax-M2.5",
-    "MiniMax-M2.5-highspeed",
-    "abab6.5s-chat",
-    "abab6.5g-chat"
-]
+MINIMAX_2_5_MODELS = ["MiniMax-M2.5", "MiniMax-M2.5-highspeed", "abab6.5s-chat", "abab6.5g-chat"]
+
 
 def is_minimax_2_5_model(model: str) -> bool:
     """检查是否为 MiniMax 2.5 系列模型"""
@@ -264,12 +250,14 @@ def is_minimax_2_5_model(model: str) -> bool:
 # 账户类型配置（默认免费用户）
 _current_account_type = "free"
 
+
 def set_account_type(account_type: str):
     """设置账户类型（free/paid）"""
     global _current_account_type
     if account_type in ["free", "paid"]:
         _current_account_type = account_type
         _reset_engine_runtime_limiter()
+
 
 def get_account_type() -> str:
     """获取当前账户类型"""
@@ -285,23 +273,25 @@ MODEL_STRATEGIES = {
         "type": "adaptive",
         "initial_concurrency": 20,
         "min_concurrency": 2,
-        "backoff_base": 2,      # 指数退避基数
-        "max_retries": 5,       # 最大重试次数
-        "base_delay": 1.0       # 初始重试延迟 (秒)
+        "backoff_base": 2,  # 指数退避基数
+        "max_retries": 5,  # 最大重试次数
+        "base_delay": 1.0,  # 初始重试延迟 (秒)
     },
     # MiniMax: 严格限流 (Strict Rate Limiting)
     "minimax": {
         "type": "static",
-        "rpm": 120,            # 默认 RPM (每分钟请求数)
-        "concurrency": 10      # 限制最大并发数，防止瞬间堆积
-    }
+        "rpm": 120,  # 默认 RPM (每分钟请求数)
+        "concurrency": 10,  # 限制最大并发数，防止瞬间堆积
+    },
 }
+
 
 class RateLimiter:
     """
     令牌桶/漏桶算法实现的简易限流器
     确保请求间隔满足 RPM 限制
     """
+
     def __init__(self, rpm):
         self.interval = 60.0 / rpm
         self.last_request_time = 0.0
@@ -313,13 +303,15 @@ class RateLimiter:
             target_time = max(now, self.last_request_time + self.interval)
             self.last_request_time = target_time
             wait_time = target_time - now
-            
+
         if wait_time > 0.001:
             await asyncio.sleep(wait_time)
+
 
 # 全局限流器和信号量
 _rate_limiter = None
 _semaphore = None
+
 
 def get_strategy(model_name: str) -> dict:
     """根据模型名称获取策略"""
@@ -329,15 +321,16 @@ def get_strategy(model_name: str) -> dict:
         # 默认为 MiniMax 策略 (涵盖 minimax, abab 等)
         return MODEL_STRATEGIES["minimax"]
 
+
 def get_rate_limiter():
     """获取或初始化限流器和信号量"""
     global _rate_limiter, _semaphore
-    
+
     if _semaphore is None:
         model = get_model()
         strategy = get_strategy(model)
-        
-        if strategy["type"] == "static": # MiniMax
+
+        if strategy["type"] == "static":  # MiniMax
             # 获取账户类型以调整 RPM
             account_type = get_account_type()
             # 免费版更严格
@@ -347,24 +340,26 @@ def get_rate_limiter():
             else:
                 rpm = strategy.get("rpm", 120)
                 concurrency = _engine_settings.get("concurrency", ENGINE_LIMITS["concurrency"]["default"])
-            
+
             _rate_limiter = RateLimiter(rpm)
             _semaphore = asyncio.Semaphore(concurrency)
             print(f"策略应用: MiniMax (Strict Limit), RPM={rpm}, Concurrency={concurrency}")
-            
-        else: # DeepSeek (Adaptive)
+
+        else:  # DeepSeek (Adaptive)
             # DeepSeek 不需要严格的 RateLimiter，只需信号量控制并发
-            _rate_limiter = None 
+            _rate_limiter = None
             concurrency = _engine_settings.get("concurrency", ENGINE_LIMITS["concurrency"]["default"])
             _semaphore = asyncio.Semaphore(concurrency)
             print(f"策略应用: DeepSeek (Adaptive), Start Concurrency={concurrency}")
-            
+
     return _semaphore, _rate_limiter
+
 
 def cleanup():
     global _semaphore, _rate_limiter
     _semaphore = None
     _rate_limiter = None
+
 
 atexit.register(cleanup)
 
@@ -429,20 +424,23 @@ SYSTEM_PROMPT = """
     - 影响：引发了变革
 """
 
-async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_info: dict = None, parent_context: str = ""):
+
+async def summarize_chunk(
+    text_chunk: str, chunk_id: int, task=None, process_info: dict = None, parent_context: str = ""
+):
     """
     处理单个文本块 (Large Chunk Optimized)
     :param parent_context: 上下文信息 (e.g., "Chapter 1 > Section 2")
     """
     # 提取章节标题（第一行）仅作为元数据
-    lines = text_chunk.strip().split('\n')
+    lines = text_chunk.strip().split("\n")
     title = lines[0] if lines else f"Section {chunk_id + 1}"
-    title = title.strip().lstrip('#').strip()
+    title = title.strip().lstrip("#").strip()
 
     # 【修复 P2-1】在 chunk 开始处理时也更新进度
     if task and process_info:
-        current = process_info['completed']
-        total = process_info['total']
+        current = process_info["completed"]
+        total = process_info["total"]
         progress = 50 + int((current / total) * 45) + 2
         task.progress = min(95, progress)
         task.message = f"AI 正在分析章节 {current + 1}/{total}..."
@@ -451,34 +449,34 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
     semaphore, rate_limiter = get_rate_limiter()
     model = get_model()
     strategy = get_strategy(model)
-    
+
     max_retries = strategy.get("max_retries", 3) if strategy["type"] == "adaptive" else 1
     base_delay = strategy.get("base_delay", 1.0)
 
-    if task and getattr(task, 'cancel_requested', False):
+    if task and getattr(task, "cancel_requested", False):
         raise asyncio.CancelledError("Task was cancelled by user")
 
     async with semaphore:
         for attempt in range(max_retries + 1):
-            if task and getattr(task, 'cancel_requested', False):
+            if task and getattr(task, "cancel_requested", False):
                 raise asyncio.CancelledError("Task was cancelled by user")
             try:
                 # 1. 严格限流 (MiniMax)
                 if rate_limiter:
                     await rate_limiter.acquire()
-                
+
                 # 2. 准备请求
                 client = get_client()
 
                 # 构建带上下文的用户提示 - 中文强化版
                 # 统计输入标题数量（用于验证）
-                input_header_count = sum(1 for line in text_chunk.split('\n') if re.match(r'^#{1,6}\s', line.strip()))
-                
+                input_header_count = sum(1 for line in text_chunk.split("\n") if re.match(r"^#{1,6}\s", line.strip()))
+
                 user_prompt = f"""
 【当前位置】：{parent_context if parent_context else "文档根节点"}
 
 【任务说明】：
-以下文本位于路径 "{parent_context if parent_context else '文档根节点'}" 下。
+以下文本位于路径 "{parent_context if parent_context else "文档根节点"}" 下。
 请严格遵守以下要求：
 1. 保留输入文本中标题的原始级别（# 的数量），不要修改标题级别
 2. 输入文本中包含 {input_header_count} 个标题，你的输出中也必须包含这 {input_header_count} 个标题（1:1 保留）
@@ -493,12 +491,9 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
                 # 3. 发送请求
                 response = await client.chat.completions.create(
                     model=model,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt}
-                    ],
+                    messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}],
                     temperature=_engine_settings.get("temperature", 0.3),
-                    max_tokens=_engine_settings.get("max_tokens", 8192)
+                    max_tokens=_engine_settings.get("max_tokens", 8192),
                 )
 
                 ai_content = response.choices[0].message.content
@@ -513,19 +508,23 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
                     result = f"## {title}\n- (未提取到内容)"
 
                 # 标题计数验证
-                output_header_count = sum(1 for line in result.split('\n') if re.match(r'^#{1,6}\s', line.strip()))
+                output_header_count = sum(1 for line in result.split("\n") if re.match(r"^#{1,6}\s", line.strip()))
                 if input_header_count > 0 and output_header_count > 0:
                     retention_rate = output_header_count / input_header_count
                     if retention_rate < 0.5:
-                        print(f"\u26a0\ufe0f Chunk {chunk_id} 标题保留率低: 输入 {input_header_count} \u2192 输出 {output_header_count} ({retention_rate:.0%})")
+                        print(
+                            f"\u26a0\ufe0f Chunk {chunk_id} 标题保留率低: 输入 {input_header_count} \u2192 输出 {output_header_count} ({retention_rate:.0%})"
+                        )
                     else:
-                        print(f"\u2705 Chunk {chunk_id} 标题保留: 输入 {input_header_count} \u2192 输出 {output_header_count} ({retention_rate:.0%})")
+                        print(
+                            f"\u2705 Chunk {chunk_id} 标题保留: 输入 {input_header_count} \u2192 输出 {output_header_count} ({retention_rate:.0%})"
+                        )
 
                 # 更新进度（chunk 完成后）
                 if task and process_info:
-                    completed = process_info['completed'] + 1
-                    total = process_info['total']
-                    process_info['completed'] = completed
+                    completed = process_info["completed"] + 1
+                    total = process_info["total"]
+                    process_info["completed"] = completed
                     progress = 50 + int((completed / total) * 45)
                     task.progress = min(95, progress)
                     task.message = f"章节 {completed}/{total} 分析完成"
@@ -535,11 +534,11 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
             except Exception as e:
                 error_msg = str(e)
                 print(f"Chunk {chunk_id} error (Attempt {attempt + 1}/{max_retries + 1}): {e}")
-                
+
                 # 如果是最后一次尝试，放弃
                 if attempt == max_retries:
                     return chunk_id, f"## {title}\n- Error extracting content: {error_msg}"
-                
+
                 # 策略: 指数退避 (Adaptive / DeepSeek)
                 if "429" in error_msg or "rate limit" in error_msg.lower():
                     # 计算退避时间: base * (2 ^ attempt)
@@ -551,6 +550,7 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
                     # 其他错误 (500等)，也稍微等待
                     await asyncio.sleep(1)
 
+
 async def generate_root_summary(full_markdown: str):
     """
     生成根节点摘要 - 基于全文档结构
@@ -559,22 +559,24 @@ async def generate_root_summary(full_markdown: str):
     try:
         # 1. 提取大纲 (Table of Contents) 而不是截断文本
         # 提取所有 headers
-        toc_lines = [line for line in full_markdown.split('\n') if line.strip().startswith('#')]
+        toc_lines = [line for line in full_markdown.split("\n") if line.strip().startswith("#")]
         toc_content = "\n".join(toc_lines)
-        
+
         # 如果 TOC 太长，再进行截断（但保留了结构概览）
         if len(toc_content) > 15000:
-             toc_content = toc_content[:15000] + "\n...(truncated)..."
+            toc_content = toc_content[:15000] + "\n...(truncated)..."
 
         client = get_client()
         model = get_model()
-        
+
         # 始终使用 deepseek-chat，不切换 reasoner（避免冗长思考链浪费 token）
         response = await client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": "你是一位专业的知识架构师。"},
-                {"role": "user", "content": f"""根据以下文档目录大纲，生成一个根节点标题和简要的高层结构概述。
+                {
+                    "role": "user",
+                    "content": f"""根据以下文档目录大纲，生成一个根节点标题和简要的高层结构概述。
 
 【输出格式要求】：
 1. 第一行必须是一级标题 # （只能有一个 #）
@@ -589,24 +591,25 @@ async def generate_root_summary(full_markdown: str):
 - 模块三：xxx
 
 目录大纲：
-{toc_content}"""}
+{toc_content}""",
+                },
             ],
             temperature=_engine_settings.get("temperature", ENGINE_LIMITS["temperature"]["default"]),
-            max_tokens=_engine_settings.get("max_tokens", ENGINE_LIMITS["max_tokens"]["default"])
+            max_tokens=_engine_settings.get("max_tokens", ENGINE_LIMITS["max_tokens"]["default"]),
         )
-        
+
         # 后置防护：移除 AI 可能误生成的 H2+ 标题
         result = response.choices[0].message.content
         sanitized_lines = []
-        for line in result.split('\n'):
+        for line in result.split("\n"):
             stripped = line.strip()
-            if re.match(r'^#{2,6}\s', stripped):
+            if re.match(r"^#{2,6}\s", stripped):
                 # H2+ 标题转为列表项
-                title_text = re.sub(r'^#{2,6}\s+', '', stripped)
+                title_text = re.sub(r"^#{2,6}\s+", "", stripped)
                 sanitized_lines.append(f"- {title_text}")
             else:
                 sanitized_lines.append(line)
-        return '\n'.join(sanitized_lines)
+        return "\n".join(sanitized_lines)
     except Exception as e:
         print(f"Error generating root summary: {e}")
         return "# Document Analysis"
@@ -620,47 +623,48 @@ async def extract_global_outline(full_text: str) -> dict:
     try:
         # 简单启发式：提取 Markdown 标题行
         headers = []
-        for line in full_text.split('\n'):
-            if line.strip().startswith('#'):
+        for line in full_text.split("\n"):
+            if line.strip().startswith("#"):
                 headers.append(line.strip())
-        
+
         if not headers:
             return {}
 
         # 如果标题太多，简化处理（避免 Token 超限）
         if len(headers) > 500:
             headers = headers[:500] + ["... (truncated)"]
-        
+
         outline_text = "\n".join(headers)
-        
+
         # 让 AI 分析每个 chunk 大致对应的章节
         # 注意：这里有一个难点，如何将 text chunk 映射回 outline
         # 简化策略：
         # 假设 chunks 是按顺序切分的。
         # 我们让 AI 浏览 Outline，并生成一个"章节导航图"
-        
+
         return outline_text
     except Exception as e:
         print(f"Outline extraction failed: {e}")
         return ""
 
+
 def sanitize_branch(branch: str) -> str:
     """
     轻量级清理：只处理 AI 输出中的明显错误，不修改标题级别
-    
+
     1. 将 H1 (#) 标题降级为 H2 (##)，因为 H1 只属于全局根节点
     2. 不平移其他标题级别，保留 AI 输出的原始层级
     """
-    header_pattern = re.compile(r'^(#{1,6})\s+(.*)')
+    header_pattern = re.compile(r"^(#{1,6})\s+(.*)")
     result_lines = []
-    for line in branch.split('\n'):
+    for line in branch.split("\n"):
         m = header_pattern.match(line.strip())
         if m and len(m.group(1)) == 1:
             # H1 → H2
             result_lines.append(f"## {m.group(2)}")
         else:
             result_lines.append(line)
-    return '\n'.join(result_lines)
+    return "\n".join(result_lines)
 
 
 async def generate_mindmap_structure(chunks: list, task=None):
@@ -671,10 +675,10 @@ async def generate_mindmap_structure(chunks: list, task=None):
         return "# Empty Document"
 
     total_chunks = len(chunks)
-    
+
     # ==================== MAP Phase ====================
-    process_info = {'completed': 0, 'total': total_chunks}
-    
+    process_info = {"completed": 0, "total": total_chunks}
+
     # 构造任务，传入 Context
     tasks_list = []
     for i, chunk_data in enumerate(chunks):
@@ -683,9 +687,9 @@ async def generate_mindmap_structure(chunks: list, task=None):
             content = chunk_data
             context = ""
         else:
-            content = chunk_data.get('content', '')
-            context = chunk_data.get('context', '')
-            
+            content = chunk_data.get("content", "")
+            context = chunk_data.get("context", "")
+
         tasks_list.append(summarize_chunk(content, i, task, process_info, parent_context=context))
 
     results = await asyncio.gather(*tasks_list, return_exceptions=True)
@@ -724,16 +728,16 @@ async def generate_mindmap_structure(chunks: list, task=None):
     try:
         # 生成根节点摘要
         root_structure = await generate_root_summary(full_branches)
-        
+
         # 只提取 H1 标题行，丢弃列表项等描述性内容
-        # 这些内容如果留在最终 Markdown 中，会在 parse_markdown_to_tree 
+        # 这些内容如果留在最终 Markdown 中，会在 parse_markdown_to_tree
         # 中变成树节点，干扰真正的文档层级结构
         h1_line = "# 知识图谱"  # 默认标题
-        for line in root_structure.split('\n'):
-            if line.strip().startswith('# ') and not line.strip().startswith('## '):
+        for line in root_structure.split("\n"):
+            if line.strip().startswith("# ") and not line.strip().startswith("## "):
                 h1_line = line.strip()
                 break
-        
+
         # 最终合并：H1 标题 + 各 chunk 的内容
         final_output = f"{h1_line}\n\n{full_branches}"
     except Exception as e:
@@ -741,6 +745,7 @@ async def generate_mindmap_structure(chunks: list, task=None):
         final_output = f"# 知识图谱\n\n{full_branches}"
 
     return final_output
+
 
 def _is_minimax_backend(model: str, client) -> bool:
     """Detect MiniMax-compatible backend by model id or base_url."""
@@ -767,32 +772,30 @@ def _is_response_format_error(error_message: str) -> bool:
 
 
 _REFINE_NOISE_RE = re.compile(
-    r'^(?:'
-    r'-\s*\d+\s*-'
-    r'|page\s+\d+'
-    r'|\d+\s*/\s*\d+'
-    r'|\d+\s+of\s+\d+'
-    r'|confidential|draft|internal'
-    r'|内部|机密|仅供参考|草稿'
-    r')$',
-    re.IGNORECASE
+    r"^(?:"
+    r"-\s*\d+\s*-"
+    r"|page\s+\d+"
+    r"|\d+\s*/\s*\d+"
+    r"|\d+\s+of\s+\d+"
+    r"|confidential|draft|internal"
+    r"|内部|机密|仅供参考|草稿"
+    r")$",
+    re.IGNORECASE,
 )
-_REFINE_DECORATIVE_RE = re.compile(r'^[\s\-=_~*#★☆■▲●◆○△◇•·]{2,}$')
-_REFINE_URL_RE = re.compile(r'^https?://', re.IGNORECASE)
-_REFINE_PATH_RE = re.compile(r'^(?:[A-Z]:\\|/(?:usr|home|var|etc|opt|tmp)/)', re.IGNORECASE)
-_REFINE_DIGIT_RE = re.compile(r'^\d{2,}$')
-_REFINE_DIAGRAM_LABEL_RE = re.compile(r'^[A-Za-z]{1,4}\s*\([^)]{1,30}\)$')
-_REFINE_MD_TABLE_SEPARATOR_RE = re.compile(
-    r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$'
-)
+_REFINE_DECORATIVE_RE = re.compile(r"^[\s\-=_~*#★☆■▲●◆○△◇•·]{2,}$")
+_REFINE_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+_REFINE_PATH_RE = re.compile(r"^(?:[A-Z]:\\|/(?:usr|home|var|etc|opt|tmp)/)", re.IGNORECASE)
+_REFINE_DIGIT_RE = re.compile(r"^\d{2,}$")
+_REFINE_DIAGRAM_LABEL_RE = re.compile(r"^[A-Za-z]{1,4}\s*\([^)]{1,30}\)$")
+_REFINE_MD_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
 
 
 def _normalize_refine_text(value: str) -> str:
     if not isinstance(value, str):
         return ""
     text = value.strip()
-    text = re.sub(r'^[\-*•\d\.\)\(]+', '', text).strip()
-    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r"^[\-*•\d\.\)\(]+", "", text).strip()
+    text = re.sub(r"\s+", " ", text)
     return text
 
 
@@ -924,7 +927,7 @@ def _extract_first_json_payload(text: str) -> str:
             if (opener == "[" and ch != "]") or (opener == "{" and ch != "}"):
                 return ""
             if not stack:
-                return text[start:i + 1]
+                return text[start : i + 1]
     return ""
 
 
@@ -979,7 +982,7 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
     """
     Refinement Phase: 针对特定节点生成子级详情
     强制 JSON 输出
-    
+
     :return: List[Dict] e.g. [{"topic": "...", "details": [...]}]
     """
     system_prompt = """
@@ -1011,7 +1014,7 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
     - 不输出 URL、文件路径、纯符号行
     - 输出前请自检，确保 JSON 数组中的每个对象都包含 topic 字段
     """
-    
+
     user_prompt = f"""
     【上下文路径】：{context_path}
     【当前章节】：{node_title}
@@ -1021,7 +1024,7 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
     
     请提取关键信息作为子节点。忽略与本章节无关的内容。
     """
-    
+
     try:
         client = get_client()
         model = get_model()
@@ -1029,10 +1032,7 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
 
         request_kwargs = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
+            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
             "temperature": 0.3,
             "max_tokens": 2000,
         }
@@ -1057,7 +1057,7 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
         elif not isinstance(content, str):
             content = str(content or "")
         return _parse_refine_response(content, node_title)
-            
+
     except Exception as e:
         print(f"Refine node {node_title} failed: {e}")
         return []

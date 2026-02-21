@@ -36,10 +36,10 @@ npm run dev
 
 ## Local Checks
 
-Run endpoint tests before opening a PR:
+Run full project checks before opening a PR:
 
 ```bash
-uv run python backend/api_endpoints_test.py
+./scripts/test_all.sh
 ```
 
 ## Reporting Issues

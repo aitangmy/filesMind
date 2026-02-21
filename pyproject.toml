@@ -19,3 +19,16 @@ dependencies = [
     "docling-hierarchical-pdf>=0.0.1",
     "cryptography>=44.0.0",
 ]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.19.1",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.15.2",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+ignore = ["E402", "E741", "E701", "F841"]
