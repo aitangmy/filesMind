@@ -1385,40 +1385,77 @@ def _run_docling_pipeline(file_path: Path, output_dir: str, file_id: str, do_ocr
         )
 
         # 用于跟踪已替换的图片（避免重复替换）
-        replaced_refs = set()
+        unresolved_items = [{"doc_ref": ref, "local_path": path} for ref, path in sorted_image_items]
+
+        def normalize_ref(value: str) -> str:
+            raw = str(value or "").strip().strip("'\"")
+            raw = raw.replace("\\", "/")
+            raw = unquote(raw)
+            raw = raw.split("?", 1)[0].split("#", 1)[0]
+            raw = re.sub(r"<!--\s*|\s*-->", "", raw).strip()
+            return raw.lower()
+
+        def basename(value: str) -> str:
+            normalized = normalize_ref(value)
+            if "/" in normalized:
+                return normalized.rsplit("/", 1)[-1]
+            return normalized
+
+        def numeric_token(value: str) -> str:
+            matched = re.search(r"(?:^|[_\-\s])(\d{1,6})(?:\.[a-z0-9]{1,6})?$", str(value or ""))
+            return matched.group(1) if matched else ""
+
+        placeholder_any_pattern = re.compile(
+            r"^(?:image|img|figure|fig|photo|picture)(?:[_\-\s]?\d+)?(?:\.[a-z0-9]{1,6})?$",
+            re.IGNORECASE,
+        )
+        placeholder_generic_pattern = re.compile(
+            r"^(?:image|img|figure|fig|photo|picture)(?:\.[a-z0-9]{1,6})?$",
+            re.IGNORECASE,
+        )
+
+        def pop_by_index(index: int) -> str:
+            return unresolved_items.pop(index)["local_path"]
+
+        def match_image_ref(original_ref: str) -> str | None:
+            ref_norm = normalize_ref(original_ref)
+            ref_base = basename(original_ref)
+
+            # 1) Strict match only: full ref then basename.
+            for idx, item in enumerate(unresolved_items):
+                doc_norm = normalize_ref(item["doc_ref"])
+                doc_base = basename(item["doc_ref"])
+                if ref_norm and doc_norm and ref_norm == doc_norm:
+                    return pop_by_index(idx)
+                if ref_base and doc_base and ref_base == doc_base:
+                    return pop_by_index(idx)
+
+            # 2) Numbered placeholders: match only when numeric token is unique.
+            if placeholder_any_pattern.match(ref_norm or ref_base):
+                token = numeric_token(ref_base or ref_norm)
+                if token:
+                    hits = []
+                    for idx, item in enumerate(unresolved_items):
+                        if numeric_token(basename(item["doc_ref"])) == token:
+                            hits.append(idx)
+                    if len(hits) == 1:
+                        return pop_by_index(hits[0])
+                    return None
+
+                # 3) Ordered fallback only for generic placeholders without numeric token.
+                if placeholder_generic_pattern.match(ref_norm or ref_base) and unresolved_items:
+                    return pop_by_index(0)
+
+            return None
 
         def replace_image_refs(match):
-            """
-            精确替换图片引用：
-            1. 获取原始 markdown 中的引用（可能是占位符或原始URI）
-            2. 在 image_map 中查找匹配的项
-            3. 替换为本地保存的文件路径
-            """
-            nonlocal replaced_refs
             alt_text = match.group(1) if match.group(1) else "image"
-            original_ref = match.group(2)  # 可能是 <!-- image --> 或原始 URI
-
-            # 尝试在 image_map 中找到匹配的引用
-            for doc_ref, local_path in sorted_image_items:
-                if doc_ref not in replaced_refs:
-                    # 匹配逻辑：
-                    # 1. 完全匹配
-                    # 2. 或者原始引用中包含 doc_ref 的一部分
-                    # 3. 或者 doc_ref 包含原始引用的一部分
-                    # 4. 对于占位符模式，使用顺序替换
-                    if (
-                        doc_ref == original_ref
-                        or doc_ref in original_ref
-                        or original_ref in doc_ref
-                        or "image" in original_ref.lower()
-                    ):
-                        replaced_refs.add(doc_ref)
-                        return f"![{alt_text}]({local_path})"
-
-            # 如果找不到匹配，保留原始内容
+            original_ref = match.group(2)
+            matched_path = match_image_ref(original_ref)
+            if matched_path:
+                return f"![{alt_text}]({matched_path})"
             return match.group(0)
 
-        # 替换所有图片引用
         md_content = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_image_refs, md_content)
 
         # ──────────────────────────────────────────────────────────────────
