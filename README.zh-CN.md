@@ -1,10 +1,8 @@
-# FilesMind - AI 驱动的深度知识导图生成器
+# FilesMind - AI 驱动的深度知识导图构建工具
 
 > [English](README.md) | [简体中文](README.zh-CN.md)
 
-> 将长篇 PDF 文档转化为结构化、可编辑的知识导图。
-
-FilesMind 是一个开源文档分析工具，面向深度阅读场景。它结合 Docling 与大模型推理，将复杂 PDF 转换为逻辑清晰的思维导图（Markdown / XMind）。
+将长篇 PDF 转换为结构化导图，支持源码追溯、可编辑流程和可配置的大模型处理参数。
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Backend](https://img.shields.io/badge/Backend-FastAPI-009688.svg)
@@ -12,49 +10,62 @@ FilesMind 是一个开源文档分析工具，面向深度阅读场景。它结�
 
 ---
 
+## 项目能力
+
+FilesMind 是一个面向深度文档阅读的全栈应用：
+
+1. 使用 `docling` / `marker` / `hybrid` 解析 PDF。
+2. 通过大模型精炼生成层级化知识结构。
+3. 持久化任务结果和历史记录。
+4. 支持节点回溯到源 Markdown 的行号片段。
+5. 导出 Markdown / XMind / PNG。
+
+---
+
 ## 核心特性
 
-1. 保留层级上下文的文档理解能力。
-2. 智能硬件加速（CUDA / Apple MPS / CPU）。
-3. 基于 IBM Docling 的深度 PDF 解析（文本、表格、图片、公式）。
-4. 原生 `.xmind` 导出，支持图片。
-5. 前后端分离架构（Vue 3 + FastAPI）。
-6. 可切换 PDF 解析后端：`docling` / `marker` / `hybrid`。
+- 解析后端可切换（`docling`、`marker`、`hybrid`），支持运行时配置。
+- 配置中心包含模型档案、解析参数与高级引擎参数。
+- 高级参数支持防抖自动保存。
+- 任务超时可运行时调整（`60` 到 `7200` 秒）。
+- 支持 source index 树与节点源码摘录接口。
+- 支持配置导入/导出，后端持久化配置加密存储。
+- 前端支持工作区和设置页路由（`/workspace`、`/settings`）。
+
+---
+
+## 环境要求
+
+- Python `3.12.x`（`pyproject.toml` 固定 `==3.12.*`）
+- Node.js `>= 18`
+- Git
 
 ---
 
 ## 快速开始
 
-### 1. 环境要求
-
-- Python `3.12.x`（项目固定为 `==3.12.*`）
-- Node.js `>= 18`
-- Git
-
-### 2. 克隆项目
+### 1. 克隆项目
 
 ```bash
 git clone https://github.com/aitangmy/filesMind.git
 cd filesMind
 ```
 
-### 3. 启动后端（uv）
-
-本项目在仓库根目录使用 `pyproject.toml` + `uv.lock` 管理 Python 依赖。
+### 2. 安装 Python 依赖（uv）
 
 ```bash
-# 如未安装 uv
 python -m pip install -U uv
-
-# 在仓库根目录同步依赖
 uv sync
+```
 
-# 启动后端服务
+### 3. 启动后端
+
+```bash
 cd backend
 uv run uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-启动成功后会看到：`Uvicorn running on http://0.0.0.0:8000`。
+后端地址：`http://localhost:8000`
 
 ### 4. 启动前端
 
@@ -66,116 +77,94 @@ npm install
 npm run dev
 ```
 
-浏览器访问 [http://localhost:5173](http://localhost:5173)。
+前端地址：`http://localhost:5173`
 
-### 5. 首次使用必做配置
+---
 
-上传 PDF 前，请先在界面右上角 **Settings** 完成：
+## 首次使用必做配置
+
+上传 PDF 前，请先进入 **Settings** 完成：
 
 1. `API Base URL`
 2. `Model`
-3. `API Key`（Ollama 模式可为空）
-4. 点击 **测试连接**，再点击 **保存配置**
+3. `API Key`（Ollama 可为空）
+4. 点击 **测试连接**
+5. 点击 **保存全部配置**
 
-如果模型配置无效，上传后会处理失败。
-
-### 6. 可选：启用 Marker/Hybrid 解析
-
-现在可通过环境变量切换解析后端：
-
-- `PARSER_BACKEND=docling`（默认）
-- `PARSER_BACKEND=marker`
-- `PARSER_BACKEND=hybrid`（先 Docling，噪声高时自动回退 Marker）
-
-先安装 Marker：
-
-```bash
-uv pip install marker-pdf
-```
-
-以 hybrid 模式启动后端：
-
-```bash
-cd backend
-PARSER_BACKEND=hybrid uv run uvicorn app:app --reload --host 0.0.0.0 --port 8000
-```
-
-可选：调整回退阈值（无效标题比例）
-
-```bash
-HYBRID_NOISE_THRESHOLD=0.20
-```
-
-注意：`marker-pdf` / `surya-ocr` 的许可证与本仓库 MIT 不同；若用于再分发或商业场景，请先做许可证合规评估。
+若跳过该步骤，任务处理会失败。
 
 ---
 
-## 新手提示
+## 解析与高级参数
 
-- 前端请求 `/api/*` 会被 Vite 代理到 `http://localhost:8000/*`。
-- 上传文件与生成结果会落盘到 `backend/data/`。
-- 纯 CPU 环境下，大 PDF 处理可能需要几分钟。
+### 解析参数
 
----
+- `parser_backend`：`docling` / `marker` / `hybrid`
+- `task_timeout_seconds`：`60 ~ 7200`
+- `hybrid_noise_threshold`：`0 ~ 1`
+- `hybrid_docling_skip_score`：`0 ~ 100`
+- `hybrid_switch_min_delta`：`0 ~ 50`
+- `hybrid_marker_min_length`：`0 ~ 1000000`
+- `marker_prefer_api`：`true/false`
 
-## 使用流程
+### 高级引擎参数
 
-1. 在顶部工具栏上传 PDF。
-2. 观察任务状态和进度。
-3. 在主画布预览导图。
-4. 导出 Markdown / XMind / PNG。
-5. 在左侧历史记录中复用或删除结果。
+- `engine_concurrency`：`1 ~ 10`
+- `engine_temperature`：`0 ~ 1`
+- `engine_max_tokens`：`1000 ~ 16000`
 
----
+说明：
 
-## 常见问题
-
-### 1）后端依赖安装失败
-
-- 先确认 Python 为 `3.12.x`。
-- 在仓库根目录执行 `uv sync`。
-- 当前仓库 **没有** `requirements.txt`。
-
-### 2）前端启动失败
-
-- 确认 Node.js 版本 `>= 18`。
-- 可重装依赖：
-
-```bash
-cd frontend
-rm -rf node_modules package-lock.json
-npm install
-```
-
-### 3）上传后长时间处理中
-
-- 先看后端日志。
-- 纯 CPU 环境 OCR 解析会明显更慢。
-
-### 4）连接测试失败
-
-- 检查 API Key 与服务商地址是否正确。
-- 检查网络是否可访问对应模型服务。
+- 高级面板参数会触发防抖自动保存。
+- 任务超时由后端任务执行器在运行时生效。
 
 ---
 
-## 技术架构
+## 可选环境变量
 
-```mermaid
-graph TD
-    U["用户"] --> F["前端 (Vue3)"]
-    F --> B["后端 (FastAPI)"]
+- `PARSER_BACKEND`（默认 `docling`）
+- `HYBRID_NOISE_THRESHOLD`（默认 `0.20`）
+- `HYBRID_DOCLING_SKIP_SCORE`（默认 `70.0`）
+- `HYBRID_SWITCH_MIN_DELTA`（默认 `2.0`）
+- `HYBRID_MARKER_MIN_LENGTH`（默认 `200`）
+- `MARKER_PREFER_API`（默认 `false`）
+- `FILESMIND_PARSE_WORKERS`（解析进程池 worker 数）
 
-    subgraph P ["后端处理流水线"]
-      B --> D["Docling 解析 + 层级后处理"]
-      D --> T["构建层级树"]
-      T --> R["并行节点精炼（LLM）"]
-      R --> M["组装 Markdown"]
-      M --> X["导出 XMind"]
-    end
+---
 
-    B --> H["硬件检测 (CUDA/MPS/CPU)"]
-```
+## 后端 API 概览
+
+主要接口（前端通过 `/api/*` 代理访问）：
+
+- `POST /upload`
+- `GET /task/{task_id}`
+- `POST /task/{task_id}/cancel`
+- `GET /history`
+- `GET /file/{file_id}`
+- `GET /file/{file_id}/tree`
+- `GET /file/{file_id}/node/{node_id}/source`
+- `GET /file/{file_id}/pdf`
+- `DELETE /file/{file_id}`
+- `GET /config` / `POST /config`
+- `GET /config/export` / `POST /config/import`
+- `POST /config/test` / `POST /config/models`
+- `GET /health`
+- `GET /system/hardware`
+- `POST /admin/source-index/rebuild`
+
+---
+
+## 数据与持久化目录
+
+运行数据保存在 `backend/data/`：
+
+- `pdfs/`
+- `mds/`
+- `images/`
+- `source_mds/`
+- `source_indexes/`
+- `history.json`
+- `config.json` + `config.key`
 
 ---
 
@@ -183,28 +172,94 @@ graph TD
 
 ```text
 filesMind/
-  backend/                # FastAPI 服务与文档处理流水线
-  frontend/               # Vue 3 + Vite 界面
-  pyproject.toml          # Python 依赖（根目录）
-  uv.lock                 # Python 锁定依赖
-  README.md
-  README.zh-CN.md
+  backend/
+    app.py                # FastAPI API 与任务编排
+    parser_service.py     # PDF 解析与解析后端路由
+    cognitive_engine.py   # 大模型接入与高级引擎运行时限制
+    structure_utils.py    # 层级重建辅助
+    data/                 # 运行期持久化数据
+    tests/                # 后端测试
+  frontend/
+    src/WorkspaceShell.vue
+    src/components/MindMap.vue
+    src/router/index.js
+    package.json
+  scripts/test_all.sh     # 本地一键检查脚本
+  pyproject.toml
+  uv.lock
 ```
 
 ---
 
-## 贡献指南
+## 开发自检
+
+执行完整本地检查：
+
+```bash
+./scripts/test_all.sh
+```
+
+如需跳过 e2e：
+
+```bash
+SKIP_E2E=1 ./scripts/test_all.sh
+```
+
+---
+
+## 生产部署（最小方案）
+
+1. 构建前端：
+
+```bash
+cd frontend
+npm run build
+```
+
+2. 后端无热重载启动：
+
+```bash
+cd backend
+uv run uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+3. 使用 Nginx（或同类网关）统一处理：
+
+- 前端静态资源
+- `/api/*` 反向代理到后端
+- `/images/*` 反向代理到后端
+
+---
+
+## 常见问题
+
+1. 依赖安装失败：
+- 确认 Python 为 `3.12.x`。
+- 在仓库根目录重新执行 `uv sync`。
+
+2. 前端启动失败：
+- 确认 Node `>= 18`。
+- 重新安装 `frontend` 依赖。
+
+3. 任务执行时间过长：
+- 查看后端日志。
+- 在 Settings 中提高 `task_timeout_seconds`。
+- 按需调整解析后端与 worker 数。
+
+4. 模型连接测试失败：
+- 检查地址、模型名、密钥。
+- 检查网络可达性与服务商限流。
+
+---
+
+## 贡献
 
 欢迎提交 Issue 和 PR。
 
-建议在发 PR 前先做本地检查：
-
-```bash
-uv run python backend/api_endpoints_test.py
-```
+仓库协作规范见 `CONTRIBUTING.md`。
 
 ---
 
-## 开源许可
+## 许可证
 
-本项目采用 MIT License，详见 [LICENSE](LICENSE)。
+MIT License，详见 [LICENSE](LICENSE)。

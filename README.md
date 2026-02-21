@@ -1,10 +1,8 @@
-# FilesMind - Deep Knowledge Map Generator Powered by AI
+# FilesMind - AI-Powered Deep Knowledge Map Builder
 
 > [English](README.md) | [简体中文](README.zh-CN.md)
 
-> Transform long PDF documents into structured, editable mind maps.
-
-FilesMind is an open-source document analysis tool for deep reading. It uses Docling + LLM reasoning to convert complex PDFs into logically structured mind maps (Markdown / XMind).
+Convert long PDFs into structured mind maps with source traceability, editable workflow, and configurable LLM processing.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Backend](https://img.shields.io/badge/Backend-FastAPI-009688.svg)
@@ -12,53 +10,66 @@ FilesMind is an open-source document analysis tool for deep reading. It uses Doc
 
 ---
 
+## What FilesMind Does
+
+FilesMind is a full-stack app for deep document reading:
+
+1. Parse PDF content with `docling` / `marker` / `hybrid` backend strategies.
+2. Build hierarchical knowledge trees with LLM refinement.
+3. Persist processing results and file history.
+4. Trace generated nodes back to source Markdown line ranges.
+5. Export final maps as Markdown / XMind / PNG.
+
+---
+
 ## Key Features
 
-1. Context-aware document understanding with hierarchy preservation.
-2. Hardware-aware parsing acceleration (CUDA / Apple MPS / CPU).
-3. Deep PDF parsing via IBM Docling (text, tables, images, formulas).
-4. Native `.xmind` export with image support.
-5. Frontend-backend decoupled architecture (Vue 3 + FastAPI).
-6. Switchable PDF parser backend: `docling` / `marker` / `hybrid`.
+- Parser backend switching (`docling`, `marker`, `hybrid`) with runtime config.
+- Settings center with model profiles, parser controls, and advanced engine controls.
+- Debounced auto-save for advanced settings.
+- Runtime task timeout control (`60` to `7200` seconds).
+- Source index tree + per-node source excerpt API.
+- Config import/export and encrypted config persistence on backend.
+- Frontend workspace + settings route (`/workspace`, `/settings`).
+
+---
+
+## Requirements
+
+- Python `3.12.x` (`==3.12.*` in `pyproject.toml`)
+- Node.js `>= 18`
+- Git
 
 ---
 
 ## Quick Start
 
-### 1. Prerequisites
-
-- Python `3.12.x` (project is pinned to `==3.12.*`)
-- Node.js `>= 18`
-- Git
-
-### 2. Clone
+### 1. Clone
 
 ```bash
 git clone https://github.com/aitangmy/filesMind.git
 cd filesMind
 ```
 
-### 3. Start Backend (uv)
-
-This repo uses `pyproject.toml` + `uv.lock` at project root.
+### 2. Install Python deps (uv)
 
 ```bash
-# Install uv if you don't have it
 python -m pip install -U uv
-
-# Sync Python dependencies at repo root
 uv sync
+```
 
-# Start backend service
+### 3. Start backend
+
+```bash
 cd backend
 uv run uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-After startup, you should see: `Uvicorn running on http://0.0.0.0:8000`.
+Backend URL: `http://localhost:8000`
 
-### 4. Start Frontend
+### 4. Start frontend
 
-Open a new terminal:
+Open another terminal:
 
 ```bash
 cd frontend
@@ -66,116 +77,94 @@ npm install
 npm run dev
 ```
 
-Then open [http://localhost:5173](http://localhost:5173).
+Frontend URL: `http://localhost:5173`
 
-### 5. First-time Setup (Required)
+---
 
-Before uploading PDF, open **Settings** in the UI and set:
+## First-Time Setup (Required)
+
+Before uploading PDFs, open **Settings** and configure:
 
 1. `API Base URL`
 2. `Model`
-3. `API Key` (not required for Ollama mode)
-4. Click **Test Connection** and then **Save**
+3. `API Key` (not required for Ollama)
+4. Click **Test Connection**
+5. Click **Save All Config**
 
-Without valid model configuration, processing requests will fail.
-
-### 6. Optional: Enable Marker/Hybrid parser
-
-FilesMind now supports parser backend switching via env var:
-
-- `PARSER_BACKEND=docling` (default)
-- `PARSER_BACKEND=marker`
-- `PARSER_BACKEND=hybrid` (Docling first, auto fallback to Marker on noisy output)
-
-Install Marker first:
-
-```bash
-uv pip install marker-pdf
-```
-
-Start backend in hybrid mode:
-
-```bash
-cd backend
-PARSER_BACKEND=hybrid uv run uvicorn app:app --reload --host 0.0.0.0 --port 8000
-```
-
-Tune fallback sensitivity (optional):
-
-```bash
-HYBRID_NOISE_THRESHOLD=0.20
-```
-
-Note: `marker-pdf` / `surya-ocr` have different license terms than this repository (MIT). Verify compatibility before redistribution/commercial use.
+If this step is skipped, task processing will fail.
 
 ---
 
-## Beginner Notes
+## Parser and Advanced Settings
 
-- Backend API base path is proxied by Vite: frontend uses `/api/*` and maps to `http://localhost:8000/*`.
-- Uploaded files and generated outputs are stored under `backend/data/`.
-- If your machine is CPU-only, large PDFs may take several minutes.
+### Parser controls
 
----
+- `parser_backend`: `docling` / `marker` / `hybrid`
+- `task_timeout_seconds`: `60 ~ 7200`
+- `hybrid_noise_threshold`: `0 ~ 1`
+- `hybrid_docling_skip_score`: `0 ~ 100`
+- `hybrid_switch_min_delta`: `0 ~ 50`
+- `hybrid_marker_min_length`: `0 ~ 1000000`
+- `marker_prefer_api`: `true/false`
 
-## User Guide
+### Advanced engine controls
 
-1. Upload a PDF from the top toolbar.
-2. Watch task progress and status.
-3. Preview the generated map in canvas.
-4. Export as Markdown / XMind / PNG.
-5. Reopen or delete records from history sidebar.
+- `engine_concurrency`: `1 ~ 10`
+- `engine_temperature`: `0 ~ 1`
+- `engine_max_tokens`: `1000 ~ 16000`
 
----
+Notes:
 
-## Troubleshooting
-
-### 1) Backend dependency install fails
-
-- Ensure Python is `3.12.x`.
-- Use `uv sync` at repository root.
-- This project currently does **not** provide `requirements.txt`.
-
-### 2) Frontend cannot start
-
-- Ensure Node.js version is `>= 18`.
-- Reinstall frontend deps:
-
-```bash
-cd frontend
-rm -rf node_modules package-lock.json
-npm install
-```
-
-### 3) Upload stuck at processing
-
-- Check backend logs first.
-- CPU-only environments can be much slower for OCR/parsing.
-
-### 4) Connection test fails
-
-- Verify API Key and provider endpoint.
-- Check network access to your model provider.
+- Advanced panel changes trigger debounced auto-save.
+- Task timeout is applied at runtime by backend task runner.
 
 ---
 
-## Architecture
+## Optional Environment Variables
 
-```mermaid
-graph TD
-    U["User"] --> F["Frontend (Vue3)"]
-    F --> B["Backend (FastAPI)"]
+- `PARSER_BACKEND` (default `docling`)
+- `HYBRID_NOISE_THRESHOLD` (default `0.20`)
+- `HYBRID_DOCLING_SKIP_SCORE` (default `70.0`)
+- `HYBRID_SWITCH_MIN_DELTA` (default `2.0`)
+- `HYBRID_MARKER_MIN_LENGTH` (default `200`)
+- `MARKER_PREFER_API` (default `false`)
+- `FILESMIND_PARSE_WORKERS` (process-pool worker count)
 
-    subgraph P ["Backend Pipeline"]
-      B --> D["Docling Parse + Hierarchy Postprocess"]
-      D --> T["Build Hierarchy Tree"]
-      T --> R["Parallel Node Refinement (LLM)"]
-      R --> M["Assemble Markdown"]
-      M --> X["Export XMind"]
-    end
+---
 
-    B --> H["Hardware Detection (CUDA/MPS/CPU)"]
-```
+## API Surface (Backend)
+
+Main endpoints (frontend accesses them via `/api/*` proxy):
+
+- `POST /upload`
+- `GET /task/{task_id}`
+- `POST /task/{task_id}/cancel`
+- `GET /history`
+- `GET /file/{file_id}`
+- `GET /file/{file_id}/tree`
+- `GET /file/{file_id}/node/{node_id}/source`
+- `GET /file/{file_id}/pdf`
+- `DELETE /file/{file_id}`
+- `GET /config` / `POST /config`
+- `GET /config/export` / `POST /config/import`
+- `POST /config/test` / `POST /config/models`
+- `GET /health`
+- `GET /system/hardware`
+- `POST /admin/source-index/rebuild`
+
+---
+
+## Data and Persistence
+
+Generated and runtime data are stored under `backend/data/`:
+
+- `pdfs/`
+- `mds/`
+- `images/`
+- `source_mds/`
+- `source_indexes/`
+- `history.json`
+- `config.json` + `config.key`
 
 ---
 
@@ -183,25 +172,91 @@ graph TD
 
 ```text
 filesMind/
-  backend/                # FastAPI service and document pipeline
-  frontend/               # Vue 3 + Vite web UI
-  pyproject.toml          # Python dependencies (root)
-  uv.lock                 # Locked Python dependency graph
-  README.md
-  README.zh-CN.md
+  backend/
+    app.py                # FastAPI API + task orchestration
+    parser_service.py     # PDF parsing and parser backend routing
+    cognitive_engine.py   # LLM integration and advanced engine runtime limits
+    structure_utils.py    # Hierarchy reconstruction helpers
+    data/                 # Persistent runtime data
+    tests/                # Backend tests
+  frontend/
+    src/WorkspaceShell.vue
+    src/components/MindMap.vue
+    src/router/index.js
+    package.json
+  scripts/test_all.sh     # Local all-in-one checks
+  pyproject.toml
+  uv.lock
 ```
+
+---
+
+## Development Checks
+
+Run full local checks:
+
+```bash
+./scripts/test_all.sh
+```
+
+Skip e2e if needed:
+
+```bash
+SKIP_E2E=1 ./scripts/test_all.sh
+```
+
+---
+
+## Production Deployment (Minimal)
+
+1. Build frontend:
+
+```bash
+cd frontend
+npm run build
+```
+
+2. Run backend without reload:
+
+```bash
+cd backend
+uv run uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+3. Put Nginx (or equivalent) in front of:
+
+- static frontend assets
+- `/api/*` proxy to backend
+- `/images/*` proxy to backend
+
+---
+
+## Troubleshooting
+
+1. Dependency install fails:
+- Confirm Python `3.12.x`.
+- Re-run `uv sync` from repo root.
+
+2. Frontend startup fails:
+- Confirm Node `>= 18`.
+- Reinstall `frontend` dependencies.
+
+3. Long-running tasks:
+- Check backend logs.
+- Increase timeout in Settings (`task_timeout_seconds`).
+- Tune parser backend and worker count.
+
+4. Model connection test fails:
+- Verify endpoint/model/key.
+- Check network access and provider-side limits.
 
 ---
 
 ## Contributing
 
-Issues and PRs are welcome.
+Issues and pull requests are welcome.
 
-Recommended local check before PR:
-
-```bash
-uv run python backend/api_endpoints_test.py
-```
+For repository guidelines, see `CONTRIBUTING.md`.
 
 ---
 
