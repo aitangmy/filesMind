@@ -1,4 +1,4 @@
-<script setup>
+﻿<script setup>
 import { ref, nextTick, onMounted, onUnmounted, computed, defineAsyncComponent, watch } from 'vue';
 import { useRouter } from 'vue-router';
 
@@ -12,23 +12,52 @@ const props = defineProps({
 const router = useRouter();
 const isSettingsRoute = computed(() => props.routeMode === 'settings');
 
-const MindMap = defineAsyncComponent(() => import('./components/MindMap.vue'));
+const loadMindMapComponent = () => import('./components/MindMap.vue');
+const loadVirtualPdfViewerComponent = () => import('./components/VirtualPdfViewer.vue');
+const MindMap = defineAsyncComponent(loadMindMapComponent);
+const VirtualPdfViewer = defineAsyncComponent(loadVirtualPdfViewerComponent);
+
+let pdfPrefetchPromise = null;
+const prefetchPdfViewerAssets = () => {
+  if (pdfPrefetchPromise) return pdfPrefetchPromise;
+  pdfPrefetchPromise = Promise.all([
+    loadVirtualPdfViewerComponent(),
+    import('pdfjs-dist'),
+    import('vue-pdf-embed'),
+    import('vue-pdf-embed/dist/styles/annotationLayer.css')
+  ]).catch((err) => {
+    console.warn('PDF assets prefetch failed', err);
+  });
+  return pdfPrefetchPromise;
+};
+
+let xmindPrefetchPromise = null;
+const prefetchXmindExportAssets = () => {
+  if (xmindPrefetchPromise) return xmindPrefetchPromise;
+  xmindPrefetchPromise = Promise.all([
+    import('simple-mind-map/src/plugins/Export.js'),
+    import('simple-mind-map/src/plugins/ExportXMind.js')
+  ]).catch((err) => {
+    console.warn('XMind export assets prefetch failed', err);
+  });
+  return xmindPrefetchPromise;
+};
 
 const MASKED_KEY = '***';
 const providerOptions = [
   { value: 'minimax', label: 'MiniMax', base_url: 'https://api.minimaxi.com/v1', default_model: 'MiniMax-M2.5' },
-  { value: 'deepseek', label: 'DeepSeek (官方)', base_url: 'https://api.deepseek.com', default_model: 'deepseek-chat' },
+  { value: 'deepseek', label: 'DeepSeek (瀹樻柟)', base_url: 'https://api.deepseek.com', default_model: 'deepseek-chat' },
   { value: 'openai', label: 'OpenAI', base_url: 'https://api.openai.com', default_model: 'gpt-4o' },
   { value: 'anthropic', label: 'Anthropic (Claude)', base_url: 'https://api.anthropic.com', default_model: 'claude-3-5-sonnet-20241022' },
-  { value: 'moonshot', label: '月之暗面 (Moonshot)', base_url: 'https://api.moonshot.cn', default_model: 'moonshot-v1-8k' },
-  { value: 'dashscope', label: '阿里云 (DashScope)', base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', default_model: 'qwen-max' },
+  { value: 'moonshot', label: '鏈堜箣鏆楅潰 (Moonshot)', base_url: 'https://api.moonshot.cn', default_model: 'moonshot-v1-8k' },
+  { value: 'dashscope', label: '闃块噷浜?(DashScope)', base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', default_model: 'qwen-max' },
   { value: 'ollama', label: 'Ollama (Local)', base_url: 'http://localhost:11434/v1', default_model: 'qwen2.5:7b' },
   { value: 'custom', label: 'Custom', base_url: '', default_model: '' }
 ];
 const parserBackendOptions = [
-  { value: 'docling', label: 'Docling（稳定）' },
-  { value: 'marker', label: 'Marker（版面鲁棒）' },
-  { value: 'hybrid', label: 'Hybrid（自动择优）' }
+  { value: 'docling', label: 'Docling锛堢ǔ瀹氾級' },
+  { value: 'marker', label: 'Marker锛堢増闈㈤瞾妫掞級' },
+  { value: 'hybrid', label: 'Hybrid锛堣嚜鍔ㄦ嫨浼橈級' }
 ];
 
 const defaultParserConfig = () => ({
@@ -54,7 +83,7 @@ const DEFAULT_MINDMAP_PLACEHOLDER = '# Welcome to FilesMind\n\n- **Upload a PDF*
 const mindmapData = ref(DEFAULT_MINDMAP_PLACEHOLDER);
 const isMindmapReady = ref(false);
 
-// 侧边栏与布局
+// 渚ц竟鏍忎笌甯冨眬
 const appShellRef = ref(null);
 const workspaceLayoutRef = ref(null);
 const viewportWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1440);
@@ -129,7 +158,7 @@ const stopPdfResizing = () => {
   document.removeEventListener('mouseup', stopPdfResizing);
 };
 
-// 导图交互状态
+// 瀵煎浘浜や簰鐘舵€?
 const mindMapRef = ref(null);
 
 const triggerExportPng = () => {
@@ -141,6 +170,7 @@ const triggerExportMd = () => {
 };
 
 const triggerExportXmind = () => {
+  void prefetchXmindExportAssets();
   if (mindMapRef.value?.exportXMind) mindMapRef.value.exportXMind();
 };
 
@@ -187,7 +217,7 @@ const triggerZoomOut = async () => {
   await syncMindMapZoom();
 };
 
-// 拖拽上传状态
+// 鎷栨嫿涓婁紶鐘舵€?
 const isDraggingFile = ref(false);
 const uploadProgress = ref(0);
 const isPdfFile = (file) => {
@@ -215,7 +245,7 @@ const onDrop = (e) => {
     if (isPdfFile(file)) {
       void handleSelectedFile(file);
     } else {
-      errorMsg.value = "请上传 PDF 格式的文件";
+      errorMsg.value = "请上传 PDF 文件";
     }
   }
 };
@@ -226,10 +256,10 @@ const triggerFileInput = () => {
   }
 };
 
-// 硬件状态
+// 纭欢鐘舵€?
 const hardwareType = ref('unknown'); // 'cpu', 'gpu', 'mps'
 
-// 设置弹窗
+// 璁剧疆寮圭獥
 const showSettings = ref(props.routeMode === 'settings');
 const activeSettingsTab = ref('model'); // model | parser | advanced
 const configLoading = ref(false);
@@ -291,12 +321,14 @@ const toastTypeClass = (type) => {
   return 'bg-blue-50 border-blue-200 text-blue-700';
 };
 
-// 系统能力标志
+// 绯荤粺鑳藉姏鏍囧織
 const systemFeatures = ref({
+  FEATURE_SERVER_PNG_EXPORT: false,
+  FEATURE_VIRTUAL_PDF: true,
   FEATURE_SIDECAR_ANCHOR: true
 });
 
-// 配置中心（多 profile）
+// 閰嶇疆涓績锛堝 profile锛?
 const profiles = ref([]);
 const activeProfileId = ref('');
 const config = ref({
@@ -340,10 +372,10 @@ const toBoolean = (value, fallback = false) => {
 
 const ERROR_CODE_HINTS = {
   OK: '配置可用',
-  MISSING_PROFILE_NAME: '请填写配置档案名称',
-  PROFILE_NAME_TOO_LONG: '配置档案名称不应超过 60 个字符',
+  MISSING_PROFILE_NAME: '请填写配置名称',
+  PROFILE_NAME_TOO_LONG: '配置名称不应超过 60 个字符',
   MISSING_BASE_URL: '请填写 API Base URL',
-  INVALID_BASE_URL: 'API Base URL 需以 http:// 或 https:// 开头',
+  INVALID_BASE_URL: 'API Base URL 需要以 http:// 或 https:// 开头',
   BASE_URL_TOO_LONG: 'API Base URL 过长',
   MISSING_MODEL: '请填写模型名称',
   MODEL_NAME_TOO_LONG: '模型名称过长',
@@ -359,23 +391,6 @@ const ERROR_CODE_HINTS = {
   CONFIG_SAVE_FAILED: '保存失败，请稍后重试',
   INVALID_PARSER_CONFIG: '解析配置格式无效',
   INVALID_PARSER_BACKEND: '解析后端仅支持 docling / marker / hybrid',
-  INVALID_HYBRID_NOISE_THRESHOLD: '噪声阈值必须是数字',
-  OUT_OF_RANGE_HYBRID_NOISE_THRESHOLD: '噪声阈值需在 0 到 1 之间',
-  INVALID_HYBRID_DOCLING_SKIP_SCORE: 'Docling 跳过分数必须是数字',
-  OUT_OF_RANGE_HYBRID_DOCLING_SKIP_SCORE: 'Docling 跳过分数需在 0 到 100 之间',
-  INVALID_HYBRID_SWITCH_MIN_DELTA: '切换分差阈值必须是数字',
-  OUT_OF_RANGE_HYBRID_SWITCH_MIN_DELTA: '切换分差阈值需在 0 到 50 之间',
-  INVALID_HYBRID_MARKER_MIN_LENGTH: 'Marker 最小长度必须是整数',
-  OUT_OF_RANGE_HYBRID_MARKER_MIN_LENGTH: 'Marker 最小长度需在 0 到 1000000 之间',
-  INVALID_TASK_TIMEOUT_SECONDS: '任务超时时间必须是整数',
-  OUT_OF_RANGE_TASK_TIMEOUT_SECONDS: '任务超时时间需在 60 到 7200 秒之间',
-  INVALID_ADVANCED_CONFIG: '高级引擎配置格式无效',
-  INVALID_ENGINE_CONCURRENCY: '并发限制必须是整数',
-  OUT_OF_RANGE_ENGINE_CONCURRENCY: '并发限制需在 1 到 10 之间',
-  INVALID_ENGINE_TEMPERATURE: '思维发散度必须是数字',
-  OUT_OF_RANGE_ENGINE_TEMPERATURE: '思维发散度需在 0 到 1 之间',
-  INVALID_ENGINE_MAX_TOKENS: '最大返回长度限制必须是整数',
-  OUT_OF_RANGE_ENGINE_MAX_TOKENS: '最大返回长度需在 1000 到 16000 之间',
   SOURCE_INDEX_REBUILD_FAILED: '历史索引重建失败',
 };
 
@@ -428,75 +443,75 @@ const fieldErrors = computed(() => {
 
   const baseUrl = config.value.base_url?.trim() || '';
   if (!baseUrl) {
-    errors.base_url = 'API Base URL 不能为空';
+    errors.base_url = 'API Base URL 涓嶈兘涓虹┖';
   } else {
     try {
       const parsed = new URL(baseUrl);
       if (!['http:', 'https:'].includes(parsed.protocol)) {
-        errors.base_url = 'API Base URL 必须使用 http:// 或 https://';
+        errors.base_url = 'API Base URL 蹇呴』浣跨敤 http:// 鎴?https://';
       }
     } catch {
-      errors.base_url = 'API Base URL 格式错误';
+      errors.base_url = 'API Base URL 鏍煎紡閿欒';
     }
-    if (baseUrl.length > 200) errors.base_url = 'API Base URL 长度不能超过 200';
+    if (baseUrl.length > 200) errors.base_url = 'API Base URL 闀垮害涓嶈兘瓒呰繃 200';
   }
 
   const model = config.value.model?.trim() || '';
-  if (!model) errors.model = '模型名称不能为空';
-  else if (model.length > 120) errors.model = '模型名称长度不能超过 120';
+  if (!model) errors.model = '妯″瀷鍚嶇О涓嶈兘涓虹┖';
+  else if (model.length > 120) errors.model = '妯″瀷鍚嶇О闀垮害涓嶈兘瓒呰繃 120';
 
   if (requiresApiKey.value && !hasUsableApiKey.value) {
-    errors.api_key = '当前服务商需要 API Key';
+    errors.api_key = '褰撳墠鏈嶅姟鍟嗛渶瑕?API Key';
   }
 
   const manualModels = normalizeManualModels(config.value.manual_models_text);
   if (manualModels.some((item) => item.length > 120)) {
-    errors.manual_models = '手动白名单中模型名长度不能超过 120';
+    errors.manual_models = '鎵嬪姩鐧藉悕鍗曚腑妯″瀷鍚嶉暱搴︿笉鑳借秴杩?120';
   }
 
   const parserBackend = String(parserConfig.value.parser_backend || '').trim().toLowerCase();
   if (!['docling', 'marker', 'hybrid'].includes(parserBackend)) {
-    errors.parser_backend = '解析后端仅支持 docling / marker / hybrid';
+    errors.parser_backend = '瑙ｆ瀽鍚庣浠呮敮鎸?docling / marker / hybrid';
   }
 
   const noiseThreshold = Number(parserConfig.value.hybrid_noise_threshold);
   if (!Number.isFinite(noiseThreshold) || noiseThreshold < 0 || noiseThreshold > 1) {
-    errors.hybrid_noise_threshold = '噪声阈值需在 0 到 1 之间';
+    errors.hybrid_noise_threshold = '鍣０闃堝€奸渶鍦?0 鍒?1 涔嬮棿';
   }
 
   const skipScore = Number(parserConfig.value.hybrid_docling_skip_score);
   if (!Number.isFinite(skipScore) || skipScore < 0 || skipScore > 100) {
-    errors.hybrid_docling_skip_score = 'Docling 跳过分数需在 0 到 100 之间';
+    errors.hybrid_docling_skip_score = 'Docling 璺宠繃鍒嗘暟闇€鍦?0 鍒?100 涔嬮棿';
   }
 
   const switchDelta = Number(parserConfig.value.hybrid_switch_min_delta);
   if (!Number.isFinite(switchDelta) || switchDelta < 0 || switchDelta > 50) {
-    errors.hybrid_switch_min_delta = '切换分差阈值需在 0 到 50 之间';
+    errors.hybrid_switch_min_delta = '鍒囨崲鍒嗗樊闃堝€奸渶鍦?0 鍒?50 涔嬮棿';
   }
 
   const markerMinLen = Number(parserConfig.value.hybrid_marker_min_length);
   if (!Number.isInteger(markerMinLen) || markerMinLen < 0 || markerMinLen > 1000000) {
-    errors.hybrid_marker_min_length = 'Marker 最小长度需为 0 到 1000000 的整数';
+    errors.hybrid_marker_min_length = 'Marker 最小长度需在 0 到 1000000 的整数范围';
   }
 
   const taskTimeout = Number(parserConfig.value.task_timeout_seconds);
   if (!Number.isInteger(taskTimeout) || taskTimeout < 60 || taskTimeout > 7200) {
-    errors.task_timeout_seconds = '任务超时时间需为 60 到 7200 的整数（秒）';
+    errors.task_timeout_seconds = '浠诲姟瓒呮椂鏃堕棿闇€涓?60 鍒?7200 鐨勬暣鏁帮紙绉掞級';
   }
 
   const engineConcurrency = Number(advancedConfig.value.engine_concurrency);
   if (!Number.isInteger(engineConcurrency) || engineConcurrency < 1 || engineConcurrency > 10) {
-    errors.engine_concurrency = '并发限制需在 1 到 10 之间';
+    errors.engine_concurrency = '骞跺彂闄愬埗闇€鍦?1 鍒?10 涔嬮棿';
   }
 
   const engineTemp = Number(advancedConfig.value.engine_temperature);
   if (!Number.isFinite(engineTemp) || engineTemp < 0 || engineTemp > 1) {
-    errors.engine_temperature = '思维发散度需在 0 到 1 之间';
+    errors.engine_temperature = '鎬濈淮鍙戞暎搴﹂渶鍦?0 鍒?1 涔嬮棿';
   }
 
   const maxTokens = Number(advancedConfig.value.engine_max_tokens);
   if (!Number.isInteger(maxTokens) || maxTokens < 1000 || maxTokens > 16000) {
-    errors.engine_max_tokens = '最大返回限制需在 1000 到 16000 之间';
+    errors.engine_max_tokens = '鏈€澶ц繑鍥為檺鍒堕渶鍦?1000 鍒?16000 涔嬮棿';
   }
 
   return errors;
@@ -522,7 +537,7 @@ const hasAdvancedValidationErrors = computed(() => advancedErrorKeys.some((key) 
 
 const isSettingsSaveDisabled = computed(() => configLoading.value || hasParserValidationErrors.value || hasLlmValidationErrors.value || hasAdvancedValidationErrors.value);
 
-// 检测是否为 MiniMax 2.5 系列模型
+// 妫€娴嬫槸鍚︿负 MiniMax 2.5 绯诲垪妯″瀷
 const isMiniMax25 = (model) => {
   if (!model) return false;
   const minimaxModels = ['MiniMax-M2.5', 'MiniMax-M2.5-highspeed', 'abab6.5s-chat', 'abab6.5g-chat'];
@@ -645,7 +660,7 @@ const isEmptyServerErrorResponse = (response, payload) => {
   return payload == null;
 };
 
-const backendUnavailableMessage = '后端服务不可用，请确认后端已启动并监听 http://localhost:8000';
+const backendUnavailableMessage = '鍚庣鏈嶅姟涓嶅彲鐢紝璇风‘璁ゅ悗绔凡鍚姩骞剁洃鍚?http://localhost:8000';
 
 const normalizeBackendError = async (response, fallbackMessage) => {
   try {
@@ -668,7 +683,7 @@ const exportConfig = async () => {
   try {
     const response = await fetch('/api/config/export');
     if (!response.ok) {
-      const err = await normalizeBackendError(response, '导出配置失败');
+      const err = await normalizeBackendError(response, '瀵煎嚭閰嶇疆澶辫触');
       notify('error', `${getErrorHint(err.code, err.message)} (${err.code})`);
       return;
     }
@@ -685,7 +700,7 @@ const exportConfig = async () => {
     configOperationMsg.value = '配置已导出（不含明文密钥）';
     notify('success', '配置已导出（不含明文密钥）');
   } catch (err) {
-    notify('error', `导出配置失败: ${err.message}`);
+    notify('error', `瀵煎嚭閰嶇疆澶辫触: ${err.message}`);
   }
 };
 
@@ -714,21 +729,21 @@ const importConfigFromFile = async (event) => {
       body: JSON.stringify(payload)
     });
     if (!response.ok) {
-      const err = await normalizeBackendError(response, '导入配置失败');
+      const err = await normalizeBackendError(response, '瀵煎叆閰嶇疆澶辫触');
       notify('error', `${getErrorHint(err.code, err.message)} (${err.code})`);
       return;
     }
     const result = await response.json();
     await loadConfig();
-    configOperationMsg.value = `${result.message || '配置导入成功'}，请检查后保存`;
-    notify('success', result.message || '配置导入成功');
+    configOperationMsg.value = `${result.message || '閰嶇疆瀵煎叆鎴愬姛'}锛岃妫€鏌ュ悗淇濆瓨`;
+    notify('success', result.message || '閰嶇疆瀵煎叆鎴愬姛');
   } catch (err) {
-    notify('error', `导入配置失败: ${err.message}`);
+    notify('error', `瀵煎叆閰嶇疆澶辫触: ${err.message}`);
   }
 };
 
 const normalizeConfigStore = (raw) => {
-  // 兼容 legacy 单配置格式
+  // 鍏煎 legacy 鍗曢厤缃牸寮?
   if (!raw?.profiles || !Array.isArray(raw.profiles)) {
     const fallback = createProfile({
       name: 'Default',
@@ -800,7 +815,7 @@ const normalizeConfigStore = (raw) => {
   };
 };
 
-// 轮询相关
+// 杞鐩稿叧
 const currentTaskId = ref(null);
 const pollTimer = ref(null);
 const taskStatus = ref('');
@@ -823,7 +838,10 @@ const sourceView = ref({
   lineStart: 0,
   lineEnd: 0,
   excerptLines: [],
-  parserBackend: 'unknown'
+  parserBackend: 'unknown',
+  pdfPageNo: null,
+  pdfYRatio: null,
+  pdfLoadError: ''
 });
 let sourceRequestToken = 0;
 
@@ -837,7 +855,7 @@ const isUploadStage = computed(() => {
 
 const chunkProgress = computed(() => {
   const text = String(taskMessage.value || '');
-  const match = text.match(/(?:章节|chunk)\s*(\d+)\s*\/\s*(\d+)/i);
+  const match = text.match(/(?:绔犺妭|chunk)\s*(\d+)\s*\/\s*(\d+)/i);
   if (!match) return { completed: 0, total: 0 };
   const completed = Number(match[1] || 0);
   const total = Number(match[2] || 0);
@@ -888,6 +906,16 @@ const isTabletViewport = computed(() => viewportWidth.value >= 768 && viewportWi
 const showDetailPane = computed(() => viewportWidth.value > 1024);
 const showMindmapCanvas = computed(() => Boolean(currentFileId.value) && isMindmapReady.value);
 const showMindmapToolbar = computed(() => showMindmapCanvas.value && !isLoading.value);
+const currentPdfSourceUrl = computed(() => {
+  if (!currentFileId.value) return '';
+  return `/api/file/${currentFileId.value}/pdf`;
+});
+const canUseVirtualPdf = computed(() => Boolean(systemFeatures.value?.FEATURE_VIRTUAL_PDF));
+const hasPdfAnchor = computed(() => {
+  const pageNo = Number(sourceView.value.pdfPageNo);
+  return Number.isInteger(pageNo) && pageNo > 0;
+});
+const showPdfViewer = computed(() => canUseVirtualPdf.value && hasPdfAnchor.value && Boolean(currentPdfSourceUrl.value));
 const workspaceGridStyle = computed(() => {
   if (!showDetailPane.value) {
     return { gridTemplateColumns: 'minmax(0, 1fr)' };
@@ -898,7 +926,13 @@ const workspaceGridStyle = computed(() => {
 });
 const topNoticeVisible = computed(() => isLoading.value || Boolean(errorMsg.value));
 
-// 加载历史记录
+watch(showPdfViewer, (visible) => {
+  if (visible) {
+    void prefetchPdfViewerAssets();
+  }
+});
+
+// 鍔犺浇鍘嗗彶璁板綍
 const loadHistory = async () => {
   try {
     const response = await fetch('/api/history');
@@ -906,7 +940,7 @@ const loadHistory = async () => {
       history.value = await response.json();
     }
   } catch (err) {
-    console.error('加载历史失败:', err);
+    console.error('鍔犺浇鍘嗗彶澶辫触:', err);
   }
 };
 
@@ -920,7 +954,10 @@ const resetSourceView = () => {
     lineStart: 0,
     lineEnd: 0,
     excerptLines: [],
-    parserBackend: 'unknown'
+    parserBackend: 'unknown',
+    pdfPageNo: null,
+    pdfYRatio: null,
+    pdfLoadError: ''
   };
 };
 
@@ -933,7 +970,7 @@ const loadTreeForFile = async (fileId) => {
   try {
     const response = await fetch(`/api/file/${fileId}/tree`);
     if (!response.ok) {
-      throw new Error('无法加载节点索引');
+      throw new Error('鏃犳硶鍔犺浇鑺傜偣绱㈠紩');
     }
     const data = await response.json();
     treeData.value = data.tree || null;
@@ -941,7 +978,7 @@ const loadTreeForFile = async (fileId) => {
   } catch (err) {
     treeData.value = null;
     flatNodes.value = [];
-    console.error('加载节点树失败:', err);
+    console.error('鍔犺浇鑺傜偣鏍戝け璐?', err);
   }
 };
 
@@ -987,10 +1024,11 @@ const loadNodeSource = async (nodeId) => {
   const requestedFileId = currentFileId.value;
   sourceView.value.loading = true;
   sourceView.value.error = '';
+  sourceView.value.pdfLoadError = '';
   try {
     const response = await fetch(`/api/file/${requestedFileId}/node/${nodeId}/source?context_lines=2&max_lines=120`);
     if (!response.ok) {
-      throw new Error('节点原文加载失败');
+      throw new Error('鑺傜偣鍘熸枃鍔犺浇澶辫触');
     }
     const data = await response.json();
     if (requestToken !== sourceRequestToken || currentFileId.value !== requestedFileId) {
@@ -1003,14 +1041,17 @@ const loadNodeSource = async (nodeId) => {
       lineStart: data.line_start || 0,
       lineEnd: data.line_end || 0,
       excerptLines: Array.isArray(data.excerpt_lines) ? data.excerpt_lines : [],
-      parserBackend: data.capabilities?.parser_backend ?? 'unknown'
+      parserBackend: data.capabilities?.parser_backend ?? 'unknown',
+      pdfPageNo: Number.isInteger(Number(data.pdf_page_no)) ? Number(data.pdf_page_no) : null,
+      pdfYRatio: Number.isFinite(Number(data.pdf_y_ratio)) ? Number(data.pdf_y_ratio) : null,
+      pdfLoadError: ''
     };
   } catch (err) {
     if (requestToken !== sourceRequestToken || currentFileId.value !== requestedFileId) {
       return;
     }
     sourceView.value.loading = false;
-    sourceView.value.error = err.message || '节点原文加载失败';
+    sourceView.value.error = err.message || '鑺傜偣鍘熸枃鍔犺浇澶辫触';
   }
 };
 
@@ -1020,12 +1061,15 @@ const handleMindmapNodeClick = async (payload) => {
     selectedNode.value = payload || null;
     sourceView.value = {
       loading: false,
-      error: fallback.excerptLines.length ? '' : '该节点暂无可追溯索引，请选择结构化节点。',
+      error: fallback.excerptLines.length ? '' : 'No traceable index for this node. Please select a structured node.',
       topic: payload?.topic || '',
       lineStart: fallback.lineStart,
       lineEnd: fallback.lineEnd,
       excerptLines: fallback.excerptLines,
-      parserBackend: fallback.excerptLines.length ? 'local-fallback' : (sourceView.value.parserBackend || 'unknown')
+      parserBackend: fallback.excerptLines.length ? 'local-fallback' : (sourceView.value.parserBackend || 'unknown'),
+      pdfPageNo: null,
+      pdfYRatio: null,
+      pdfLoadError: ''
     };
     return;
   }
@@ -1033,8 +1077,19 @@ const handleMindmapNodeClick = async (payload) => {
   await loadNodeSource(payload.nodeId);
 };
 
+const handlePdfViewerLoaded = () => {
+  if (sourceView.value.pdfLoadError) {
+    sourceView.value.pdfLoadError = '';
+  }
+};
+
+const handlePdfViewerError = (payload) => {
+  const message = payload?.message || 'PDF 娓叉煋澶辫触';
+  sourceView.value.pdfLoadError = message;
+};
+
 const handleMindmapFeedback = (payload) => {
-  const message = payload?.message || '操作失败，请重试';
+  const message = payload?.message || '鎿嶄綔澶辫触锛岃閲嶈瘯';
   const type = payload?.type || 'info';
   notify(type, message);
 };
@@ -1046,13 +1101,13 @@ const handleMindmapZoomChange = (payload) => {
   }
 };
 
-// 加载文件内容
+// 鍔犺浇鏂囦欢鍐呭
 const loadFile = async (fileId) => {
   try {
     resetSourceView();
     const response = await fetch(`/api/file/${fileId}`);
     if (!response.ok) {
-      throw new Error('文件加载失败');
+      throw new Error('鏂囦欢鍔犺浇澶辫触');
     }
     const data = await response.json();
     mindmapData.value = data.content;
@@ -1063,14 +1118,14 @@ const loadFile = async (fileId) => {
     isLoading.value = false;
   } catch (err) {
     errorMsg.value = err.message;
-    console.error('加载文件失败:', err);
+    console.error('鍔犺浇鏂囦欢澶辫触:', err);
   }
 };
 
-// 删除文件
+// 鍒犻櫎鏂囦欢
 const deleteFile = async (fileId, event) => {
   event.stopPropagation();
-  if (!confirm('确定要删除这个文件吗？')) return;
+  if (!confirm('Are you sure you want to delete this file?')) return;
   
   try {
     const response = await fetch(`/api/file/${fileId}`, {
@@ -1088,11 +1143,11 @@ const deleteFile = async (fileId, event) => {
       }
     }
   } catch (err) {
-    console.error('删除失败:', err);
+    console.error('鍒犻櫎澶辫触:', err);
   }
 };
 
-// 清理轮询
+// 娓呯悊杞
 const cleanupPoll = () => {
   if (pollTimer.value) {
     clearInterval(pollTimer.value);
@@ -1117,78 +1172,83 @@ onUnmounted(() => {
   toastTimers.clear();
 });
 
-// 轮询任务状态
-const pollTaskStatus = async (taskId) => {
+// 杞浠诲姟鐘舵€?
+const pollTaskStatus = async (docId, taskId = '') => {
+  if (!docId && !taskId) return;
   try {
-    const response = await fetch(`/api/task/${taskId}`);
-    
+    const response = docId
+      ? await fetch(`/api/documents/${docId}/status`)
+      : await fetch(`/api/task/${taskId}`);
+
     if (response.status === 404) {
       cleanupPoll();
       isLoading.value = false;
-      errorMsg.value = '任务状态不存在，可能是后端重启导致。请重新上传或从历史记录打开文件。';
+      errorMsg.value = 'Task status not found';
       await loadHistory();
       return;
     }
-    
+
     if (!response.ok) {
       throw new Error(`Status check failed: ${response.statusText}`);
     }
-    
+
     const data = await response.json();
-    
+
     taskStatus.value = data.status;
     taskProgress.value = data.progress;
     taskMessage.value = data.message;
-    
-    if (data.status === 'completed') {
+
+    if (data.status === 'completed' || data.status === 'completed_with_gaps') {
       cleanupPoll();
-      mindmapData.value = data.result;
-      isMindmapReady.value = true;
-      if (data.file_id) {
-        currentFileId.value = data.file_id;
-        await loadTreeForFile(data.file_id);
+      const resolvedFileId = data.doc_id || data.file_id || docId;
+      if (resolvedFileId) {
+        currentFileId.value = resolvedFileId;
+        await loadTreeForFile(resolvedFileId);
+        await loadFile(resolvedFileId);
+      } else if (data.result) {
+        mindmapData.value = data.result;
+        isMindmapReady.value = true;
       }
       await syncMindMapZoom();
       isLoading.value = false;
       uploadProgress.value = 0;
       if (fileInput.value) fileInput.value.value = '';
       await loadHistory();
-    } 
-    else if (data.status === 'failed') {
+    } else if (data.status === 'failed') {
       cleanupPoll();
       isMindmapReady.value = false;
-      errorMsg.value = data.error || '处理失败';
+      errorMsg.value = data.error || 'Processing failed';
+      isLoading.value = false;
+      uploadProgress.value = 0;
+      await loadHistory();
+    } else if (data.status === 'cancelled') {
+      cleanupPoll();
+      isMindmapReady.value = false;
+      errorMsg.value = data.message || 'Task cancelled';
       isLoading.value = false;
       uploadProgress.value = 0;
       await loadHistory();
     }
-    else if (data.status === 'cancelled') {
-      cleanupPoll();
-      isMindmapReady.value = false;
-      errorMsg.value = data.message || '任务已取消';
-      isLoading.value = false;
-      uploadProgress.value = 0;
-      await loadHistory();
-    }
-    
+
   } catch (err) {
-    console.error("Poll error:", err);
+    console.error('Poll error:', err);
   }
 };
 
-const requestTaskCancel = async (taskId, reason = '已手动取消') => {
-  if (!taskId) return;
+const requestTaskCancel = async (taskId, reason = 'manual cancel', docId = null) => {
+  if (!taskId && !docId) return;
   try {
-    const response = await fetch(`/api/task/${taskId}/cancel`, {
+    const endpoint = docId ? `/api/documents/${docId}/cancel` : `/api/task/${taskId}/cancel`;
+    const response = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reason })
     });
     if (!response.ok) {
-      console.warn('取消任务请求失败:', response.status);
+      console.warn('Cancel request failed:', response.status);
     }
   } catch (err) {
-    console.warn('取消任务请求异常:', err);
+    console.warn('Cancel request error:', err);
   }
 };
 
@@ -1196,15 +1256,14 @@ const checkPollTimeout = async () => {
   if (pollStartTime && Date.now() - pollStartTime > pollTimeoutMs.value) {
     const timeoutSeconds = Math.round(pollTimeoutMs.value / 1000);
     const taskId = currentTaskId.value;
-    await requestTaskCancel(taskId, `前端等待超时（${timeoutSeconds}秒）自动取消`);
+    await requestTaskCancel(taskId, `timeout after ${timeoutSeconds}s`, currentFileId.value);
     cleanupPoll();
     isMindmapReady.value = false;
-    errorMsg.value = `处理超时（>${timeoutSeconds}秒），任务已取消`;
+    errorMsg.value = `Processing timeout (${timeoutSeconds}s), task cancelled`;
     isLoading.value = false;
     await loadHistory();
   }
 };
-
 const uploadPdfFile = (file) => new Promise((resolve, reject) => {
   const formData = new FormData();
   formData.append('file', file);
@@ -1218,7 +1277,7 @@ const uploadPdfFile = (file) => new Promise((resolve, reject) => {
     const percent = Math.round((event.loaded / event.total) * 100);
     uploadProgress.value = Math.max(1, Math.min(100, percent));
     taskStatus.value = 'uploading';
-    taskMessage.value = `正在上传文件... ${uploadProgress.value}%`;
+    taskMessage.value = `姝ｅ湪涓婁紶鏂囦欢... ${uploadProgress.value}%`;
   };
 
   xhr.onload = () => {
@@ -1227,7 +1286,7 @@ const uploadPdfFile = (file) => new Promise((resolve, reject) => {
       try {
         payload = JSON.parse(xhr.responseText);
       } catch (err) {
-        reject(new Error('上传响应解析失败'));
+        reject(new Error('涓婁紶鍝嶅簲瑙ｆ瀽澶辫触'));
         return;
       }
     }
@@ -1239,32 +1298,31 @@ const uploadPdfFile = (file) => new Promise((resolve, reject) => {
     resolve(payload || {});
   };
 
-  xhr.onerror = () => reject(new Error('网络异常，上传失败'));
-  xhr.onabort = () => reject(new Error('上传已取消'));
+  xhr.onerror = () => reject(new Error('Network error, upload failed'));
+  xhr.onabort = () => reject(new Error('Upload aborted'));
   xhr.send(formData);
 });
 
 const handleSelectedFile = async (file, clearInput) => {
   if (!file) return;
   if (!isPdfFile(file)) {
-    errorMsg.value = '请上传 PDF 格式的文件';
+    errorMsg.value = 'Please upload a PDF file';
     if (typeof clearInput === 'function') clearInput();
     return;
   }
 
-  // [新增] 硬件性能检查拦截
+  // [鏂板] 纭欢鎬ц兘妫€鏌ユ嫤鎴?
   if (hardwareType.value === 'cpu') {
       const confirmCpu = window.confirm(
-          "⚠️ 性能效能提醒\n\n" +
-          "服务器当前正在使用 CPU 进行运算。\n" +
-          "解析大文件可能需要较长时间（预计 2-5 分钟）。\n\n" +
-          "建议使用支持 GPU (CUDA) 或 Mac (MPS) 的设备以获得最佳速度。\n\n" +
-          "是否仍要继续上传？"
+          "Performance reminder\n\n" +
+          "Current backend is running on CPU.\n" +
+          "Large files may take longer to process.\n\n" +
+          "Continue upload?"
       );
       
       if (!confirmCpu) {
           if (typeof clearInput === 'function') clearInput();
-          return; // 终止上传
+          return; // 缁堟涓婁紶
       }
   }
 
@@ -1280,7 +1338,7 @@ const handleSelectedFile = async (file, clearInput) => {
   taskStatus.value = 'pending';
   taskProgress.value = 0;
   uploadProgress.value = 0;
-  taskMessage.value = '正在上传文件...';
+  taskMessage.value = '姝ｅ湪涓婁紶鏂囦欢...';
 
   try {
     const data = await uploadPdfFile(file);
@@ -1293,11 +1351,11 @@ const handleSelectedFile = async (file, clearInput) => {
       if (data.status === 'completed') {
         mindmapData.value = data.existing_md;
         isMindmapReady.value = true;
-        currentFileId.value = data.file_id;
+        currentFileId.value = data.doc_id || data.file_id;
         await loadTreeForFile(data.file_id);
         isLoading.value = false;
         uploadProgress.value = 0;
-        notify('info', '该文件已存在，已直接加载历史结果');
+        notify('info', '璇ユ枃浠跺凡瀛樺湪锛屽凡鐩存帴鍔犺浇鍘嗗彶缁撴灉');
         if (typeof clearInput === 'function') clearInput();
         return;
       }
@@ -1309,39 +1367,39 @@ const handleSelectedFile = async (file, clearInput) => {
         currentFileId.value = data.file_id;
         pollStartTime = Date.now();
         taskStatus.value = 'processing';
-        taskMessage.value = data.message || '检测到相同文件正在处理中，已连接到现有任务';
+        taskMessage.value = data.message || '妫€娴嬪埌鐩稿悓鏂囦欢姝ｅ湪澶勭悊涓紝宸茶繛鎺ュ埌鐜版湁浠诲姟';
 
         pollTimer.value = setInterval(() => {
           void checkPollTimeout();
           if (currentTaskId.value) {
-            void pollTaskStatus(currentTaskId.value);
+            void pollTaskStatus(currentFileId.value, currentTaskId.value);
           }
         }, POLL_INTERVAL);
-        void pollTaskStatus(data.task_id);
+        void pollTaskStatus(currentFileId.value, data.task_id);
         await loadHistory();
         return;
       }
     }
 
     if (!data.task_id) {
-      throw new Error('未获取到任务ID');
+      throw new Error('鏈幏鍙栧埌浠诲姟ID');
     }
 
     uploadProgress.value = 0;
     isMindmapReady.value = false;
     currentTaskId.value = data.task_id;
-    currentFileId.value = data.file_id;
+    currentFileId.value = data.doc_id || data.file_id;
     pollStartTime = Date.now();
     taskStatus.value = 'processing';
     
     pollTimer.value = setInterval(() => {
       void checkPollTimeout();
       if (currentTaskId.value) {
-        void pollTaskStatus(currentTaskId.value);
+        void pollTaskStatus(currentFileId.value, currentTaskId.value);
       }
     }, POLL_INTERVAL);
     
-    void pollTaskStatus(data.task_id);
+    void pollTaskStatus(currentFileId.value, data.task_id);
     await loadHistory();
     
   } catch (err) {
@@ -1366,13 +1424,13 @@ const handleFileUpload = async (event) => {
 
 const cancelTask = async () => {
   if (currentTaskId.value) {
-    await requestTaskCancel(currentTaskId.value, '用户手动取消任务');
+    await requestTaskCancel(currentTaskId.value, 'user cancelled', currentFileId.value);
   }
   cleanupPoll();
   isLoading.value = false;
   uploadProgress.value = 0;
   taskProgress.value = 0;
-  taskMessage.value = '任务已取消';
+  taskMessage.value = 'Task cancelled';
   await loadHistory();
 };
 
@@ -1400,11 +1458,11 @@ const formatDateTime = (dateStr) => {
 };
 
 const rebuildActionLabel = (action) => {
-  if (action === 'rebuilt') return '已重建';
-  if (action === 'would_rebuild') return '预览重建';
-  if (action === 'skipped') return '已跳过';
-  if (action === 'failed') return '失败';
-  return action || '未知';
+  if (action === 'rebuilt') return 'rebuilt';
+  if (action === 'would_rebuild') return '棰勮閲嶅缓';
+  if (action === 'skipped') return 'skipped';
+  if (action === 'failed') return '澶辫触';
+  return action || '鏈煡';
 };
 
 const rebuildActionClass = (action) => {
@@ -1427,7 +1485,7 @@ onMounted(() => {
   loadFeatures();
 });
 
-// 获取系统功能开关
+// 鑾峰彇绯荤粺鍔熻兘寮€鍏?
 const loadFeatures = async () => {
   try {
     const response = await fetch('/api/system/features');
@@ -1440,7 +1498,7 @@ const loadFeatures = async () => {
   }
 };
 
-// 检查硬件状态
+// 妫€鏌ョ‖浠剁姸鎬?
 const checkHardware = async () => {
     try {
         const response = await fetch('/api/system/hardware');
@@ -1454,7 +1512,7 @@ const checkHardware = async () => {
     }
 };
 
-// 加载配置
+// 鍔犺浇閰嶇疆
 const loadConfig = async () => {
   try {
     const response = await fetch('/api/config');
@@ -1469,11 +1527,11 @@ const loadConfig = async () => {
       loadProfileIntoEditor(activeProfileId.value);
       configOperationMsg.value = '';
     } else {
-      const err = await normalizeBackendError(response, '加载配置失败');
-      console.error('加载配置失败:', err);
+      const err = await normalizeBackendError(response, '鍔犺浇閰嶇疆澶辫触');
+      console.error('鍔犺浇閰嶇疆澶辫触:', err);
     }
   } catch (err) {
-    console.error('加载配置失败:', err);
+    console.error('鍔犺浇閰嶇疆澶辫触:', err);
   }
 };
 
@@ -1484,7 +1542,7 @@ const firstFieldErrorMessage = (keys) => {
   return '';
 };
 
-// 保存配置
+// 淇濆瓨閰嶇疆
 const saveConfig = async (scope = 'all', options = {}) => {
   const {
     silent = false,
@@ -1499,11 +1557,11 @@ const saveConfig = async (scope = 'all', options = {}) => {
   const scopedError = firstFieldErrorMessage(keys);
   if (scopedError) {
     if (scope === 'advanced') advancedAutoSaveState.value = 'error';
-    if (!silent) notify('warning', scopedError || '请先修正配置项');
+    if (!silent) notify('warning', scopedError || 'Please fix config fields first');
     return;
   }
   if (scope === 'all' && hasValidationErrors.value) {
-    const firstMessage = Object.values(fieldErrors.value)[0] || '请先修正配置项';
+    const firstMessage = Object.values(fieldErrors.value)[0] || 'Please fix config fields first';
     if (!silent) notify('warning', firstMessage);
     return;
   }
@@ -1536,28 +1594,28 @@ const saveConfig = async (scope = 'all', options = {}) => {
       if (scope === 'advanced') {
         advancedAutoSaveState.value = 'saved';
       } else if (!silent) {
-        notify('success', '配置已保存');
+        notify('success', 'Config saved');
       }
       if (!silent) {
-        configOperationMsg.value = '配置已保存并生效';
+        configOperationMsg.value = '閰嶇疆宸蹭繚瀛樺苟鐢熸晥';
       }
     } else {
       const detail = data?.detail || data;
       const code = detail?.code || data?.code || (response.ok ? 'UNKNOWN_ERROR' : `HTTP_${response.status}`);
       const message = typeof detail === 'string'
         ? detail
-        : (detail?.message || data?.message || response.statusText || '未知错误');
+        : (detail?.message || data?.message || response.statusText || '鏈煡閿欒');
       if (scope === 'advanced') {
         advancedAutoSaveState.value = 'error';
       } else if (!silent) {
-        notify('error', `保存失败: ${getErrorHint(code, message)} (${code})`);
+        notify('error', `淇濆瓨澶辫触: ${getErrorHint(code, message)} (${code})`);
       }
     }
   } catch (err) {
     if (scope === 'advanced') {
       advancedAutoSaveState.value = 'error';
     } else if (!silent) {
-      notify('error', `保存失败: ${err.message || backendUnavailableMessage}`);
+      notify('error', `淇濆瓨澶辫触: ${err.message || backendUnavailableMessage}`);
     }
   }
   configLoading.value = false;
@@ -1573,10 +1631,10 @@ const scheduleAdvancedAutoSave = () => {
   }, 360);
 };
 
-// 测试配置
+// 娴嬭瘯閰嶇疆
 const testConfig = async () => {
   if (!canTestConfig.value) {
-    const firstMessage = Object.values(fieldErrors.value)[0] || '请先修正配置项';
+    const firstMessage = Object.values(fieldErrors.value)[0] || 'Please fix config fields first';
     notify('warning', firstMessage);
     return;
   }
@@ -1600,7 +1658,7 @@ const testConfig = async () => {
     }
     const success = response.ok ? (result?.success !== false) : false;
     const code = result?.code || (success ? 'OK' : `HTTP_${response.status}`);
-    const message = result?.message || (success ? '连接测试完成' : (response.statusText || '连接测试失败'));
+    const message = result?.message || (success ? '杩炴帴娴嬭瘯瀹屾垚' : (response.statusText || '杩炴帴娴嬭瘯澶辫触'));
     configTestResult.value = {
       ...(result || {}),
       success,
@@ -1616,7 +1674,7 @@ const testConfig = async () => {
 
 const loadModels = async () => {
   if (!canTestConfig.value) {
-    const firstMessage = Object.values(fieldErrors.value)[0] || '请先修正配置项';
+    const firstMessage = Object.values(fieldErrors.value)[0] || 'Please fix config fields first';
     notify('warning', firstMessage);
     return;
   }
@@ -1641,7 +1699,7 @@ const loadModels = async () => {
     if (!data) {
       modelFetchResult.value = {
         success: false,
-        message: response.ok ? '服务端未返回模型列表数据' : (response.statusText || '拉取模型列表失败'),
+        message: response.ok ? '鏈嶅姟绔湭杩斿洖妯″瀷鍒楄〃鏁版嵁' : (response.statusText || '鎷夊彇妯″瀷鍒楄〃澶辫触'),
         source: 'none',
         code: response.ok ? 'EMPTY_RESPONSE' : `HTTP_${response.status}`
       };
@@ -1659,7 +1717,7 @@ const loadModels = async () => {
       modelFetchResult.value = {
         ...data,
         success: false,
-        message: data?.message || response.statusText || '拉取模型列表失败',
+        message: data?.message || response.statusText || '鎷夊彇妯″瀷鍒楄〃澶辫触',
         source: data?.source || 'none',
         code: data?.code || `HTTP_${response.status}`
       };
@@ -1695,7 +1753,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
     if (!response.ok) {
       const detail = data?.detail || data;
       const code = detail?.code || `HTTP_${response.status}`;
-      const message = detail?.message || response.statusText || '索引重建失败';
+      const message = detail?.message || response.statusText || '绱㈠紩閲嶅缓澶辫触';
       notify('error', `${getErrorHint(code, message)} (${code})`);
       return;
     }
@@ -1706,15 +1764,15 @@ const runSourceIndexRebuild = async (dryRun = false) => {
     const skipped = Number(summary.skipped || 0);
     const scanned = Number(summary.scanned || 0);
     if (failed > 0) {
-      notify('warning', `完成但存在失败：扫描 ${scanned}，重建 ${rebuilt}，跳过 ${skipped}，失败 ${failed}`);
+      notify('warning', `瀹屾垚浣嗗瓨鍦ㄥけ璐ワ細鎵弿 ${scanned}锛岄噸寤?${rebuilt}锛岃烦杩?${skipped}锛屽け璐?${failed}`);
     } else {
-      notify('success', `${dryRun ? '预览完成' : '重建完成'}：扫描 ${scanned}，重建 ${rebuilt}，跳过 ${skipped}`);
+      notify('success', `${dryRun ? '棰勮瀹屾垚' : '閲嶅缓瀹屾垚'}锛氭壂鎻?${scanned}锛岄噸寤?${rebuilt}锛岃烦杩?${skipped}`);
     }
     if (!dryRun) {
       await loadHistory();
     }
   } catch (err) {
-    notify('error', `索引重建失败: ${err.message || backendUnavailableMessage}`);
+    notify('error', `绱㈠紩閲嶅缓澶辫触: ${err.message || backendUnavailableMessage}`);
   } finally {
     sourceIndexRebuildRunning.value = false;
   }
@@ -1729,7 +1787,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
     @dragleave.prevent="onDragLeave"
     @drop.prevent="onDrop"
   >
-    <!-- 全局拖拽悬浮层 -->
+    <!-- 鍏ㄥ眬鎷栨嫿鎮诞灞?-->
     <div
       v-if="isDraggingFile"
       class="absolute inset-0 z-[100] bg-blue-500/10 backdrop-blur-sm m-4 rounded-3xl border-4 border-dashed border-blue-400 flex items-center justify-center transition-all duration-300 pointer-events-none"
@@ -1742,7 +1800,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
       </div>
     </div>
 
-    <!-- Toast 通知 -->
+    <!-- Toast 閫氱煡 -->
     <TransitionGroup name="toast" tag="div" class="fixed top-4 right-4 z-[120] flex flex-col gap-2 w-[min(92vw,360px)] pointer-events-none">
       <div
         v-for="item in toasts"
@@ -1757,18 +1815,18 @@ const runSourceIndexRebuild = async (dryRun = false) => {
           class="text-current/70 hover:text-current rounded-md px-1 transition-all duration-200"
           aria-label="close toast"
         >
-          ×
+          脳
         </button>
       </div>
     </TransitionGroup>
 
-    <!-- 侧边栏 - 可折叠 + 可拖拽 -->
+    <!-- 渚ц竟鏍?- 鍙姌鍙?+ 鍙嫋鎷?-->
     <aside
       class="app-panel elev-md flex-shrink-0 backdrop-blur-xl flex flex-col overflow-hidden transition-[width,opacity] duration-300 ease-out"
       :style="{ width: showSidebar ? `${sidebarWidth}px` : '0px' }"
       :class="showSidebar ? 'opacity-100 border-r border-slate-200/60' : 'opacity-0 border-r-0 pointer-events-none'"
     >
-      <!-- Logo 区域 -->
+      <!-- Logo 鍖哄煙 -->
       <div class="brand-banner h-14 px-4 flex items-center border-b border-slate-200/40">
         <div class="flex items-center gap-2.5">
           <div class="w-8 h-8 bg-white/20 backdrop-blur-sm rounded-lg flex items-center justify-center text-white text-sm font-bold shadow-lg">
@@ -1781,11 +1839,11 @@ const runSourceIndexRebuild = async (dryRun = false) => {
         </div>
       </div>
 
-      <!-- 文件列表 -->
+      <!-- 鏂囦欢鍒楄〃 -->
       <div class="flex-grow overflow-y-auto p-3 bg-slate-50/50">
         <div class="flex items-center justify-between mb-3 px-2">
           <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider">
-            历史文件
+            鍘嗗彶鏂囦欢
           </div>
           <span class="text-[10px] px-2 py-0.5 bg-slate-200/60 text-slate-600 rounded-full">{{ history.length }}</span>
         </div>
@@ -1794,7 +1852,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
           <svg class="w-12 h-12 mx-auto mb-2 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
           </svg>
-          暂无文件记录
+          鏆傛棤鏂囦欢璁板綍
         </div>
 
         <div v-else class="space-y-1.5">
@@ -1819,8 +1877,8 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                         ? 'bg-amber-100 text-amber-600'
                         : 'bg-rose-100 text-rose-600'"
                   >
-                    <span v-if="item.status === 'completed'">✓</span>
-                    <span v-else-if="item.status === 'processing'">⟳</span>
+                    <span v-if="item.status === 'completed'">OK</span>
+                    <span v-else-if="item.status === 'processing'">...</span>
                     <span v-else>!</span>
                   </span>
                   <span class="text-[10px] text-slate-400">{{ formatDate(item.created_at) }}</span>
@@ -1840,7 +1898,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
         </div>
       </div>
 
-      <!-- 底部提示 -->
+      <!-- 搴曢儴鎻愮ず -->
       <div class="p-3 border-t border-slate-200/60 bg-gradient-to-r from-slate-50 to-blue-50/30">
         <div class="text-[10px] text-slate-400 text-center">
           Powered by <span class="font-medium text-slate-500">IBM Docling</span> & <span class="font-medium text-slate-500">DeepSeek</span>
@@ -1860,9 +1918,9 @@ const runSourceIndexRebuild = async (dryRun = false) => {
       </div>
     </div>
 
-    <!-- 主内容区 -->
+    <!-- 涓诲唴瀹瑰尯 -->
     <div class="flex-grow flex flex-col min-w-0">
-      <!-- 顶部导航栏 -->
+      <!-- 椤堕儴瀵艰埅鏍?-->
       <header class="app-toolbar flex-shrink-0 backdrop-blur-xl border-b border-slate-200/40 shadow-sm">
         <div class="h-14 flex items-center justify-between px-4">
           <div class="flex items-center gap-3">
@@ -1893,7 +1951,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path>
                 </svg>
-                上传 PDF
+                涓婁紶 PDF
               </span>
             </label>
           </div>
@@ -1903,19 +1961,19 @@ const runSourceIndexRebuild = async (dryRun = false) => {
               v-if="isTabletViewport"
               class="hidden md:inline-flex text-[11px] px-2 py-1 rounded-full bg-slate-100 text-slate-500"
             >
-              平板宽度已自动隐藏原文区
+              骞虫澘瀹藉害宸茶嚜鍔ㄩ殣钘忓師鏂囧尯
             </span>
             <button
               @click="openSettingsPage"
               data-testid="settings-open-btn"
               class="flex items-center gap-2 px-3 py-2 rounded-xl text-slate-500 hover:text-indigo-600 hover:bg-indigo-50/80 transition-all duration-200 border border-transparent hover:border-indigo-100 font-medium"
-              title="系统设置"
+              title="绯荤粺璁剧疆"
             >
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317a1 1 0 011.35-.936l.75.325a1 1 0 00.9 0l.75-.325a1 1 0 011.35.936l.084.805a1 1 0 00.57.79l.726.42a1 1 0 01.365 1.366l-.403.701a1 1 0 000 .998l.403.701a1 1 0 01-.365 1.366l-.726.42a1 1 0 00-.57.79l-.084.805a1 1 0 01-1.35.936l-.75-.325a1 1 0 00-.9 0l-.75.325a1 1 0 01-1.35-.936l-.084-.805a1 1 0 00-.57-.79l-.726-.42a1 1 0 01-.365-1.366l.403-.701a1 1 0 000-.998l-.403-.701a1 1 0 01.365-1.366l.726-.42a1 1 0 00.57-.79l.084-.805z"></path>
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10.5a1.5 1.5 0 110 3 1.5 1.5 0 010-3z"></path>
               </svg>
-              <span class="text-[13px] hidden sm:inline">系统设置</span>
+              <span class="text-[13px] hidden sm:inline">绯荤粺璁剧疆</span>
             </button>
           </div>
         </div>
@@ -1961,20 +2019,26 @@ const runSourceIndexRebuild = async (dryRun = false) => {
         </div>
       </header>
 
-      <!-- 主内容区域（双栏分割容器） -->
+      <!-- 涓诲唴瀹瑰尯鍩燂紙鍙屾爮鍒嗗壊瀹瑰櫒锛?-->
       <main class="flex-grow p-6 overflow-hidden bg-slate-100/50 flex">
         <div
           ref="workspaceLayoutRef"
           class="h-full w-full grid items-stretch overflow-hidden"
           :style="workspaceGridStyle"
         >
-          <!-- 左侧：思维导图 -->
+          <!-- 宸︿晶锛氭€濈淮瀵煎浘 -->
           <div class="app-card elev-md min-w-0 h-full flex flex-col rounded-xl border border-slate-200/40 overflow-hidden relative">
             <div class="absolute top-4 right-4 flex items-center gap-1 z-20 bg-white/70 backdrop-blur-md p-1 rounded-xl shadow-sm border border-slate-200/40">
               <button @click="triggerExportMd" class="p-2 rounded-lg text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors" title="Export as Markdown">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
               </button>
-              <button @click="triggerExportXmind" class="p-2 rounded-lg text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors" title="Export as XMind">
+              <button
+                @click="triggerExportXmind"
+                @mouseenter="prefetchXmindExportAssets"
+                @focus="prefetchXmindExportAssets"
+                class="p-2 rounded-lg text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors"
+                title="Export as XMind"
+              >
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
               </button>
               <button @click="triggerToggleTheme" class="p-2 rounded-lg text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors" title="Toggle Theme">
@@ -1993,9 +2057,9 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                     <svg class="w-20 h-20 mb-5 text-slate-400 group-hover:text-blue-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 16.5V9.75m0 0l3 3m-3-3l-3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z"></path>
                     </svg>
-                    <h2 class="text-xl md:text-2xl font-semibold text-slate-700 tracking-wide text-center">点击或拖拽 PDF 文件至此</h2>
-                    <p class="text-sm text-slate-500 mt-3 text-center">解析完成后自动生成思维导图，并在右侧联动展示节点详情与原文片段</p>
-                    <p class="text-xs text-slate-400 mt-4">支持 PDF 格式，最大 50MB</p>
+                    <h2 class="text-xl md:text-2xl font-semibold text-slate-700 tracking-wide text-center">鐐瑰嚮鎴栨嫋鎷?PDF 鏂囦欢鑷虫</h2>
+                    <p class="text-sm text-slate-500 mt-3 text-center">瑙ｆ瀽瀹屾垚鍚庤嚜鍔ㄧ敓鎴愭€濈淮瀵煎浘锛屽苟鍦ㄥ彸渚ц仈鍔ㄥ睍绀鸿妭鐐硅鎯呬笌鍘熸枃鐗囨</p>
+                    <p class="text-xs text-slate-400 mt-4">鏀寔 PDF 鏍煎紡锛屾渶澶?50MB</p>
 
                     <div v-if="isLoading" class="w-full max-w-xl mt-8 space-y-4">
                       <div class="skeleton-tree-wrap">
@@ -2034,6 +2098,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                   :tree="treeData"
                   :markdown="mindmapData"
                   :file-id="currentFileId || ''"
+                  :features="systemFeatures"
                   :flat-nodes="flatNodes"
                   class="absolute inset-0"
                   @node-click="handleMindmapNodeClick"
@@ -2045,19 +2110,19 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                   v-if="showMindmapToolbar"
                   class="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 bg-white/88 backdrop-blur-md rounded-xl border border-slate-200 shadow-lg px-2 py-1.5"
                 >
-                  <button @click="triggerCollapseAll" class="toolbar-btn" title="折叠全部">折叠</button>
-                  <button @click="triggerExpandAll" class="toolbar-btn" title="展开全部">展开</button>
-                  <button @click="triggerFitView" class="toolbar-btn" title="居中视图">居中</button>
+                  <button @click="triggerCollapseAll" class="toolbar-btn" title="鎶樺彔鍏ㄩ儴">鎶樺彔</button>
+                  <button @click="triggerExpandAll" class="toolbar-btn" title="灞曞紑鍏ㄩ儴">灞曞紑</button>
+                  <button @click="triggerFitView" class="toolbar-btn" title="灞呬腑瑙嗗浘">灞呬腑</button>
                   <div class="w-px h-5 bg-slate-200 mx-1"></div>
-                  <button @click="triggerZoomOut" class="toolbar-btn toolbar-zoom" title="缩小">-</button>
+                  <button @click="triggerZoomOut" class="toolbar-btn toolbar-zoom" title="缂╁皬">-</button>
                   <span class="text-[11px] text-slate-600 font-medium min-w-12 text-center">{{ mindMapZoomPercent }}%</span>
-                  <button @click="triggerZoomIn" class="toolbar-btn toolbar-zoom" title="放大">+</button>
+                  <button @click="triggerZoomIn" class="toolbar-btn toolbar-zoom" title="鏀惧ぇ">+</button>
                 </div>
               </Transition>
             </div>
           </div>
 
-          <!-- 分隔拖拽条 -->
+          <!-- 鍒嗛殧鎷栨嫿鏉?-->
           <div
             v-if="showDetailPane"
             class="group cursor-col-resize flex flex-col justify-center items-center rounded-md bg-slate-200/40 hover:bg-blue-100/70 transition-colors relative"
@@ -2069,21 +2134,22 @@ const runSourceIndexRebuild = async (dryRun = false) => {
             </div>
           </div>
 
-          <!-- 右侧：节点详情 -->
+          <!-- 鍙充晶锛氳妭鐐硅鎯?-->
           <aside
             v-if="showDetailPane"
             class="app-card elev-md h-full flex flex-col rounded-xl border border-slate-200/40 overflow-hidden transition-all duration-300 ease-out"
             :class="{ 'duration-0': isPdfResizing }"
             :style="{ width: `${pdfPaneWidth}px`, minWidth: '320px' }"
+            @mouseenter="prefetchPdfViewerAssets"
           >
             <div class="p-3 border-b border-slate-200/40 flex-shrink-0 bg-slate-50/60 backdrop-blur-sm z-10 flex items-center justify-between">
               <div>
                 <h3 class="text-sm font-semibold text-slate-700 flex items-center gap-2">
                   <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
-                  节点详情
+                  鑺傜偣璇︽儏
                 </h3>
-                <p class="text-[11px] text-slate-500 mt-0.5 truncate max-w-[240px]" :title="sourceView.topic || '选取节点以查看'">
-                  {{ sourceView.topic ? sourceView.topic : '选取左侧节点以查看详情与原文片段' }}
+                <p class="text-[11px] text-slate-500 mt-0.5 truncate max-w-[240px]" :title="sourceView.topic || '选择节点以查看'">
+                  {{ sourceView.topic ? sourceView.topic : '选择左侧节点以查看详情与原文片段' }}
                 </p>
               </div>
             </div>
@@ -2113,7 +2179,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                       <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                       <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                     </svg>
-                    正在加载节点详情...
+                    姝ｅ湪鍔犺浇鑺傜偣璇︽儏...
                  </div>
               </div>
               <div v-else-if="sourceView.error" class="absolute inset-0 flex items-center justify-center p-4 z-10">
@@ -2132,6 +2198,25 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                   <span class="px-2 py-1 rounded-lg bg-slate-100 text-slate-500 border border-slate-200 text-xs">
                     parser: {{ sourceView.parserBackend || 'unknown' }}
                   </span>
+                  <span v-if="sourceView.pdfPageNo" class="px-2 py-1 rounded-lg bg-indigo-50 text-indigo-700 border border-indigo-200 text-xs font-mono">
+                    PDF P{{ sourceView.pdfPageNo }}
+                  </span>
+                </div>
+                <div v-if="showPdfViewer" class="rounded-xl border border-slate-200 bg-white overflow-hidden h-[48vh] min-h-[280px]">
+                  <VirtualPdfViewer
+                    :key="`${currentFileId || 'none'}:${sourceView.pdfPageNo || 0}:${sourceView.pdfYRatio ?? 0}`"
+                    :source-url="currentPdfSourceUrl"
+                    :page-no="sourceView.pdfPageNo"
+                    :y-ratio="sourceView.pdfYRatio"
+                    :scale="1.05"
+                    @loaded="handlePdfViewerLoaded"
+                    @error="handlePdfViewerError"
+                  />
+                </div>
+                <div v-else-if="canUseVirtualPdf && selectedNode" class="rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-500">
+                  褰撳墠鑺傜偣缂哄皯 PDF 瀹氫綅閿氱偣锛屽凡鑷姩鍒囨崲鍒板師鏂囩墖娈垫煡鐪嬨€?                </div>
+                <div v-if="sourceView.pdfLoadError" class="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
+                  PDF 娓叉煋澶辫触锛歿{ sourceView.pdfLoadError }}
                 </div>
                 <div v-if="sourceView.excerptLines.length" class="bg-slate-900 rounded-xl p-3 text-[11px] leading-relaxed text-slate-200 font-mono overflow-x-auto border border-slate-700/60">
                   <div v-for="line in sourceView.excerptLines" :key="line.line_no" class="flex gap-2">
@@ -2140,7 +2225,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                   </div>
                 </div>
                 <div v-else class="rounded-xl border border-slate-200 bg-white p-4 text-xs text-slate-500">
-                  当前节点暂无原文片段数据。
+                  褰撳墠鑺傜偣鏆傛棤鍘熸枃鐗囨鏁版嵁銆?
                 </div>
               </div>
             </div>
@@ -2150,7 +2235,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
     </div>
   </div>
 
-  <!-- 系统设置弹窗（统一 Tabs） -->
+  <!-- 绯荤粺璁剧疆寮圭獥锛堢粺涓€ Tabs锛?-->
   <Transition name="modal">
     <div
       v-if="showSettings"
@@ -2168,9 +2253,9 @@ const runSourceIndexRebuild = async (dryRun = false) => {
               </svg>
             </div>
             <div>
-              <h2 class="text-lg font-semibold text-slate-800">系统设置</h2>
+              <h2 class="text-lg font-semibold text-slate-800">绯荤粺璁剧疆</h2>
               <p class="text-xs text-slate-500">
-                {{ activeSettingsTab === 'model' ? '模型与授权' : (activeSettingsTab === 'parser' ? '解析与阈值' : '高级引擎控制') }}
+                {{ activeSettingsTab === 'model' ? '模型与鉴权' : (activeSettingsTab === 'parser' ? '解析与阈值' : '高级引擎控制') }}
               </p>
             </div>
           </div>
@@ -2187,7 +2272,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
             type="button"
             @click="activeSettingsTab = 'model'"
           >
-            模型与授权
+            妯″瀷涓庢巿鏉?
           </button>
           <button
             data-testid="settings-tab-parser"
@@ -2196,7 +2281,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
             type="button"
             @click="activeSettingsTab = 'parser'"
           >
-            解析与阈值
+            瑙ｆ瀽涓庨槇鍊?
           </button>
           <button
             data-testid="settings-tab-advanced"
@@ -2205,7 +2290,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
             type="button"
             @click="activeSettingsTab = 'advanced'"
           >
-            高级引擎
+            楂樼骇寮曟搸
           </button>
         </div>
 
@@ -2220,10 +2305,10 @@ const runSourceIndexRebuild = async (dryRun = false) => {
         <div class="p-6 max-h-[70vh] overflow-y-auto">
           <div v-if="activeSettingsTab === 'model'" data-testid="settings-model-panel" class="space-y-5">
             <div class="flex items-center justify-between gap-2 p-3 bg-blue-50/60 border border-blue-100 rounded-xl">
-              <p class="text-xs text-slate-600">支持导出当前配置（不含明文密钥）并在本机或其他环境导入。</p>
+              <p class="text-xs text-slate-600">支持导出当前配置（不含明文密钥），并在本机或其他环境导入。</p>
               <div class="flex items-center gap-2">
-                <button @click="triggerImportConfig" type="button" class="px-3 py-1.5 text-xs rounded-lg border border-slate-300 hover:bg-white">导入</button>
-                <button @click="exportConfig" type="button" class="px-3 py-1.5 text-xs rounded-lg border border-slate-300 hover:bg-white">导出</button>
+                <button @click="triggerImportConfig" type="button" class="px-3 py-1.5 text-xs rounded-lg border border-slate-300 hover:bg-white">瀵煎叆</button>
+                <button @click="exportConfig" type="button" class="px-3 py-1.5 text-xs rounded-lg border border-slate-300 hover:bg-white">瀵煎嚭</button>
               </div>
             </div>
             <div v-if="configOperationMsg" class="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
@@ -2232,7 +2317,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
 
             <div>
               <label class="flex items-center gap-2 text-sm font-medium text-slate-700 mb-2">
-                服务商
+                鏈嶅姟鍟?
               </label>
               <select
                 :value="config.provider"
@@ -2261,14 +2346,14 @@ const runSourceIndexRebuild = async (dryRun = false) => {
 
             <div class="space-y-2">
               <div class="flex items-center justify-between">
-                <label class="text-sm font-medium text-slate-700">模型</label>
+                <label class="text-sm font-medium text-slate-700">妯″瀷</label>
                 <button
                   @click="loadModels"
                   :disabled="modelLoading || !canTestConfig"
                   type="button"
                   class="px-3 py-1.5 text-xs rounded-lg border border-slate-300 hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  {{ modelLoading ? '拉取中...' : '拉取模型列表' }}
+                  {{ modelLoading ? '鎷夊彇涓?..' : '鎷夊彇妯″瀷鍒楄〃' }}
                 </button>
               </div>
               <select
@@ -2293,7 +2378,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                 rows="2"
                 :data-error="Boolean(fieldErrors.manual_models)"
                 class="w-full px-4 py-2 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 bg-white hover:border-slate-300 placeholder:text-slate-400"
-                placeholder="手动白名单（逗号或换行分隔），用于 /models 不可用时回退"
+                placeholder="鎵嬪姩鐧藉悕鍗曪紙閫楀彿鎴栨崲琛屽垎闅旓級锛岀敤浜?/models 涓嶅彲鐢ㄦ椂鍥為€€"
               ></textarea>
               <p v-if="fieldErrors.model" class="text-xs text-rose-600">{{ fieldErrors.model }}</p>
               <p v-if="fieldErrors.manual_models" class="text-xs text-rose-600">{{ fieldErrors.manual_models }}</p>
@@ -2302,7 +2387,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                 class="text-xs p-2 rounded-lg border"
                 :class="modelFetchResult.success ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-amber-50 border-amber-200 text-amber-700'"
               >
-                {{ modelFetchResult.message }}<span v-if="modelFetchResult.source">（source: {{ modelFetchResult.source }}）</span>
+                {{ modelFetchResult.message }}<span v-if="modelFetchResult.source"> (source: {{ modelFetchResult.source }})</span>
                 <div v-if="modelFetchResult.code" class="mt-1 opacity-80">{{ getErrorHint(modelFetchResult.code) }}</div>
               </div>
             </div>
@@ -2320,12 +2405,12 @@ const runSourceIndexRebuild = async (dryRun = false) => {
               />
               <div v-if="config.has_api_key && !config.api_key" class="mt-2 flex items-center justify-between text-xs text-slate-500">
                 <span>已保存密钥（未显示）。留空表示继续使用已保存密钥。</span>
-                <button @click="clearStoredKey" type="button" class="text-rose-600 hover:text-rose-700">清空密钥</button>
+                <button @click="clearStoredKey" type="button" class="text-rose-600 hover:text-rose-700">娓呯┖瀵嗛挜</button>
               </div>
               <p v-if="fieldErrors.api_key" class="text-xs text-rose-600 mt-1">{{ fieldErrors.api_key }}</p>
             </div>
             <div v-else class="p-3 bg-blue-50 text-blue-700 text-xs rounded-xl flex items-center gap-2">
-              Ollama 模式下无需 API Key（后台自动处理占位）。
+              Ollama 妯″紡涓嬫棤闇€ API Key锛堝悗鍙拌嚜鍔ㄥ鐞嗗崰浣嶏級銆?
             </div>
 
             <div v-if="isMiniMax25(config.model)" class="p-4 bg-amber-50 border border-amber-200 rounded-xl">
@@ -2333,14 +2418,14 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path>
                 </svg>
-                账户类型
+                璐︽埛绫诲瀷
               </label>
               <select
                 v-model="config.account_type"
                 class="w-full px-4 py-2.5 border border-amber-300 rounded-xl text-sm focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-all duration-200 bg-white"
               >
-                <option value="free">免费用户 (20 RPM)</option>
-                <option value="paid">充值用户 (500 RPM)</option>
+                <option value="free">鍏嶈垂鐢ㄦ埛 (20 RPM)</option>
+                <option value="paid">鍏呭€肩敤鎴?(500 RPM)</option>
               </select>
             </div>
 
@@ -2363,7 +2448,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
           <div v-else-if="activeSettingsTab === 'parser'" data-testid="settings-parser-panel" class="space-y-5">
             <div class="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
               <label class="flex items-center gap-2 text-sm font-medium text-slate-700">
-                解析引擎
+                瑙ｆ瀽寮曟搸
               </label>
               <select
                 v-model="parserConfig.parser_backend"
@@ -2388,14 +2473,14 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                   step="30"
                   class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
                 />
-                <div class="mt-1 text-xs text-slate-600">{{ parserConfig.task_timeout_seconds }} 秒</div>
+                <div class="mt-1 text-xs text-slate-600">{{ parserConfig.task_timeout_seconds }} s</div>
                 <p class="text-[11px] text-slate-500 mt-1">控制前端等待与后端任务执行的统一超时阈值。</p>
                 <p v-if="fieldErrors.task_timeout_seconds" class="text-xs text-rose-600 mt-1">{{ fieldErrors.task_timeout_seconds }}</p>
               </div>
 
               <div v-if="isHybridParser" class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div>
-                  <label class="text-xs text-slate-600">噪声阈值 (0-1)</label>
+                  <label class="text-xs text-slate-600">鍣０闃堝€?(0-1)</label>
                   <input
                     v-model.number="parserConfig.hybrid_noise_threshold"
                     type="number"
@@ -2408,7 +2493,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                   <p v-if="fieldErrors.hybrid_noise_threshold" class="text-xs text-rose-600 mt-1">{{ fieldErrors.hybrid_noise_threshold }}</p>
                 </div>
                 <div>
-                  <label class="text-xs text-slate-600">Docling 跳过分数 (0-100)</label>
+                  <label class="text-xs text-slate-600">Docling 璺宠繃鍒嗘暟 (0-100)</label>
                   <input
                     v-model.number="parserConfig.hybrid_docling_skip_score"
                     type="number"
@@ -2421,7 +2506,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                   <p v-if="fieldErrors.hybrid_docling_skip_score" class="text-xs text-rose-600 mt-1">{{ fieldErrors.hybrid_docling_skip_score }}</p>
                 </div>
                 <div>
-                  <label class="text-xs text-slate-600">切换分差阈值 (0-50)</label>
+                  <label class="text-xs text-slate-600">鍒囨崲鍒嗗樊闃堝€?(0-50)</label>
                   <input
                     v-model.number="parserConfig.hybrid_switch_min_delta"
                     type="number"
@@ -2450,8 +2535,8 @@ const runSourceIndexRebuild = async (dryRun = false) => {
 
               <label v-if="usesMarkerPath" class="flex items-center justify-between gap-3 p-3 rounded-lg bg-white border border-slate-200">
                 <div>
-                  <p class="text-sm text-slate-700">优先使用 Marker Python API</p>
-                  <p class="text-xs text-slate-500">失败时自动回退到 CLI</p>
+                  <p class="text-sm text-slate-700">浼樺厛浣跨敤 Marker Python API</p>
+                  <p class="text-xs text-slate-500">澶辫触鏃惰嚜鍔ㄥ洖閫€鍒?CLI</p>
                 </div>
                 <input v-model="parserConfig.marker_prefer_api" type="checkbox" class="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500">
               </label>
@@ -2460,7 +2545,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
             <div class="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
               <div class="flex items-start justify-between gap-3">
                 <div>
-                  <p class="text-sm font-medium text-slate-700">历史索引重建</p>
+                  <p class="text-sm font-medium text-slate-700">鍘嗗彶绱㈠紩閲嶅缓</p>
                   <p class="text-xs text-slate-500 mt-1">修复历史文件中“导图仅根节点”的索引问题，并返回逐文件日志。</p>
                 </div>
                 <div class="flex items-center gap-2">
@@ -2469,14 +2554,14 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                     :disabled="sourceIndexRebuildRunning"
                     class="px-3 py-1.5 text-xs rounded-lg border border-slate-300 hover:bg-white disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    {{ sourceIndexRebuildRunning ? '执行中...' : '预览重建' }}
+                    {{ sourceIndexRebuildRunning ? '鎵ц涓?..' : '棰勮閲嶅缓' }}
                   </button>
                   <button
                     @click="runSourceIndexRebuild(false)"
                     :disabled="sourceIndexRebuildRunning"
                     class="px-3 py-1.5 text-xs rounded-lg btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    {{ sourceIndexRebuildRunning ? '执行中...' : '执行重建' }}
+                    {{ sourceIndexRebuildRunning ? '鎵ц涓?..' : '鎵ц閲嶅缓' }}
                   </button>
                 </div>
               </div>
@@ -2484,19 +2569,19 @@ const runSourceIndexRebuild = async (dryRun = false) => {
               <div v-if="sourceIndexRebuildResult" class="space-y-2">
                 <div class="flex flex-wrap items-center gap-2 text-[11px]">
                   <span class="px-2 py-1 rounded-md bg-slate-100 border border-slate-200 text-slate-600">
-                    扫描 {{ sourceIndexRebuildResult.summary?.scanned || 0 }}
+                    鎵弿 {{ sourceIndexRebuildResult.summary?.scanned || 0 }}
                   </span>
                   <span class="px-2 py-1 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-700">
-                    重建 {{ sourceIndexRebuildResult.summary?.rebuilt || 0 }}
+                    閲嶅缓 {{ sourceIndexRebuildResult.summary?.rebuilt || 0 }}
                   </span>
                   <span class="px-2 py-1 rounded-md bg-slate-100 border border-slate-200 text-slate-600">
-                    跳过 {{ sourceIndexRebuildResult.summary?.skipped || 0 }}
+                    璺宠繃 {{ sourceIndexRebuildResult.summary?.skipped || 0 }}
                   </span>
                   <span class="px-2 py-1 rounded-md bg-rose-50 border border-rose-200 text-rose-700">
-                    失败 {{ sourceIndexRebuildResult.summary?.failed || 0 }}
+                    澶辫触 {{ sourceIndexRebuildResult.summary?.failed || 0 }}
                   </span>
                   <span class="text-slate-500">
-                    完成于 {{ formatDateTime(sourceIndexRebuildResult.finished_at) || '--' }}
+                    瀹屾垚浜?{{ formatDateTime(sourceIndexRebuildResult.finished_at) || '--' }}
                   </span>
                 </div>
 
@@ -2518,7 +2603,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                     </div>
                   </div>
                   <div v-if="sourceIndexRebuildItems.length === 0" class="px-3 py-3 text-xs text-slate-400">
-                    本次没有可展示日志。
+                    鏈娌℃湁鍙睍绀烘棩蹇椼€?
                   </div>
                 </div>
               </div>
@@ -2529,7 +2614,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
             <div class="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-4">
               <!-- Timeout Setting -->
               <div>
-                <label class="text-sm font-medium text-slate-700">任务最大超时时间（秒）：{{ parserConfig.task_timeout_seconds }}</label>
+                <label class="text-sm font-medium text-slate-700">浠诲姟鏈€澶ц秴鏃舵椂闂达紙绉掞級锛歿{ parserConfig.task_timeout_seconds }}</label>
                 <div class="flex items-center gap-4 mt-2">
                   <input
                     data-testid="advanced-task-timeout-slider"
@@ -2551,14 +2636,14 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                     @input="scheduleAdvancedAutoSave"
                   />
                 </div>
-                <p class="text-xs text-slate-500 mt-1">控制大模型解析长文档时的最长等待时间，默认 600 秒。</p>
+                <p class="text-xs text-slate-500 mt-1">控制长文档分析任务的最大等待时间，默认 600 秒。</p>
                 <p v-if="fieldErrors.task_timeout_seconds" class="text-xs text-rose-600 mt-1">{{ fieldErrors.task_timeout_seconds }}</p>
               </div>
 
               <hr class="border-slate-200" />
 
               <div>
-                <label class="text-sm font-medium text-slate-700">并发请求限制：{{ advancedConfig.engine_concurrency }}</label>
+                <label class="text-sm font-medium text-slate-700">骞跺彂璇锋眰闄愬埗锛歿{ advancedConfig.engine_concurrency }}</label>
                 <input
                   data-testid="advanced-concurrency"
                   v-model.number="advancedConfig.engine_concurrency"
@@ -2573,7 +2658,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
               </div>
 
               <div>
-                <label class="text-sm font-medium text-slate-700">AI 思维发散度：{{ Number(advancedConfig.engine_temperature).toFixed(2) }}</label>
+                <label class="text-sm font-medium text-slate-700">AI 鎬濈淮鍙戞暎搴︼細{{ Number(advancedConfig.engine_temperature).toFixed(2) }}</label>
                 <input
                   data-testid="advanced-temperature"
                   v-model.number="advancedConfig.engine_temperature"
@@ -2588,7 +2673,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
               </div>
 
               <div>
-                <label class="text-sm font-medium text-slate-700">返回长度限制（Max Tokens）：{{ advancedConfig.engine_max_tokens }}</label>
+                <label class="text-sm font-medium text-slate-700">杩斿洖闀垮害闄愬埗锛圡ax Tokens锛夛細{{ advancedConfig.engine_max_tokens }}</label>
                 <input
                   data-testid="advanced-max-tokens"
                   v-model.number="advancedConfig.engine_max_tokens"
@@ -2611,7 +2696,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                   ? 'bg-rose-50 border-rose-200 text-rose-700'
                   : 'bg-slate-50 border-slate-200 text-slate-600'"
             >
-              <span v-if="advancedAutoSaveState === 'saving'">正在自动保存高级参数...</span>
+              <span v-if="advancedAutoSaveState === 'saving'">姝ｅ湪鑷姩淇濆瓨楂樼骇鍙傛暟...</span>
               <span v-else-if="advancedAutoSaveState === 'saved'">高级参数已自动保存并生效。</span>
               <span v-else-if="advancedAutoSaveState === 'error'">自动保存失败，请点击“保存全部配置”重试。</span>
               <span v-else>滑动参数后将自动写入后端配置。</span>
@@ -2630,7 +2715,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
               </svg>
-              {{ configLoading ? '测试中...' : '测试连接' }}
+              {{ configLoading ? '娴嬭瘯涓?..' : '娴嬭瘯杩炴帴' }}
             </span>
           </button>
           <button
@@ -2639,7 +2724,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
             :disabled="isSettingsSaveDisabled"
             class="px-5 py-2.5 text-sm btn-primary rounded-xl disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {{ configLoading ? '保存中...' : '保存配置' }}
+            {{ configLoading ? '淇濆瓨涓?..' : '淇濆瓨閰嶇疆' }}
           </button>
         </div>
       </div>
