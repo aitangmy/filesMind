@@ -76,6 +76,7 @@ npm run check:bundle # 严格预算校验（超限即失败）
 - 支持 source index 树与节点源码摘录接口。
 - 支持配置导入/导出，后端配置加密存储。
 - 前端提供工作区与设置页路由（`/workspace`、`/settings`）。
+- 增加 Durable Workflow 基础能力（`activities/`、`workflows/`、`repo/`、`worker/`）。
 
 ---
 
@@ -83,6 +84,7 @@ npm run check:bundle # 严格预算校验（超限即失败）
 
 - Python `3.12.x`（`pyproject.toml` 固定 `==3.12.*`）
 - Node.js `>= 18`
+- PostgreSQL `>= 14`（仅在启用 Durable Workflow 持久化时需要）
 - Git
 
 ---
@@ -168,7 +170,36 @@ npm run dev
 - `HYBRID_SWITCH_MIN_DELTA`（默认 `2.0`）
 - `HYBRID_MARKER_MIN_LENGTH`（默认 `200`）
 - `MARKER_PREFER_API`（默认 `false`）
+- `FILESMIND_MAX_UPLOAD_BYTES`（默认 `52428800`，即 `50MB`）
 - `FILESMIND_PARSE_WORKERS`（解析进程池 worker 数）
+- `FILESMIND_DB_DSN`（Durable Workflow 使用的 PostgreSQL DSN）
+- `FILESMIND_REFINE_CONCURRENCY`（节点细化并发度，默认 `3`）
+- `FILESMIND_REFINE_MAX_ATTEMPTS`（节点细化最大重试次数，默认 `8`）
+
+---
+
+## 🧱 Durable Workflow（可选）
+
+当前版本已提供本地 Durable Workflow 实现骨架，契约与结构对齐 Temporal 风格编排：
+
+- Contracts：`backend/workflow_contracts/`
+- Activities：`backend/activities/`
+- Workflow Runner：`backend/workflows/document_workflow.py`
+- Worker 入口：`backend/worker/main.py`
+- Postgres Repo + Migration：`backend/repo/`、`backend/migrations/0001_temporal_rebuild.sql`
+
+初始化数据库结构：
+
+```bash
+psql "$FILESMIND_DB_DSN" -f backend/migrations/0001_temporal_rebuild.sql
+```
+
+本地执行一次工作流：
+
+```bash
+cd backend
+python -m worker.main --doc-id <uuid> --filename <name.pdf> --file-path <pdf_path> --file-hash <sha256>
+```
 
 ---
 
@@ -190,6 +221,7 @@ npm run dev
 - `POST /config/test` / `POST /config/models`
 - `GET /health`
 - `GET /system/hardware`
+- `GET /system/features`
 - `POST /admin/source-index/rebuild`
 
 ---
@@ -217,6 +249,12 @@ filesMind/
     parser_service.py
     cognitive_engine.py
     structure_utils.py
+    activities/
+    repo/
+    workflow_contracts/
+    workflows/
+    worker/
+    migrations/
     data/
     tests/
   frontend/
