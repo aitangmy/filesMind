@@ -769,6 +769,27 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertEqual(task.cancel_reason, "test-cancel")
         self.assertTrue(worker.cancelled)
 
+    def test_build_source_markdown_keeps_line_numbers_stable(self):
+        raw_md = "\n".join(
+            [
+                "# Root <!-- fm_anchor:page=1;y=0.1 -->",
+                "",
+                "",
+                "## Section A <!-- fm_anchor:page=2;y=0.3 -->",
+                "Line A1",
+                "",
+                "",
+                "",
+                "Line A2",
+            ]
+        )
+
+        source_md = app_module._build_source_markdown(raw_md)
+
+        self.assertEqual(len(source_md.splitlines()), len(raw_md.splitlines()))
+        self.assertNotIn("fm_anchor", source_md)
+        self.assertIn("\n\n\n", source_md)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

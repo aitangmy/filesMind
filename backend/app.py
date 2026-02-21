@@ -1416,6 +1416,14 @@ _MD_TRAILING_PAGE_RE = re.compile(r"\s+\d+\s*$")
 _MAX_FALLBACK_INDEX_NODES = 220
 
 
+def _build_source_markdown(markdown: str) -> str:
+    """
+    Build source markdown without changing line positions.
+    Keep line numbers aligned with build_hierarchy_tree(md_content).
+    """
+    return _MD_ANCHOR_RE.sub("", str(markdown or ""))
+
+
 def _clean_markdown_topic(raw: str) -> str:
     text = _MD_ANCHOR_RE.sub("", str(raw or ""))
     text = html.unescape(text)
@@ -1743,8 +1751,8 @@ def rebuild_source_indexes_batch(
                 continue
 
             source_md_path = _source_md_path(file_id)
-            if not os.path.exists(source_md_path):
-                source_md_path = md_path
+            source_md = _build_source_markdown(markdown)
+            _atomic_write_text(source_md_path, source_md)
             rebuilt_index = _build_index_from_markdown_headings(file_id, markdown, source_md_path)
             new_nodes = _count_source_index_nodes(rebuilt_index)
             index_mode = str(rebuilt_index.get("index_mode", "unknown"))
@@ -1826,9 +1834,8 @@ def _rebuild_source_index_from_markdown(file_id: str, markdown_path: str) -> Dic
         markdown = f.read()
 
     source_md_path = _source_md_path(file_id)
-    if not os.path.exists(source_md_path):
-        # 兼容历史数据：没有原始 source md 时，回退为当前 md。
-        source_md_path = markdown_path
+    source_md = _build_source_markdown(markdown)
+    _atomic_write_text(source_md_path, source_md)
 
     rebuilt = _build_index_from_markdown_headings(file_id, markdown, source_md_path)
     index_path = _source_index_path(file_id)
@@ -1935,11 +1942,10 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         settings = get_parser_runtime_config()
         parser_backend = str(settings.get("parser_backend", "docling")).lower()
 
-        # Phase 2 End: Clean tags out before saving the visible `.md` proxy
+        # Phase 2 End: strip anchors only; never fold blank lines.
         source_md_path = _source_md_path(file_id)
-        clean_md = re.sub(r"<!--\s*fm_anchor:.*?\s*-->", "", md_content)
-        clean_md = re.sub(r"\n{3,}", "\n\n", clean_md)
-        _atomic_write_text(source_md_path, clean_md)
+        source_md = _build_source_markdown(md_content)
+        _atomic_write_text(source_md_path, source_md)
 
         _persist_source_index(file_id, root_node, source_md_path, parser_backend)
 
