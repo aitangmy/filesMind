@@ -1,10 +1,25 @@
 <script setup>
-import { ref, shallowRef, watch, onMounted, onUnmounted, nextTick } from 'vue';
-import VuePdfEmbed from 'vue-pdf-embed';
-import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/build/pdf';
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.js?url';
-import 'vue-pdf-embed/dist/styles/annotationLayer.css';
-GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+import { ref, shallowRef, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent } from 'vue';
+
+const VuePdfEmbed = defineAsyncComponent(async () => {
+  await import('vue-pdf-embed/dist/styles/annotationLayer.css');
+  const module = await import('vue-pdf-embed');
+  return module.default;
+});
+
+let pdfApiPromise = null;
+const ensurePdfApi = async () => {
+  if (pdfApiPromise) return pdfApiPromise;
+  pdfApiPromise = (async () => {
+    const [{ getDocument, GlobalWorkerOptions }, { default: pdfWorkerUrl }] = await Promise.all([
+      import('pdfjs-dist'),
+      import('pdfjs-dist/build/pdf.worker.min.mjs?url')
+    ]);
+    GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+    return { getDocument };
+  })();
+  return pdfApiPromise;
+};
 
 const props = defineProps({
   sourceUrl: {
@@ -111,6 +126,7 @@ const loadPdf = async () => {
   if (token !== loadToken) return;
 
   try {
+    const { getDocument } = await ensurePdfApi();
     loadingTask = getDocument(props.sourceUrl);
     currentLoadingTask = loadingTask;
     const doc = await loadingTask.promise;

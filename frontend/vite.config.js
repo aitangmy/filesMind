@@ -4,6 +4,19 @@ import vue from '@vitejs/plugin-vue'
 // https://vitejs.dev/config/
 export default defineConfig({
     plugins: [vue()],
+    build: {
+        rollupOptions: {
+            output: {
+                manualChunks(id) {
+                    if (!id.includes('node_modules')) return;
+                    if (id.includes('pdfjs-dist')) return 'pdfjs';
+                    if (id.includes('vue-pdf-embed')) return 'pdf-viewer';
+                    if (id.includes('simple-mind-map')) return 'mindmap-vendor';
+                    return 'vendor';
+                }
+            }
+        }
+    },
     test: {
         include: ['src/**/*.{test,spec}.?(c|m)[jt]s?(x)'],
         environment: 'jsdom'
