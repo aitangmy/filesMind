@@ -174,5 +174,55 @@ class EngineSettingsTests(unittest.TestCase):
         self.assertIsNone(ce._rate_limiter)
 
 
+class RefineLimiterAndRetryTests(unittest.TestCase):
+    def setUp(self):
+        self._old_semaphore = ce._semaphore
+        self._old_rate = ce._rate_limiter
+        self._old_model = ce.get_model()
+
+    def tearDown(self):
+        ce._semaphore = self._old_semaphore
+        ce._rate_limiter = self._old_rate
+        ce.set_model(self._old_model)
+
+    def test_refine_node_content_uses_rate_limiter(self):
+        class _Limiter:
+            def __init__(self):
+                self.count = 0
+
+            async def acquire(self):
+                self.count += 1
+
+        limiter = _Limiter()
+        fake_client = _FakeClient(
+            "https://api.minimaxi.com/v1",
+            [_make_response('[{"topic":"Sub","details":[]}]')],
+        )
+
+        with patch.object(ce, "get_client", return_value=fake_client):
+            with patch.object(ce, "get_model", return_value="MiniMax-M2.5"):
+                with patch.object(ce, "get_rate_limiter", return_value=(asyncio.Semaphore(1), limiter)):
+                    data = asyncio.run(ce.refine_node_content("Title", "Body", "Path"))
+
+        self.assertEqual(len(data), 1)
+        self.assertEqual(limiter.count, 1)
+
+    def test_refine_node_content_raises_after_retry_exhausted(self):
+        fake_client = _FakeClient(
+            "https://api.minimaxi.com/v1",
+            [
+                Exception("429 Too Many Requests"),
+                Exception("429 Too Many Requests"),
+                Exception("429 Too Many Requests"),
+                Exception("429 Too Many Requests"),
+            ],
+        )
+
+        with patch.object(ce, "get_client", return_value=fake_client):
+            with patch.object(ce, "get_model", return_value="MiniMax-M2.5"):
+                with self.assertRaises(ce.RefineNodeRequestError):
+                    asyncio.run(ce.refine_node_content("Title", "Body", "Path"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

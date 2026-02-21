@@ -22,6 +22,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("FilesMind")
 
 
+def _env_upload_max_bytes(default: int) -> int:
+    raw = os.getenv("FILESMIND_MAX_UPLOAD_BYTES")
+    if raw is None:
+        return default
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"FILESMIND_MAX_UPLOAD_BYTES={raw!r} invalid, fallback={default}")
+        return default
+    if parsed <= 0:
+        logger.warning(f"FILESMIND_MAX_UPLOAD_BYTES={raw!r} invalid, fallback={default}")
+        return default
+    return parsed
+
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -411,6 +426,27 @@ MAX_ENGINE_TEMPERATURE = 1.0
 DEFAULT_ENGINE_MAX_TOKENS = 8192
 MIN_ENGINE_MAX_TOKENS = 1000
 MAX_ENGINE_MAX_TOKENS = 16000
+DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_UPLOAD_BYTES = _env_upload_max_bytes(DEFAULT_MAX_UPLOAD_BYTES)
+UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+
+
+class UploadSizeExceededError(ValueError):
+    pass
+
+
+async def _save_upload_with_size_limit(upload: UploadFile, dst_path: str, max_bytes: int) -> int:
+    total = 0
+    with open(dst_path, "wb+") as buffer:
+        while True:
+            chunk = await upload.read(UPLOAD_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise UploadSizeExceededError(f"upload exceeds max size: {total}>{max_bytes}")
+            buffer.write(chunk)
+    return total
 
 
 def get_task_timeout_seconds_runtime() -> int:
@@ -1102,6 +1138,7 @@ class Task:
         self.message = "等待处理..."
         self.result = None
         self.error = None
+        self.failure_details: List[Dict[str, str]] = []
         self.cancel_requested = False
         self.cancel_reason = ""
         self.timeout_seconds = get_task_timeout_seconds_runtime()
@@ -1148,6 +1185,7 @@ def _task_to_snapshot(task: "Task") -> Dict[str, Any]:
         "message": task.message or "",
         "result": task.result,
         "error": task.error,
+        "failure_details": list(task.failure_details or []),
         "cancel_requested": bool(task.cancel_requested),
         "cancel_reason": task.cancel_reason or "",
         "timeout_seconds": int(task.timeout_seconds or 0),
@@ -1904,6 +1942,7 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
 
     try:
         task.file_id = file_id
+        task.failure_details = []
         task.status = TaskStatus.PROCESSING
         task.progress = 5
         task.message = "正在解析 PDF 文档..."
@@ -1969,36 +2008,37 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         # 阶段 3: 并行 Refinement (20-95%)
         from cognitive_engine import refine_node_content
 
-        semaphore = asyncio.Semaphore(5)
         total_nodes = len(nodes_to_refine)
         completed_count = 0
+        failed_nodes = []
 
         async def process_node(node):
             nonlocal completed_count
-            async with semaphore:
-                try:
-                    ensure_task_active()
-                    context_path = node.get_breadcrumbs()
+            try:
+                ensure_task_active()
+                context_path = node.get_breadcrumbs()
 
-                    details = await refine_node_content(
-                        node_title=node.topic, content_chunk=node.full_content, context_path=context_path
-                    )
-                    ensure_task_active()
+                # Concurrency/rate limiting is centrally enforced in cognitive_engine.
+                details = await refine_node_content(
+                    node_title=node.topic, content_chunk=node.full_content, context_path=context_path
+                )
+                ensure_task_active()
 
-                    if details:
-                        node.ai_details = details
+                if details:
+                    node.ai_details = details
 
-                    completed_count += 1
-                    current_progress = 20 + int((completed_count / total_nodes) * 75)
-                    task.progress = min(95, current_progress)
-                    if completed_count % 5 == 0:
-                        task.message = f"AI 正在深入分析章节 ({completed_count}/{total_nodes})..."
-                        commit_state()
+                completed_count += 1
+                current_progress = 20 + int((completed_count / total_nodes) * 75)
+                task.progress = min(95, current_progress)
+                if completed_count % 5 == 0:
+                    task.message = f"AI 正在深入分析章节 ({completed_count}/{total_nodes})..."
+                    commit_state()
 
-                except TaskControlError:
-                    raise
-                except Exception as e:
-                    logger.error(f"Node processing failed: {e}")
+            except TaskControlError:
+                raise
+            except Exception as e:
+                logger.error(f"Node processing failed: {e}")
+                failed_nodes.append({"node_id": getattr(node, "id", ""), "topic": node.topic, "error": str(e)})
 
         if nodes_to_refine:
             workers = [asyncio.create_task(process_node(n)) for n in nodes_to_refine]
@@ -2011,6 +2051,23 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
                 raise
         else:
             logger.warning("No nodes required refinement.")
+
+        if failed_nodes:
+            task.failure_details = [
+                {
+                    "node_id": str(item.get("node_id", "")),
+                    "topic": str(item.get("topic", "")),
+                    "error": str(item.get("error", "")),
+                }
+                for item in failed_nodes
+            ]
+            commit_state()
+            failed_preview = ", ".join(
+                f"{item.get('topic') or item.get('node_id')}: {item.get('error')}" for item in failed_nodes[:3]
+            )
+            if len(failed_nodes) > 3:
+                failed_preview += f" ... (+{len(failed_nodes) - 3} more)"
+            raise Exception(f"Refinement failed for {len(failed_nodes)} node(s). {failed_preview}")
 
         ensure_task_active()
         task.progress = 98
@@ -2081,6 +2138,7 @@ class TaskResponse(BaseModel):
     message: str
     result: Optional[str] = None
     error: Optional[str] = None
+    failure_details: Optional[List[Dict[str, str]]] = None
 
 
 class UploadResponse(BaseModel):
@@ -2122,12 +2180,45 @@ async def upload_document(file: UploadFile = File(...)):
     os.makedirs(os.path.dirname(temp_file), exist_ok=True)
 
     try:
-        with open(temp_file, "wb+") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        logger.info(f"文件已保存：{temp_file}")
+        content_length = file.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail={
+                            "code": "FILE_TOO_LARGE",
+                            "message": f"Upload exceeds max size ({MAX_UPLOAD_BYTES} bytes)",
+                            "max_bytes": MAX_UPLOAD_BYTES,
+                        },
+                    )
+            except ValueError:
+                pass
+
+        saved_bytes = await _save_upload_with_size_limit(file, temp_file, MAX_UPLOAD_BYTES)
+        logger.info(f"文件已保存：{temp_file}, bytes={saved_bytes}")
+    except UploadSizeExceededError:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "FILE_TOO_LARGE",
+                "message": f"Upload exceeds max size ({MAX_UPLOAD_BYTES} bytes)",
+                "max_bytes": MAX_UPLOAD_BYTES,
+            },
+        )
+    except HTTPException:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        raise
     except Exception as e:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
         logger.error(f"文件保存失败：{e}")
         raise HTTPException(status_code=500, detail=f"文件保存失败：{str(e)}")
+    finally:
+        await file.close()
 
     # 计算文件 Hash
     file_hash = get_file_hash(temp_file)
@@ -2279,6 +2370,7 @@ async def get_task_status(task_id: str):
             message=str(snapshot.get("message", "")),
             result=snapshot.get("result"),
             error=snapshot.get("error"),
+            failure_details=snapshot.get("failure_details"),
         )
 
     return TaskResponse(
@@ -2289,6 +2381,7 @@ async def get_task_status(task_id: str):
         message=task.message,
         result=task.result,
         error=task.error,
+        failure_details=task.failure_details,
     )
 
 

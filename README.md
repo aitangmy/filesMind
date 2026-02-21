@@ -76,6 +76,7 @@ npm run check:bundle # enforce budget and fail on violation
 - Source index tree + per-node source excerpt API.
 - Config import/export and encrypted config persistence on backend.
 - Frontend workspace + settings routes (`/workspace`, `/settings`).
+- Durable workflow foundation for document processing (`activities/`, `workflows/`, `repo/`, `worker/`).
 
 ---
 
@@ -83,6 +84,7 @@ npm run check:bundle # enforce budget and fail on violation
 
 - Python `3.12.x` (`==3.12.*` in `pyproject.toml`)
 - Node.js `>= 18`
+- PostgreSQL `>= 14` (required only for durable workflow persistence)
 - Git
 
 ---
@@ -168,7 +170,36 @@ If this step is skipped, task processing will fail.
 - `HYBRID_SWITCH_MIN_DELTA` (default `2.0`)
 - `HYBRID_MARKER_MIN_LENGTH` (default `200`)
 - `MARKER_PREFER_API` (default `false`)
+- `FILESMIND_MAX_UPLOAD_BYTES` (default `52428800`, i.e. `50MB`)
 - `FILESMIND_PARSE_WORKERS` (process-pool worker count)
+- `FILESMIND_DB_DSN` (PostgreSQL DSN for durable workflow repo)
+- `FILESMIND_REFINE_CONCURRENCY` (workflow refine concurrency, default `3`)
+- `FILESMIND_REFINE_MAX_ATTEMPTS` (workflow refine retry cap, default `8`)
+
+---
+
+## 🧱 Durable Workflow (Optional)
+
+FilesMind now includes a local durable-workflow implementation scaffolded for Temporal-style orchestration:
+
+- Contracts: `backend/workflow_contracts/`
+- Activities: `backend/activities/`
+- Workflow runner: `backend/workflows/document_workflow.py`
+- Worker entrypoint: `backend/worker/main.py`
+- Postgres repository + migration: `backend/repo/`, `backend/migrations/0001_temporal_rebuild.sql`
+
+Initialize schema:
+
+```bash
+psql "$FILESMIND_DB_DSN" -f backend/migrations/0001_temporal_rebuild.sql
+```
+
+Run one local workflow:
+
+```bash
+cd backend
+python -m worker.main --doc-id <uuid> --filename <name.pdf> --file-path <pdf_path> --file-hash <sha256>
+```
 
 ---
 
@@ -190,6 +221,7 @@ Main endpoints (frontend accesses via `/api/*` proxy):
 - `POST /config/test` / `POST /config/models`
 - `GET /health`
 - `GET /system/hardware`
+- `GET /system/features`
 - `POST /admin/source-index/rebuild`
 
 ---
@@ -217,6 +249,12 @@ filesMind/
     parser_service.py
     cognitive_engine.py
     structure_utils.py
+    activities/
+    repo/
+    workflow_contracts/
+    workflows/
+    worker/
+    migrations/
     data/
     tests/
   frontend/

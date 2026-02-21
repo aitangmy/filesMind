@@ -1,5 +1,6 @@
 import re
 import json
+import html
 import hashlib
 from collections import Counter
 
@@ -34,6 +35,16 @@ _HF_APPROX_LINES_PER_PAGE = 30  # used when no page-break markers are present
 _HF_MIN_PAGES = 2  # need at least 2 pages for reliable detection
 _HF_MAX_LINE_LEN = 120  # very long lines are never headers/footers
 _HF_POSITION_ZONE = 0.30  # top/bottom 30% of each page segment = HF zone
+
+_FM_ANCHOR_RE = re.compile(
+    r"<!--\s*fm_anchor:(.*?)\s*--|(?:\\)?&lt;!--\s*fm_anchor:(.*?)\s*--(?:\\)?&gt;",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _anchor_payload_from_match(match: re.Match) -> str:
+    payload = match.group(1) if match.group(1) is not None else match.group(2)
+    return html.unescape((payload or "").strip())
 
 
 def _normalise_hf_line(line: str) -> str:
@@ -765,11 +776,11 @@ def build_hierarchy_tree(markdown_text):
             continue
 
         raw_topic = m.group(2).strip()
-        anchor_match = re.search(r"<!--\s*fm_anchor:(.*?)\s*-->", raw_topic)
+        anchor_match = _FM_ANCHOR_RE.search(raw_topic)
         anchor_data = None
         if anchor_match:
             try:
-                anchor_data = json.loads(anchor_match.group(1))
+                anchor_data = json.loads(_anchor_payload_from_match(anchor_match))
             except Exception:
                 pass
             raw_topic = (raw_topic[: anchor_match.start()] + raw_topic[anchor_match.end() :]).strip()
@@ -819,7 +830,7 @@ def build_hierarchy_tree(markdown_text):
 
         if header_match:
             raw_topic = header_match.group(2).strip()
-            anchor_match = re.search(r"<!--\s*fm_anchor:(.*?)\s*-->", raw_topic)
+            anchor_match = _FM_ANCHOR_RE.search(raw_topic)
             if anchor_match:
                 raw_topic = (raw_topic[: anchor_match.start()] + raw_topic[anchor_match.end() :]).strip()
 
@@ -876,11 +887,11 @@ def build_hierarchy_tree(markdown_text):
         else:
             line = line.strip()
             # remove anchor tag from content lines
-            anchor_match = re.search(r"<!--\s*fm_anchor:(.*?)\s*-->", line)
+            anchor_match = _FM_ANCHOR_RE.search(line)
             while anchor_match:
                 if not getattr(stack[-1], "pdf_page_no", None):
                     try:
-                        anchor = json.loads(anchor_match.group(1))
+                        anchor = json.loads(_anchor_payload_from_match(anchor_match))
                         stack[-1].pdf_page_no = anchor.get("page_no")
                         bbox = anchor.get("bbox")
                         page_height = anchor.get("page_height", 1000)
@@ -897,7 +908,7 @@ def build_hierarchy_tree(markdown_text):
                         pass
 
                 line = (line[: anchor_match.start()] + line[anchor_match.end() :]).strip()
-                anchor_match = re.search(r"<!--\s*fm_anchor:(.*?)\s*-->", line)
+                anchor_match = _FM_ANCHOR_RE.search(line)
 
             if line:
                 stack[-1].content_lines.append(line)

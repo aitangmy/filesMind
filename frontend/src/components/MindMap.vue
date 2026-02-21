@@ -63,6 +63,10 @@ const props = defineProps({
   tree: {
     type: Object,
     default: null
+  },
+  features: {
+    type: Object,
+    default: () => ({})
   }
 });
 
@@ -73,9 +77,11 @@ const mindMapInstance = shallowRef(null);
 
 let resizeObserver = null;
 let fitTimer = null;
+let highlightTimer = null;
 let updateToken = 0;
 let darkThemeEnabled = false;
 let initPromise = null;
+let lastHighlightedNode = null;
 
 const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 
@@ -210,6 +216,8 @@ const mindMapData = computed(() => {
   }
   return buildMindMapNodeFromMarkdown(props.markdown);
 });
+
+const canUseServerPngExport = computed(() => Boolean(props.features?.FEATURE_SERVER_PNG_EXPORT));
 
 const getThemeConfig = () => {
   if (darkThemeEnabled) {
@@ -351,6 +359,76 @@ const handleScaleChange = () => {
   emitZoomChange();
 };
 
+const walkRenderNode = (node, visit) => {
+  if (!node) return false;
+  if (visit(node)) return true;
+  const children = Array.isArray(node.children) ? node.children : [];
+  for (const child of children) {
+    if (walkRenderNode(child, visit)) return true;
+  }
+  return false;
+};
+
+const findRenderNode = ({ nodeId = '', topic = '' } = {}) => {
+  const root = mindMapInstance.value?.renderer?.root;
+  if (!root) return null;
+  const normalizedTopic = String(topic || '').trim().toLowerCase();
+  let matched = null;
+  walkRenderNode(root, (node) => {
+    const data = typeof node?.getData === 'function' ? node.getData() : (node?.nodeData?.data || {});
+    const currentId = String(data?.nodeId || '').trim();
+    const currentTopic = String(data?.topic || data?.text || '').trim().toLowerCase();
+    if (nodeId && currentId && currentId === nodeId) {
+      matched = node;
+      return true;
+    }
+    if (!nodeId && normalizedTopic && currentTopic === normalizedTopic) {
+      matched = node;
+      return true;
+    }
+    return false;
+  });
+  return matched;
+};
+
+const focusNode = async (nodeId = '', topic = '') => {
+  if (!mindMapInstance.value) {
+    await initMindMap();
+  }
+  const instance = mindMapInstance.value;
+  const renderer = instance?.renderer;
+  if (!instance || !renderer) return false;
+
+  const target = findRenderNode({ nodeId, topic });
+  if (!target) return false;
+
+  if (highlightTimer) {
+    clearTimeout(highlightTimer);
+    highlightTimer = null;
+  }
+  if (lastHighlightedNode && typeof lastHighlightedNode.closeHighlight === 'function') {
+    lastHighlightedNode.closeHighlight();
+  }
+
+  renderer.goTargetNode(target, (resolvedNode) => {
+    const finalNode = resolvedNode || target;
+    if (finalNode && typeof finalNode.highlight === 'function') {
+      finalNode.highlight();
+      lastHighlightedNode = finalNode;
+      highlightTimer = setTimeout(() => {
+        if (finalNode && typeof finalNode.closeHighlight === 'function') {
+          finalNode.closeHighlight();
+        }
+        if (lastHighlightedNode === finalNode) {
+          lastHighlightedNode = null;
+        }
+        highlightTimer = null;
+      }, 1600);
+    }
+  });
+  return true;
+};
+
 const initMindMap = async () => {
   if (mindMapInstance.value) return;
   if (initPromise) {
@@ -436,44 +514,232 @@ const exportXMind = async () => {
   }
 };
 
+const blobToDataUrl = (blob) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve(String(reader.result || ''));
+  reader.onerror = () => reject(new Error('Failed to convert blob to data URL'));
+  reader.readAsDataURL(blob);
+});
+
+const getImageHref = (el) => {
+  const href = el.getAttribute('href');
+  if (href) return href;
+  return el.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || '';
+};
+
+const setImageHref = (el, value) => {
+  el.setAttribute('href', value);
+  el.setAttributeNS('http://www.w3.org/1999/xlink', 'href', value);
+};
+
+const STYLE_URL_RE = /url\((['"]?)([^'")]+)\1\)/gi;
+
+const replaceStyleUrls = async (text, resolver) => {
+  const src = String(text || '');
+  const matches = Array.from(src.matchAll(STYLE_URL_RE));
+  if (!matches.length) return src;
+
+  let result = src;
+  for (const match of matches) {
+    const original = match[0];
+    const url = String(match[2] || '').trim();
+    if (!url || url.startsWith('data:') || url.startsWith('blob:')) continue;
+    const dataUrl = await resolver(url);
+    if (!dataUrl) continue;
+    result = result.split(original).join(`url("${dataUrl}")`);
+  }
+  return result;
+};
+
+const inlineSvgImageResources = async (svgHTML) => {
+  if (!svgHTML) return { svg: svgHTML, unresolved: 0 };
+  let doc = null;
+  try {
+    doc = new DOMParser().parseFromString(svgHTML, 'image/svg+xml');
+  } catch {
+    return { svg: svgHTML, unresolved: 0 };
+  }
+  if (!doc) return { svg: svgHTML, unresolved: 0 };
+
+  const images = Array.from(doc.querySelectorAll('image'));
+  let unresolved = 0;
+
+  const resolveToDataUrl = async (rawHref) => {
+    const source = String(rawHref || '').trim();
+    if (!source || source.startsWith('data:') || source.startsWith('blob:')) {
+      return source;
+    }
+    try {
+      const absoluteUrl = new URL(source, window.location.origin).toString();
+      const resp = await fetch(absoluteUrl, {
+        mode: 'cors',
+        credentials: 'same-origin'
+      });
+      if (!resp.ok) {
+        unresolved += 1;
+        return null;
+      }
+      const imgBlob = await resp.blob();
+      const dataUrl = await blobToDataUrl(imgBlob);
+      if (!dataUrl) {
+        unresolved += 1;
+        return null;
+      }
+      return dataUrl;
+    } catch {
+      unresolved += 1;
+      return null;
+    }
+  };
+
+  const tasks = images.map(async (imgEl) => {
+    const rawHref = String(getImageHref(imgEl) || '').trim();
+    if (!rawHref || rawHref.startsWith('data:') || rawHref.startsWith('blob:')) {
+      return;
+    }
+    const dataUrl = await resolveToDataUrl(rawHref);
+    if (dataUrl) {
+      setImageHref(imgEl, dataUrl);
+    }
+  });
+
+  await Promise.all(tasks);
+
+  const styledNodes = Array.from(doc.querySelectorAll('[style]'));
+  for (const el of styledNodes) {
+    const styleText = el.getAttribute('style');
+    if (!styleText || !styleText.includes('url(')) continue;
+    const replaced = await replaceStyleUrls(styleText, resolveToDataUrl);
+    if (replaced !== styleText) {
+      el.setAttribute('style', replaced);
+    }
+  }
+
+  const styleTags = Array.from(doc.querySelectorAll('style'));
+  for (const styleTag of styleTags) {
+    const css = styleTag.textContent || '';
+    if (!css.includes('url(')) continue;
+    const replacedCss = await replaceStyleUrls(css, resolveToDataUrl);
+    if (replacedCss !== css) {
+      styleTag.textContent = replacedCss;
+    }
+  }
+
+  return {
+    svg: new XMLSerializer().serializeToString(doc),
+    unresolved
+  };
+};
+
+const downloadBlobAsFile = (blob, filename) => {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+};
+
+const exportPngViaServer = async ({ svg, width, height, padding = 20 }) => {
+  const response = await fetch('/api/export/png', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      svg,
+      width,
+      height,
+      padding,
+      background: '#ffffff'
+    })
+  });
+
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`;
+    try {
+      const data = await response.json();
+      const detail = data?.detail || data;
+      message = detail?.message || detail || message;
+    } catch {
+      // Keep fallback status message.
+    }
+    throw new Error(message);
+  }
+
+  const blob = await response.blob();
+  if (!blob || blob.size <= 0) {
+    throw new Error('Server PNG export returned empty content');
+  }
+  downloadBlobAsFile(blob, 'mindmap.png');
+};
+
 const exportPNG = async () => {
   if (!mindMapInstance.value) return;
 
   try {
     const { svgHTML, rect } = mindMapInstance.value.getSvgData({});
-    const svgBlob = new Blob([svgHTML], { type: 'image/svg+xml;charset=utf-8' });
-    const svgUrl = URL.createObjectURL(svgBlob);
+    const { svg: safeSvg, unresolved } = await inlineSvgImageResources(svgHTML);
 
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     const img = new Image();
+    img.crossOrigin = 'anonymous';
 
     const width = Math.max(1, Math.ceil(rect?.width || 1));
     const height = Math.max(1, Math.ceil(rect?.height || 1));
     canvas.width = width + 40;
     canvas.height = height + 40;
 
-    img.onload = () => {
-      if (!ctx) return;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 20, 20, width, height);
-      URL.revokeObjectURL(svgUrl);
+    let localExportError = null;
+    if (unresolved === 0) {
+      try {
+        const svgBlob = new Blob([safeSvg], { type: 'image/svg+xml;charset=utf-8' });
+        const svgUrl = URL.createObjectURL(svgBlob);
+        const pngBlob = await new Promise((resolve, reject) => {
+          img.onload = () => {
+            try {
+              if (!ctx) {
+                reject(new Error('Canvas context is unavailable'));
+                return;
+              }
+              ctx.fillStyle = '#ffffff';
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              ctx.drawImage(img, 20, 20, width, height);
 
-      canvas.toBlob((blob) => {
-        if (!blob) return;
-        const pngUrl = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = pngUrl;
-        a.download = 'mindmap.png';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(pngUrl);
-      }, 'image/png');
-    };
+              canvas.toBlob((blob) => {
+                if (!blob) {
+                  reject(new Error('Canvas export failed: possible CORS taint'));
+                  return;
+                }
+                resolve(blob);
+              }, 'image/png');
+            } catch (err) {
+              reject(err instanceof Error ? err : new Error('PNG rendering failed'));
+            } finally {
+              URL.revokeObjectURL(svgUrl);
+            }
+          };
+          img.onerror = () => {
+            URL.revokeObjectURL(svgUrl);
+            reject(new Error('Failed to load generated SVG for PNG export'));
+          };
+          img.src = svgUrl;
+        });
+        downloadBlobAsFile(pngBlob, 'mindmap.png');
+      } catch (err) {
+        localExportError = err instanceof Error ? err : new Error('Local PNG export failed');
+      }
+    } else {
+      localExportError = new Error(`Unresolved SVG assets detected: ${unresolved}`);
+    }
 
-    img.src = svgUrl;
+    if (localExportError && canUseServerPngExport.value) {
+      await exportPngViaServer({ svg: safeSvg, width, height, padding: 20 });
+    } else if (localExportError) {
+      throw localExportError;
+    }
+
     emit('export', 'png');
   } catch (err) {
     console.error('导出 PNG 失败:', err);
@@ -539,6 +805,14 @@ onUnmounted(() => {
     clearTimeout(fitTimer);
     fitTimer = null;
   }
+  if (highlightTimer) {
+    clearTimeout(highlightTimer);
+    highlightTimer = null;
+  }
+  if (lastHighlightedNode && typeof lastHighlightedNode.closeHighlight === 'function') {
+    lastHighlightedNode.closeHighlight();
+    lastHighlightedNode = null;
+  }
   if (resizeObserver) {
     resizeObserver.disconnect();
     resizeObserver = null;
@@ -573,6 +847,7 @@ defineExpose({
   zoomIn,
   zoomOut,
   getZoomPercent,
+  focusNode,
 });
 </script>
 

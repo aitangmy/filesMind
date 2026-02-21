@@ -853,6 +853,8 @@ const pollTimer = ref(null);
 const taskStatus = ref('');
 const taskProgress = ref(0);
 const taskMessage = ref('');
+const taskFailureDetails = ref([]);
+const showAllFailureDetails = ref(false);
 const treeData = ref(null);
 const sourceIndexRebuildRunning = ref(false);
 const sourceIndexRebuildResult = ref(null);
@@ -957,6 +959,24 @@ const workspaceGridStyle = computed(() => {
   };
 });
 const topNoticeVisible = computed(() => isLoading.value || Boolean(errorMsg.value));
+const hasTaskFailureDetails = computed(() => Array.isArray(taskFailureDetails.value) && taskFailureDetails.value.length > 0);
+const taskFailureDetailCount = computed(() => (hasTaskFailureDetails.value ? taskFailureDetails.value.length : 0));
+const visibleTaskFailureDetails = computed(() => {
+  const list = hasTaskFailureDetails.value ? taskFailureDetails.value : [];
+  if (showAllFailureDetails.value) return list;
+  return list.slice(0, 6);
+});
+
+const normalizeFailureDetails = (input) => {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => ({
+      nodeId: String(item?.node_id || item?.nodeId || '').trim(),
+      topic: String(item?.topic || '').trim(),
+      error: String(item?.error || '').trim()
+    }))
+    .filter((item) => item.topic || item.nodeId || item.error);
+};
 
 watch(showPdfViewer, (visible) => {
   if (visible) {
@@ -1133,10 +1153,60 @@ const handleMindmapZoomChange = (payload) => {
   }
 };
 
+const clearTaskErrorNotice = () => {
+  errorMsg.value = '';
+  taskFailureDetails.value = [];
+  showAllFailureDetails.value = false;
+};
+
+const locateFailedNode = async (item) => {
+  const candidates = Array.isArray(flatNodes.value) ? flatNodes.value : [];
+  if (!candidates.length) {
+    notify('warning', 'Current mind map index is not ready yet');
+    return;
+  }
+
+  let matched = null;
+  if (item?.nodeId) {
+    matched = candidates.find((node) => String(node?.node_id || '') === String(item.nodeId));
+  }
+
+  if (!matched && item?.topic) {
+    const topic = String(item.topic).trim().toLowerCase();
+    matched = candidates.find((node) => String(node?.topic || '').trim().toLowerCase() === topic);
+  }
+
+  if (!matched) {
+    notify('warning', 'Failed node is not available in current tree index');
+    return;
+  }
+
+  await handleMindmapNodeClick({
+    nodeId: matched.node_id || '',
+    topic: matched.topic || item?.topic || '',
+    level: Number(matched.level || 0),
+    sourceLineStart: Number(matched.source_line_start || 0),
+    sourceLineEnd: Number(matched.source_line_end || 0)
+  });
+
+  await nextTick();
+  if (mindMapRef.value?.focusNode) {
+    const focused = await mindMapRef.value.focusNode(
+      String(matched.node_id || item?.nodeId || ''),
+      String(matched.topic || item?.topic || '')
+    );
+    if (!focused) {
+      notify('warning', 'Node located in details pane, but visual focus in mind map failed');
+    }
+  }
+};
+
 // 鍔犺浇鏂囦欢鍐呭
 const loadFile = async (fileId) => {
   try {
     resetSourceView();
+    taskFailureDetails.value = [];
+    showAllFailureDetails.value = false;
     const response = await fetch(`/api/file/${fileId}`);
     if (!response.ok) {
       throw new Error('鏂囦欢鍔犺浇澶辫触');
@@ -1229,9 +1299,12 @@ const pollTaskStatus = async (docId, taskId = '') => {
     taskStatus.value = data.status;
     taskProgress.value = data.progress;
     taskMessage.value = data.message;
+    taskFailureDetails.value = normalizeFailureDetails(data.failure_details);
 
     if (data.status === 'completed' || data.status === 'completed_with_gaps') {
       cleanupPoll();
+      taskFailureDetails.value = [];
+      showAllFailureDetails.value = false;
       const resolvedFileId = data.doc_id || data.file_id || docId;
       if (resolvedFileId) {
         currentFileId.value = resolvedFileId;
@@ -1250,6 +1323,7 @@ const pollTaskStatus = async (docId, taskId = '') => {
       cleanupPoll();
       isMindmapReady.value = false;
       errorMsg.value = data.error || 'Processing failed';
+      showAllFailureDetails.value = false;
       isLoading.value = false;
       uploadProgress.value = 0;
       await loadHistory();
@@ -1257,6 +1331,8 @@ const pollTaskStatus = async (docId, taskId = '') => {
       cleanupPoll();
       isMindmapReady.value = false;
       errorMsg.value = data.message || 'Task cancelled';
+      taskFailureDetails.value = [];
+      showAllFailureDetails.value = false;
       isLoading.value = false;
       uploadProgress.value = 0;
       await loadHistory();
@@ -1363,6 +1439,8 @@ const handleSelectedFile = async (file, clearInput) => {
   }
 
   isLoading.value = true;
+  taskFailureDetails.value = [];
+  showAllFailureDetails.value = false;
   resetSourceView();
   isMindmapReady.value = false;
   errorMsg.value = '';
@@ -1463,6 +1541,8 @@ const cancelTask = async () => {
   uploadProgress.value = 0;
   taskProgress.value = 0;
   taskMessage.value = 'Task cancelled';
+  taskFailureDetails.value = [];
+  showAllFailureDetails.value = false;
   await loadHistory();
 };
 
@@ -2034,19 +2114,55 @@ const runSourceIndexRebuild = async (dryRun = false) => {
           </div>
           <div
             v-if="errorMsg"
-            class="rounded-xl border border-rose-200/80 bg-gradient-to-r from-rose-50 to-orange-50 px-3 py-2 flex items-center gap-2"
+            class="rounded-xl border border-rose-200/80 bg-gradient-to-r from-rose-50 to-orange-50 px-3 py-2"
           >
-            <div class="p-1 rounded-md bg-rose-100">
-              <svg class="w-4 h-4 text-rose-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-              </svg>
+            <div class="flex items-center gap-2">
+              <div class="p-1 rounded-md bg-rose-100">
+                <svg class="w-4 h-4 text-rose-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+              </div>
+              <span class="text-xs font-medium text-rose-700 truncate">{{ errorMsg }}</span>
+              <button
+                @click="clearTaskErrorNotice"
+                class="ml-auto p-1 rounded-md text-rose-400 hover:text-rose-600 hover:bg-rose-100 transition-all duration-200"
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                </svg>
+              </button>
             </div>
-            <span class="text-xs font-medium text-rose-700 truncate">{{ errorMsg }}</span>
-            <button @click="errorMsg = ''" class="ml-auto p-1 rounded-md text-rose-400 hover:text-rose-600 hover:bg-rose-100 transition-all duration-200">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
-              </svg>
-            </button>
+            <div v-if="hasTaskFailureDetails" class="mt-2 rounded-lg border border-rose-200 bg-white/80 p-2.5">
+              <div class="flex items-center justify-between gap-2 mb-2">
+                <span class="text-[11px] font-semibold text-rose-700">Failure Nodes ({{ taskFailureDetailCount }})</span>
+                <button
+                  v-if="taskFailureDetailCount > 6"
+                  @click="showAllFailureDetails = !showAllFailureDetails"
+                  class="text-[11px] text-rose-600 hover:text-rose-700 font-medium"
+                >
+                  {{ showAllFailureDetails ? 'Collapse' : 'Show all' }}
+                </button>
+              </div>
+              <div class="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                <div
+                  v-for="(item, idx) in visibleTaskFailureDetails"
+                  :key="`${item.nodeId || item.topic || 'node'}-${idx}`"
+                  class="failure-item"
+                >
+                  <div class="failure-head">
+                    <span class="failure-topic" :title="item.topic || item.nodeId || 'Unknown node'">{{ item.topic || item.nodeId || 'Unknown node' }}</span>
+                    <button
+                      class="failure-jump-btn"
+                      @click="locateFailedNode(item)"
+                      title="Locate this failed node"
+                    >
+                      定位
+                    </button>
+                  </div>
+                  <div class="failure-error" :title="item.error || 'Unknown error'">{{ item.error || 'Unknown error' }}</div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </header>
@@ -2879,5 +2995,57 @@ const runSourceIndexRebuild = async (dryRun = false) => {
 @keyframes skeleton-breath {
   0%, 100% { opacity: 0.65; }
   50% { opacity: 1; }
+}
+
+.failure-item {
+  border: 1px solid #fecdd3;
+  border-radius: 0.6rem;
+  background: linear-gradient(180deg, #fff1f2 0%, #ffffff 100%);
+  padding: 0.45rem 0.55rem;
+}
+
+.failure-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.failure-jump-btn {
+  flex-shrink: 0;
+  border: 1px solid #fda4af;
+  background: #fff1f2;
+  color: #be123c;
+  font-size: 0.66rem;
+  line-height: 1;
+  font-weight: 700;
+  border-radius: 0.45rem;
+  padding: 0.2rem 0.45rem;
+  transition: all 0.15s ease;
+}
+
+.failure-jump-btn:hover {
+  background: #ffe4e6;
+  border-color: #fb7185;
+}
+
+.failure-topic {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #be123c;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.failure-error {
+  margin-top: 0.2rem;
+  font-size: 0.68rem;
+  line-height: 1.2rem;
+  color: #9f1239;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 </style>

@@ -7,6 +7,7 @@ import asyncio
 import re
 import atexit
 import json
+import random
 
 try:
     from openai import AsyncOpenAI
@@ -306,6 +307,10 @@ class RateLimiter:
 
         if wait_time > 0.001:
             await asyncio.sleep(wait_time)
+
+
+class RefineNodeRequestError(RuntimeError):
+    """Raised when refinement request exhausts retries for a node."""
 
 
 # 全局限流器和信号量
@@ -771,6 +776,33 @@ def _is_response_format_error(error_message: str) -> bool:
     return "expr_path=response_format" in msg
 
 
+def _extract_retry_after_seconds(error_message: str) -> float:
+    """
+    Best-effort parser for provider error text containing Retry-After hints.
+    """
+    message = str(error_message or "")
+    if not message:
+        return 0.0
+    patterns = [
+        r"retry[-_\s]*after[^\d]*(\d+(?:\.\d+)?)",
+        r"(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?\b",
+        r"(\d+(?:\.\d+)?)\s*ms\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, message, re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            raw = float(m.group(1))
+            if "ms" in pattern:
+                raw = raw / 1000.0
+            if raw > 0:
+                return raw
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
 _REFINE_NOISE_RE = re.compile(
     r"^(?:"
     r"-\s*\d+\s*-"
@@ -1025,39 +1057,68 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
     请提取关键信息作为子节点。忽略与本章节无关的内容。
     """
 
-    try:
-        client = get_client()
-        model = get_model()
-        is_minimax = _is_minimax_backend(model, client)
+    semaphore, rate_limiter = get_rate_limiter()
+    model = get_model()
+    strategy = get_strategy(model)
+    # Refinement failures are expensive for long docs; allow bounded retries for all providers.
+    max_retries = strategy.get("max_retries", 3) if strategy["type"] == "adaptive" else 3
+    base_delay = float(strategy.get("base_delay", 1.0))
+    backoff_base = float(strategy.get("backoff_base", 2))
 
-        request_kwargs = {
-            "model": model,
-            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            "temperature": 0.3,
-            "max_tokens": 2000,
-        }
-        if is_minimax:
-            extra_body = dict(request_kwargs.get("extra_body") or {})
-            extra_body["reasoning_split"] = True
-            request_kwargs["extra_body"] = extra_body
+    async with semaphore:
+        for attempt in range(max_retries + 1):
+            try:
+                if rate_limiter:
+                    await rate_limiter.acquire()
 
-        use_response_format = _should_use_response_format(model, client)
-        response = await _create_refine_completion(client, request_kwargs, use_response_format)
-        content = response.choices[0].message.content
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, dict):
-                    text = part.get("text") or part.get("content")
-                    if isinstance(text, str) and text:
-                        parts.append(text)
-                elif isinstance(part, str):
-                    parts.append(part)
-            content = "\n".join(parts).strip()
-        elif not isinstance(content, str):
-            content = str(content or "")
-        return _parse_refine_response(content, node_title)
+                client = get_client()
+                model = get_model()
+                is_minimax = _is_minimax_backend(model, client)
 
-    except Exception as e:
-        print(f"Refine node {node_title} failed: {e}")
-        return []
+                request_kwargs = {
+                    "model": model,
+                    "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                    "temperature": _engine_settings.get("temperature", ENGINE_LIMITS["temperature"]["default"]),
+                    "max_tokens": _engine_settings.get("max_tokens", ENGINE_LIMITS["max_tokens"]["default"]),
+                }
+                if is_minimax:
+                    extra_body = dict(request_kwargs.get("extra_body") or {})
+                    extra_body["reasoning_split"] = True
+                    request_kwargs["extra_body"] = extra_body
+
+                use_response_format = _should_use_response_format(model, client)
+                response = await _create_refine_completion(client, request_kwargs, use_response_format)
+                content = response.choices[0].message.content
+                if isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if isinstance(part, dict):
+                            text = part.get("text") or part.get("content")
+                            if isinstance(text, str) and text:
+                                parts.append(text)
+                        elif isinstance(part, str):
+                            parts.append(part)
+                    content = "\n".join(parts).strip()
+                elif not isinstance(content, str):
+                    content = str(content or "")
+                return _parse_refine_response(content, node_title)
+
+            except Exception as e:
+                error_msg = str(e)
+                if attempt >= max_retries:
+                    print(f"Refine node {node_title} failed after retries: {e}")
+                    raise RefineNodeRequestError(
+                        f"refine_node_content exhausted retries for node={node_title}: {error_msg}"
+                    ) from e
+
+                retry_after = _extract_retry_after_seconds(error_msg)
+                if retry_after > 0:
+                    sleep_time = retry_after
+                elif "429" in error_msg or "rate limit" in error_msg.lower():
+                    sleep_time = base_delay * (backoff_base**attempt)
+                else:
+                    sleep_time = 1.0 + attempt * 0.5
+
+                # Add low-amplitude jitter to reduce synchronized retry bursts.
+                sleep_time = max(0.1, sleep_time + random.uniform(0.0, 0.25))
+                await asyncio.sleep(sleep_time)

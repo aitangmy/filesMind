@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import asyncio
 import types
 import unittest
 from pathlib import Path
@@ -116,6 +117,7 @@ class FastAPIEndpointTests(unittest.TestCase):
         data = res.json()
         self.assertEqual(data["file_id"], "file-1")
         self.assertEqual(data["progress"], 42)
+        self.assertIn("failure_details", data)
 
     def test_upload_duplicate_processing_reuses_existing_task(self):
         content = b"same-pdf-content"
@@ -190,6 +192,25 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertEqual(history[0]["file_id"], old_file_id)
         self.assertEqual(history[0]["task_id"], data["task_id"])
         self.assertEqual(history[0]["status"], "processing")
+
+    def test_upload_rejects_oversized_file_with_413(self):
+        old_limit = app_module.MAX_UPLOAD_BYTES
+        app_module.MAX_UPLOAD_BYTES = 1024
+        try:
+            payload = b"a" * 2048
+            with TestClient(app_module.app) as client:
+                res = client.post("/upload", files={"file": ("oversized.pdf", payload, "application/pdf")})
+
+            self.assertEqual(res.status_code, 413)
+            detail = res.json().get("detail", {})
+            self.assertEqual(detail.get("code"), "FILE_TOO_LARGE")
+            self.assertEqual(detail.get("max_bytes"), 1024)
+
+            temp_dir = Path(app_module.DATA_DIR) / "temp"
+            if temp_dir.exists():
+                self.assertEqual(list(temp_dir.iterdir()), [])
+        finally:
+            app_module.MAX_UPLOAD_BYTES = old_limit
 
     def test_delete_file_removes_disk_artifacts(self):
         file_id = "file-delete"
@@ -789,6 +810,149 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertEqual(len(source_md.splitlines()), len(raw_md.splitlines()))
         self.assertNotIn("fm_anchor", source_md)
         self.assertIn("\n\n\n", source_md)
+
+    def test_process_document_task_uses_engine_level_limiter_only(self):
+        file_id = "file-engine-limiter"
+        task_id = "task-engine-limiter"
+        pdf_path = Path(app_module.PDF_DIR) / "engine-limiter.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n")
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        md_path.write_text("# placeholder", encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="engine-limiter.pdf",
+            file_hash="hash-engine-limiter",
+            pdf_path=str(pdf_path),
+            md_path=str(md_path),
+            status="processing",
+            task_id=task_id,
+        )
+        task = app_module.create_task(task_id, file_id=file_id)
+
+        class _Node:
+            def __init__(self, topic, content, level=1, node_id="n"):
+                self.topic = topic
+                self.full_content = content
+                self.level = level
+                self.id = node_id
+                self.source_line_start = 1
+                self.source_line_end = 3
+                self.children = []
+                self.ai_details = []
+
+            def get_breadcrumbs(self):
+                return self.topic
+
+        root = _Node("Root", "x" * 80, level=0, node_id="root")
+        child = _Node("Child", "y" * 120, level=1, node_id="child-1")
+        root.children = [child]
+
+        structure_utils = types.ModuleType("structure_utils")
+        structure_utils.build_hierarchy_tree = lambda _md: root
+        structure_utils.assign_stable_node_ids = lambda _root, file_id=None: None
+        structure_utils.tree_to_markdown = lambda _root: "## Final"
+
+        call_counter = {"count": 0}
+        cognitive_engine = types.ModuleType("cognitive_engine")
+
+        async def _refine_node_content(node_title, content_chunk, context_path=""):
+            call_counter["count"] += 1
+            return [{"topic": f"{node_title}-detail", "details": [context_path, content_chunk[:8]]}]
+
+        cognitive_engine.refine_node_content = _refine_node_content
+
+        with patch.dict(sys.modules, {"structure_utils": structure_utils, "cognitive_engine": cognitive_engine}):
+            with patch.object(app_module, "process_pdf_safely", return_value=("# Root\n\n## Child\nBody", None)):
+                with patch.object(
+                    app_module.asyncio,
+                    "Semaphore",
+                    side_effect=AssertionError("app-level semaphore should not be used in stage 3"),
+                ):
+                    asyncio.run(
+                        app_module.process_document_task(
+                            task_id=task_id,
+                            file_location=str(pdf_path),
+                            file_id=file_id,
+                            original_filename="engine-limiter.pdf",
+                        )
+                    )
+
+        self.assertEqual(task.status, app_module.TaskStatus.COMPLETED)
+        self.assertGreaterEqual(call_counter["count"], 1)
+
+    def test_process_document_task_fails_when_refinement_nodes_fail(self):
+        file_id = "file-engine-fail"
+        task_id = "task-engine-fail"
+        pdf_path = Path(app_module.PDF_DIR) / "engine-fail.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n")
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        md_path.write_text("# placeholder", encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="engine-fail.pdf",
+            file_hash="hash-engine-fail",
+            pdf_path=str(pdf_path),
+            md_path=str(md_path),
+            status="processing",
+            task_id=task_id,
+        )
+        task = app_module.create_task(task_id, file_id=file_id)
+
+        class _Node:
+            def __init__(self, topic, content, level=1, node_id="n"):
+                self.topic = topic
+                self.full_content = content
+                self.level = level
+                self.id = node_id
+                self.source_line_start = 1
+                self.source_line_end = 3
+                self.children = []
+                self.ai_details = []
+
+            def get_breadcrumbs(self):
+                return self.topic
+
+        root = _Node("Root", "x" * 80, level=0, node_id="root")
+        child = _Node("Child", "y" * 120, level=1, node_id="child-1")
+        root.children = [child]
+
+        structure_utils = types.ModuleType("structure_utils")
+        structure_utils.build_hierarchy_tree = lambda _md: root
+        structure_utils.assign_stable_node_ids = lambda _root, file_id=None: None
+        structure_utils.tree_to_markdown = lambda _root: "## Final"
+
+        cognitive_engine = types.ModuleType("cognitive_engine")
+
+        async def _refine_node_content(node_title, content_chunk, context_path=""):
+            raise RuntimeError(f"429 for {node_title}")
+
+        cognitive_engine.refine_node_content = _refine_node_content
+
+        with patch.dict(sys.modules, {"structure_utils": structure_utils, "cognitive_engine": cognitive_engine}):
+            with patch.object(app_module, "process_pdf_safely", return_value=("# Root\n\n## Child\nBody", None)):
+                asyncio.run(
+                    app_module.process_document_task(
+                        task_id=task_id,
+                        file_location=str(pdf_path),
+                        file_id=file_id,
+                        original_filename="engine-fail.pdf",
+                    )
+                )
+
+        self.assertEqual(task.status, app_module.TaskStatus.FAILED)
+        self.assertIn("Refinement failed for", task.message)
+        self.assertEqual(len(task.failure_details), 2)
+        self.assertEqual(task.failure_details[0]["topic"], "Root")
+
+        app_module.tasks.pop(task_id, None)
+        with TestClient(app_module.app) as client:
+            status_res = client.get(f"/task/{task_id}")
+        self.assertEqual(status_res.status_code, 200)
+        status_data = status_res.json()
+        self.assertEqual(status_data["status"], "failed")
+        self.assertEqual(len(status_data.get("failure_details") or []), 2)
 
 
 if __name__ == "__main__":
