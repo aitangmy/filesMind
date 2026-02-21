@@ -10,7 +10,7 @@ Convert long PDFs into structured mind maps with source traceability, editable w
 
 ---
 
-## What FilesMind Does
+## 🌟 What FilesMind Does
 
 FilesMind is a full-stack app for deep document reading:
 
@@ -22,7 +22,52 @@ FilesMind is a full-stack app for deep document reading:
 
 ---
 
-## Key Features
+## 🧱 Frontend Architecture
+
+The frontend now uses a feature-domain loading model focused on reliability and performance:
+
+1. **Async feature loading**
+- `MindMap` and `VirtualPdfViewer` are loaded via resilient async components.
+- Async modules have loading state, error state, and automatic retry.
+
+2. **Feature-based chunking**
+- `pdfjs` chunk: `pdfjs-dist`
+- `pdf-viewer` chunk: `vue-pdf-embed`
+- `mindmap-vendor` chunk: `simple-mind-map` core
+- `export-xmind` chunk: XMind export plugins only
+- `vendor` chunk: remaining shared dependencies
+
+3. **Intent-based prefetch**
+- Hover/focus export button prefetches XMind exporter.
+- Entering/hovering PDF detail area prefetches PDF viewer assets.
+
+4. **Runtime chunk failure recovery**
+- `vite:preloadError` listener auto-reloads the page to recover from stale chunk references after deployment.
+
+---
+
+## 📦 Bundle Budget Gate
+
+Bundle budgets are enforced via `frontend/scripts/check-bundle-size.mjs`.
+
+Current gzip thresholds:
+
+- `app-shell` (`index-*.js`): `<= 120 KB`
+- `pdfjs` (`pdfjs-*.js`): `<= 180 KB`
+- `pdf-viewer` (`pdf-viewer-*.js`): `<= 850 KB`
+- `single-chunk` (all other JS chunks): `<= 500 KB`
+
+Commands:
+
+```bash
+cd frontend
+npm run analyze      # build + report-only budget table
+npm run check:bundle # enforce budget and fail on violation
+```
+
+---
+
+## ✨ Key Features
 
 - Parser backend switching (`docling`, `marker`, `hybrid`) with runtime config.
 - Settings center with model profiles, parser controls, and advanced engine controls.
@@ -30,11 +75,11 @@ FilesMind is a full-stack app for deep document reading:
 - Runtime task timeout control (`60` to `7200` seconds).
 - Source index tree + per-node source excerpt API.
 - Config import/export and encrypted config persistence on backend.
-- Frontend workspace + settings route (`/workspace`, `/settings`).
+- Frontend workspace + settings routes (`/workspace`, `/settings`).
 
 ---
 
-## Requirements
+## 🧰 Requirements
 
 - Python `3.12.x` (`==3.12.*` in `pyproject.toml`)
 - Node.js `>= 18`
@@ -42,7 +87,7 @@ FilesMind is a full-stack app for deep document reading:
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
 ### 1. Clone
 
@@ -81,7 +126,7 @@ Frontend URL: `http://localhost:5173`
 
 ---
 
-## First-Time Setup (Required)
+## ⚙️ First-Time Setup (Required)
 
 Before uploading PDFs, open **Settings** and configure:
 
@@ -95,7 +140,7 @@ If this step is skipped, task processing will fail.
 
 ---
 
-## Parser and Advanced Settings
+## 🧪 Parser and Advanced Settings
 
 ### Parser controls
 
@@ -113,14 +158,9 @@ If this step is skipped, task processing will fail.
 - `engine_temperature`: `0 ~ 1`
 - `engine_max_tokens`: `1000 ~ 16000`
 
-Notes:
-
-- Advanced panel changes trigger debounced auto-save.
-- Task timeout is applied at runtime by backend task runner.
-
 ---
 
-## Optional Environment Variables
+## 🌍 Optional Environment Variables
 
 - `PARSER_BACKEND` (default `docling`)
 - `HYBRID_NOISE_THRESHOLD` (default `0.20`)
@@ -132,9 +172,9 @@ Notes:
 
 ---
 
-## API Surface (Backend)
+## 🔌 API Surface (Backend)
 
-Main endpoints (frontend accesses them via `/api/*` proxy):
+Main endpoints (frontend accesses via `/api/*` proxy):
 
 - `POST /upload`
 - `GET /task/{task_id}`
@@ -154,7 +194,7 @@ Main endpoints (frontend accesses them via `/api/*` proxy):
 
 ---
 
-## Data and Persistence
+## 💾 Data and Persistence
 
 Generated and runtime data are stored under `backend/data/`:
 
@@ -168,32 +208,45 @@ Generated and runtime data are stored under `backend/data/`:
 
 ---
 
-## Project Structure
+## 🗂️ Project Structure
 
 ```text
 filesMind/
   backend/
-    app.py                # FastAPI API + task orchestration
-    parser_service.py     # PDF parsing and parser backend routing
-    cognitive_engine.py   # LLM integration and advanced engine runtime limits
-    structure_utils.py    # Hierarchy reconstruction helpers
-    data/                 # Persistent runtime data
-    tests/                # Backend tests
+    app.py
+    parser_service.py
+    cognitive_engine.py
+    structure_utils.py
+    data/
+    tests/
   frontend/
     src/WorkspaceShell.vue
     src/components/MindMap.vue
-    src/router/index.js
+    src/components/VirtualPdfViewer.vue
+    src/main.js
+    vite.config.js
+    scripts/check-bundle-size.mjs
     package.json
-  scripts/test_all.sh     # Local all-in-one checks
+  scripts/test_all.sh
   pyproject.toml
   uv.lock
 ```
 
 ---
 
-## Development Checks
+## ✅ Development Checks
 
-Run full local checks:
+Frontend checks:
+
+```bash
+cd frontend
+npm run build
+npm run test:unit
+npm run test:e2e
+npm run check:bundle
+```
+
+Full local checks:
 
 ```bash
 ./scripts/test_all.sh
@@ -207,7 +260,7 @@ SKIP_E2E=1 ./scripts/test_all.sh
 
 ---
 
-## Production Deployment (Minimal)
+## 🚢 Production Deployment (Minimal)
 
 1. Build frontend:
 
@@ -231,20 +284,36 @@ uv run uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
 
 ---
 
-## Troubleshooting
+## ❓ Q&A
 
-1. Dependency install fails:
-- Confirm Python `3.12.x`.
-- Re-run `uv sync` from repo root.
+1. **Why is `pdf-viewer` budget set to `850 KB`?**  
+`vue-pdf-embed` currently bundles large rendering/runtime code. We keep a strict ceiling to prevent further regressions while preserving PDF functionality.
 
-2. Frontend startup fails:
+2. **Can I lower bundle limits immediately?**  
+Yes, but expect failures until you further split or replace heavy dependencies. Start with `npm run analyze` and reduce thresholds gradually.
+
+3. **Should CI enforce `check:bundle`?**  
+Yes. Treat it as a required gate before merge to prevent silent performance regressions.
+
+4. **Why do async modules auto-retry?**  
+To reduce transient loading failures (network hiccups, stale cache windows) and improve end-user resilience.
+
+---
+
+## 🛠️ Troubleshooting
+
+1. Frontend startup fails:
 - Confirm Node `>= 18`.
-- Reinstall `frontend` dependencies.
+- Reinstall frontend dependencies.
 
-3. Long-running tasks:
-- Check backend logs.
-- Increase timeout in Settings (`task_timeout_seconds`).
-- Tune parser backend and worker count.
+2. E2E fails with temp/output permission error on Windows:
+- Ensure Playwright output uses project-local path.
+- Run test command with sufficient file permissions.
+
+3. Large bundle warning:
+- Run `npm run analyze`.
+- Check `manualChunks` and dynamic imports.
+- Keep `npm run check:bundle` green before merge.
 
 4. Model connection test fails:
 - Verify endpoint/model/key.
@@ -252,7 +321,7 @@ uv run uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
 
 ---
 
-## Contributing
+## 🤝 Contributing
 
 Issues and pull requests are welcome.
 
@@ -260,6 +329,6 @@ For repository guidelines, see `CONTRIBUTING.md`.
 
 ---
 
-## License
+## 📄 License
 
 MIT License. See [LICENSE](LICENSE).

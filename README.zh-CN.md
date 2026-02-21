@@ -2,7 +2,7 @@
 
 > [English](README.md) | [简体中文](README.zh-CN.md)
 
-将长篇 PDF 转换为结构化导图，支持源码追溯、可编辑流程和可配置的大模型处理参数。
+将长篇 PDF 转换为结构化思维导图，支持来源追溯、可编辑流程与可配置的大模型处理参数。
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Backend](https://img.shields.io/badge/Backend-FastAPI-009688.svg)
@@ -10,31 +10,76 @@
 
 ---
 
-## 项目能力
+## 🌟 项目能力
 
-FilesMind 是一个面向深度文档阅读的全栈应用：
+FilesMind 是面向深度文档阅读的全栈应用：
 
 1. 使用 `docling` / `marker` / `hybrid` 解析 PDF。
-2. 通过大模型精炼生成层级化知识结构。
-3. 持久化任务结果和历史记录。
-4. 支持节点回溯到源 Markdown 的行号片段。
+2. 通过大模型逐层细化，生成层级知识树。
+3. 持久化任务结果与历史记录。
+4. 支持节点回溯到源 Markdown 行号区间。
 5. 导出 Markdown / XMind / PNG。
 
 ---
 
-## 核心特性
+## 🧱 前端架构
 
-- 解析后端可切换（`docling`、`marker`、`hybrid`），支持运行时配置。
-- 配置中心包含模型档案、解析参数与高级引擎参数。
-- 高级参数支持防抖自动保存。
-- 任务超时可运行时调整（`60` 到 `7200` 秒）。
-- 支持 source index 树与节点源码摘录接口。
-- 支持配置导入/导出，后端持久化配置加密存储。
-- 前端支持工作区和设置页路由（`/workspace`、`/settings`）。
+当前前端采用“按功能域加载”的高鲁棒方案：
+
+1. **异步能力加载**
+- `MindMap` 与 `VirtualPdfViewer` 通过可恢复异步组件加载。
+- 异步组件具备 `loading`、`error`、自动重试机制。
+
+2. **按功能域拆包**
+- `pdfjs`：`pdfjs-dist`
+- `pdf-viewer`：`vue-pdf-embed`
+- `mindmap-vendor`：`simple-mind-map` 核心
+- `export-xmind`：仅 XMind 导出插件
+- `vendor`：其他通用依赖
+
+3. **意图驱动预取**
+- 鼠标悬停/聚焦导出按钮时预取 XMind 导出依赖。
+- 进入/悬停 PDF 详情区域时预取 PDF 相关依赖。
+
+4. **动态 Chunk 失败自恢复**
+- 监听 `vite:preloadError`，发布后出现旧 Chunk 引用时自动刷新恢复。
 
 ---
 
-## 环境要求
+## 📦 体积预算门禁
+
+预算校验脚本：`frontend/scripts/check-bundle-size.mjs`
+
+当前 gzip 阈值：
+
+- `app-shell`（`index-*.js`）: `<= 120 KB`
+- `pdfjs`（`pdfjs-*.js`）: `<= 180 KB`
+- `pdf-viewer`（`pdf-viewer-*.js`）: `<= 850 KB`
+- `single-chunk`（其余 JS Chunk）: `<= 500 KB`
+
+命令：
+
+```bash
+cd frontend
+npm run analyze      # 构建并输出预算报告（不阻断）
+npm run check:bundle # 严格预算校验（超限即失败）
+```
+
+---
+
+## ✨ 核心特性
+
+- 解析后端可切换（`docling`、`marker`、`hybrid`）且支持运行时配置。
+- 配置中心包含模型档案、解析参数与高级引擎参数。
+- 高级参数支持防抖自动保存。
+- 任务超时支持运行时调整（`60` 到 `7200` 秒）。
+- 支持 source index 树与节点源码摘录接口。
+- 支持配置导入/导出，后端配置加密存储。
+- 前端提供工作区与设置页路由（`/workspace`、`/settings`）。
+
+---
+
+## 🧰 环境要求
 
 - Python `3.12.x`（`pyproject.toml` 固定 `==3.12.*`）
 - Node.js `>= 18`
@@ -42,7 +87,7 @@ FilesMind 是一个面向深度文档阅读的全栈应用：
 
 ---
 
-## 快速开始
+## 🚀 快速开始
 
 ### 1. 克隆项目
 
@@ -81,7 +126,7 @@ npm run dev
 
 ---
 
-## 首次使用必做配置
+## ⚙️ 首次使用必做配置
 
 上传 PDF 前，请先进入 **Settings** 完成：
 
@@ -91,36 +136,31 @@ npm run dev
 4. 点击 **测试连接**
 5. 点击 **保存全部配置**
 
-若跳过该步骤，任务处理会失败。
+跳过该步骤会导致任务处理失败。
 
 ---
 
-## 解析与高级参数
+## 🧪 解析与高级参数
 
 ### 解析参数
 
-- `parser_backend`：`docling` / `marker` / `hybrid`
-- `task_timeout_seconds`：`60 ~ 7200`
-- `hybrid_noise_threshold`：`0 ~ 1`
-- `hybrid_docling_skip_score`：`0 ~ 100`
-- `hybrid_switch_min_delta`：`0 ~ 50`
-- `hybrid_marker_min_length`：`0 ~ 1000000`
-- `marker_prefer_api`：`true/false`
+- `parser_backend`: `docling` / `marker` / `hybrid`
+- `task_timeout_seconds`: `60 ~ 7200`
+- `hybrid_noise_threshold`: `0 ~ 1`
+- `hybrid_docling_skip_score`: `0 ~ 100`
+- `hybrid_switch_min_delta`: `0 ~ 50`
+- `hybrid_marker_min_length`: `0 ~ 1000000`
+- `marker_prefer_api`: `true/false`
 
 ### 高级引擎参数
 
-- `engine_concurrency`：`1 ~ 10`
-- `engine_temperature`：`0 ~ 1`
-- `engine_max_tokens`：`1000 ~ 16000`
-
-说明：
-
-- 高级面板参数会触发防抖自动保存。
-- 任务超时由后端任务执行器在运行时生效。
+- `engine_concurrency`: `1 ~ 10`
+- `engine_temperature`: `0 ~ 1`
+- `engine_max_tokens`: `1000 ~ 16000`
 
 ---
 
-## 可选环境变量
+## 🌍 可选环境变量
 
 - `PARSER_BACKEND`（默认 `docling`）
 - `HYBRID_NOISE_THRESHOLD`（默认 `0.20`）
@@ -132,7 +172,7 @@ npm run dev
 
 ---
 
-## 后端 API 概览
+## 🔌 后端 API 概览
 
 主要接口（前端通过 `/api/*` 代理访问）：
 
@@ -154,7 +194,7 @@ npm run dev
 
 ---
 
-## 数据与持久化目录
+## 💾 数据与持久化目录
 
 运行数据保存在 `backend/data/`：
 
@@ -168,32 +208,45 @@ npm run dev
 
 ---
 
-## 项目结构
+## 🗂️ 项目结构
 
 ```text
 filesMind/
   backend/
-    app.py                # FastAPI API 与任务编排
-    parser_service.py     # PDF 解析与解析后端路由
-    cognitive_engine.py   # 大模型接入与高级引擎运行时限制
-    structure_utils.py    # 层级重建辅助
-    data/                 # 运行期持久化数据
-    tests/                # 后端测试
+    app.py
+    parser_service.py
+    cognitive_engine.py
+    structure_utils.py
+    data/
+    tests/
   frontend/
     src/WorkspaceShell.vue
     src/components/MindMap.vue
-    src/router/index.js
+    src/components/VirtualPdfViewer.vue
+    src/main.js
+    vite.config.js
+    scripts/check-bundle-size.mjs
     package.json
-  scripts/test_all.sh     # 本地一键检查脚本
+  scripts/test_all.sh
   pyproject.toml
   uv.lock
 ```
 
 ---
 
-## 开发自检
+## ✅ 开发检查
 
-执行完整本地检查：
+前端检查：
+
+```bash
+cd frontend
+npm run build
+npm run test:unit
+npm run test:e2e
+npm run check:bundle
+```
+
+完整本地检查：
 
 ```bash
 ./scripts/test_all.sh
@@ -207,7 +260,7 @@ SKIP_E2E=1 ./scripts/test_all.sh
 
 ---
 
-## 生产部署（最小方案）
+## 🚢 生产部署（最小方案）
 
 1. 构建前端：
 
@@ -231,28 +284,44 @@ uv run uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
 
 ---
 
-## 常见问题
+## ❓ Q&A
 
-1. 依赖安装失败：
-- 确认 Python 为 `3.12.x`。
-- 在仓库根目录重新执行 `uv sync`。
+1. **为什么 `pdf-viewer` 预算是 `850 KB`？**  
+`vue-pdf-embed` 当前运行时代码体积较大。我们先设定硬上限，防止继续膨胀，同时不影响 PDF 功能可用性。
 
-2. 前端启动失败：
+2. **预算可以马上降到更低吗？**  
+可以，但通常会立即触发失败。建议先跑 `npm run analyze`，定位增量来源后分阶段下调阈值。
+
+3. **CI 是否必须启用 `check:bundle`？**  
+建议必须启用。把它作为合并门禁，避免性能回退在主分支累积。
+
+4. **为什么异步组件要自动重试？**  
+可显著降低网络抖动、缓存窗口期导致的偶发加载失败，提升可用性。
+
+---
+
+## 🛠️ 常见问题
+
+1. 前端启动失败：
 - 确认 Node `>= 18`。
 - 重新安装 `frontend` 依赖。
 
-3. 任务执行时间过长：
-- 查看后端日志。
-- 在 Settings 中提高 `task_timeout_seconds`。
-- 按需调整解析后端与 worker 数。
+2. Windows 下 e2e 输出目录权限报错：
+- 确认 Playwright 输出目录使用项目内路径。
+- 确认当前 shell 对测试输出目录有写权限。
+
+3. 构建提示大包：
+- 先执行 `npm run analyze`。
+- 检查 `manualChunks` 与动态导入点。
+- 合并前保证 `npm run check:bundle` 通过。
 
 4. 模型连接测试失败：
-- 检查地址、模型名、密钥。
+- 检查 Base URL、模型名、API Key。
 - 检查网络可达性与服务商限流。
 
 ---
 
-## 贡献
+## 🤝 贡献
 
 欢迎提交 Issue 和 PR。
 
@@ -260,6 +329,6 @@ uv run uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
 
 ---
 
-## 许可证
+## 📄 许可证
 
 MIT License，详见 [LICENSE](LICENSE)。
