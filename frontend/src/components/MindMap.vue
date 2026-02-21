@@ -1,7 +1,50 @@
 <script setup>
-import { ref, onMounted, watch, nextTick, onUnmounted } from 'vue';
-import { Transformer } from 'markmap-lib';
-import { Markmap } from 'markmap-view';
+import { ref, shallowRef, watch, nextTick, onMounted, onUnmounted, computed } from 'vue';
+
+let mindMapCoreCtor = null;
+let mindMapCoreLoader = null;
+let xmindPluginReady = false;
+let xmindPluginLoader = null;
+
+const ensureMindMapCore = async () => {
+  if (mindMapCoreCtor) return mindMapCoreCtor;
+  if (!mindMapCoreLoader) {
+    mindMapCoreLoader = (async () => {
+      const [{ default: MindMapCore }] = await Promise.all([
+        import('simple-mind-map'),
+        import('simple-mind-map/dist/simpleMindMap.esm.css')
+      ]);
+      mindMapCoreCtor = MindMapCore;
+      return MindMapCore;
+    })().finally(() => {
+      mindMapCoreLoader = null;
+    });
+  }
+  return mindMapCoreLoader;
+};
+
+const ensureXMindExportPlugin = async () => {
+  if (xmindPluginReady) return;
+  if (!xmindPluginLoader) {
+    xmindPluginLoader = (async () => {
+      const MindMapCore = await ensureMindMapCore();
+      const [{ default: Export }, { default: ExportXMind }] = await Promise.all([
+        import('simple-mind-map/src/plugins/Export.js'),
+        import('simple-mind-map/src/plugins/ExportXMind.js')
+      ]);
+      MindMapCore.usePlugin(Export);
+      MindMapCore.usePlugin(ExportXMind);
+      if (mindMapInstance.value?.addPlugin) {
+        mindMapInstance.value.addPlugin(Export);
+        mindMapInstance.value.addPlugin(ExportXMind);
+      }
+      xmindPluginReady = true;
+    })().finally(() => {
+      xmindPluginLoader = null;
+    });
+  }
+  await xmindPluginLoader;
+};
 
 const props = defineProps({
   markdown: {
@@ -16,179 +59,354 @@ const props = defineProps({
   flatNodes: {
     type: Array,
     default: () => []
+  },
+  tree: {
+    type: Object,
+    default: null
   }
 });
 
-const emit = defineEmits(['export', 'node-click', 'feedback']);
+const emit = defineEmits(['export', 'node-click', 'feedback', 'zoom-change']);
 
 const containerRef = ref(null);
-const svgRef = ref(null);
-const transformer = new Transformer();
-let mm_instance = null;
+const mindMapInstance = shallowRef(null);
+
+let resizeObserver = null;
 let fitTimer = null;
-let resizeTimer = null;
 let updateToken = 0;
-const LARGE_MAP_THRESHOLD = 140;
-const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/;
-const PURE_DASH_RE = /^\s*-{5,}\s*$/;
+let darkThemeEnabled = false;
+let initPromise = null;
 
-const isTableRowLike = (line) => {
-  const text = (line || '').trim();
-  if (!text || text.startsWith('#')) return false;
-  const pipeMatches = text.match(/\|/g);
-  return pipeMatches && pipeMatches.length >= 2;
-};
+const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 
-const nearestNonEmptyLine = (lines, index, step) => {
-  let i = index + step;
-  while (i >= 0 && i < lines.length) {
-    const text = lines[i].trim();
-    if (text) return text;
-    i += step;
+const smartWrapText = (text, maxVisualLength = 36) => {
+  const str = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!str) return '未命名节点';
+  if (str.length <= (maxVisualLength / 2)) return str;
+
+  let result = '';
+  let currentLineWidth = 0;
+  let currentLineText = '';
+
+  for (let i = 0; i < str.length; i++) {
+    const char = str[i];
+    const charWeight = char.charCodeAt(0) > 255 ? 2 : 1;
+    
+    const isAtWrapZone = currentLineWidth >= (maxVisualLength - 4);
+    const isBreakableChar = /[\s，。、；：！？,.;:!?]/.test(char);
+
+    if (currentLineWidth + charWeight > maxVisualLength) {
+      result += currentLineText + '\n';
+      currentLineText = char;
+      currentLineWidth = charWeight;
+    } else if (isAtWrapZone && isBreakableChar) {
+      result += currentLineText + char + '\n';
+      currentLineText = '';
+      currentLineWidth = 0;
+    } else {
+      currentLineText += char;
+      currentLineWidth += charWeight;
+    }
   }
-  return '';
+
+  if (currentLineText) {
+    result += currentLineText;
+  }
+
+  return result.trim();
 };
 
-const sanitizeMarkdownForMindmap = (markdown) => {
-  if (!markdown) return markdown;
-  const lines = markdown.split('\n');
-  const cleaned = [];
+const hasStructuredTree = (tree) => {
+  return Boolean(tree && Array.isArray(tree.children) && tree.children.length > 0);
+};
 
+const buildMindMapNodeFromTree = (node, depth = 0) => {
+  const topic = normalizeText(node?.topic || '');
+  const children = Array.isArray(node?.children)
+    ? node.children.map((item) => buildMindMapNodeFromTree(item, depth + 1))
+    : [];
+
+  return {
+    data: {
+      text: smartWrapText(topic || `节点 ${depth}`, 40),
+      topic: topic || `节点 ${depth}`,
+      nodeId: node?.node_id || '',
+      level: Number(node?.level ?? depth),
+      sourceLineStart: Number(node?.source_line_start || 0),
+      sourceLineEnd: Number(node?.source_line_end || 0)
+    },
+    children
+  };
+};
+
+const buildMindMapNodeFromMarkdown = (markdown) => {
+  const root = {
+    data: {
+      text: '文档导图',
+      topic: '文档导图',
+      nodeId: '',
+      level: 0,
+      sourceLineStart: 0,
+      sourceLineEnd: 0
+    },
+    children: []
+  };
+
+  if (!markdown) return root;
+
+  const lines = String(markdown).split('\n');
+  const stack = [{ level: 0, node: root }];
   for (let i = 0; i < lines.length; i += 1) {
-    const raw = lines[i];
-    const stripped = raw.trim();
-    if (!stripped) {
-      cleaned.push(raw);
-      continue;
-    }
+    const line = lines[i];
+    const match = line.match(/^(#{1,6})\s+(.+)$/);
+    if (!match) continue;
 
-    if (TABLE_SEPARATOR_RE.test(stripped)) {
-      continue;
-    }
+    const level = match[1].length;
+    const topic = normalizeText(match[2]);
+    if (!topic) continue;
 
-    if (PURE_DASH_RE.test(stripped)) {
-      const prev = nearestNonEmptyLine(lines, i, -1);
-      const next = nearestNonEmptyLine(lines, i, 1);
-      if (isTableRowLike(prev) || isTableRowLike(next)) {
-        continue;
-      }
-    }
-
-    cleaned.push(raw);
-  }
-
-  return cleaned.join('\n');
-};
-
-const extractNodeLabel = (element) => {
-  if (!element) return '';
-  const foreign = element.querySelector('foreignObject');
-  if (foreign && foreign.textContent) {
-    return foreign.textContent.trim();
-  }
-  const text = element.querySelector('text');
-  return text && text.textContent ? text.textContent.trim() : '';
-};
-
-const decorateMindmapAppearance = () => {
-  if (!svgRef.value) return;
-
-  const nodeElements = Array.from(svgRef.value.querySelectorAll('.markmap-node'));
-  nodeElements.forEach((el) => {
-    el.classList.remove('fm-root', 'fm-level2', 'fm-leaf', 'fm-branch');
-    const datum = el.__data__ || {};
-    const depth = Number.isFinite(Number(datum?.depth)) ? Number(datum.depth) : 0;
-    const hasChildren = Array.isArray(datum?.children) && datum.children.length > 0;
-
-    el.dataset.depth = String(depth);
-    if (depth === 0) el.classList.add('fm-root');
-    if (depth === 1) el.classList.add('fm-level2');
-    if (hasChildren) el.classList.add('fm-branch');
-    else el.classList.add('fm-leaf');
-  });
-
-  const links = Array.from(svgRef.value.querySelectorAll('.markmap-link'));
-  links.forEach((link) => {
-    link.classList.add('fm-link');
-    link.setAttribute('fill', 'none');
-  });
-};
-
-const countNodes = (node) => {
-  if (!node) return 0;
-  const children = Array.isArray(node.children) ? node.children : [];
-  return 1 + children.reduce((acc, child) => acc + countNodes(child), 0);
-};
-
-const bindNodeClickHandlers = () => {
-  if (!svgRef.value) return;
-  const nodeElements = Array.from(svgRef.value.querySelectorAll('.markmap-node'));
-  if (!nodeElements.length || !props.flatNodes?.length) return;
-
-  const usedNodeIds = new Set();
-  const byLevelAndTopic = new Map();
-  const byTopic = new Map();
-
-  for (const item of props.flatNodes) {
-    if (!item?.node_id) continue;
-    const topic = String(item.topic || '').trim();
-    const level = Number(item.level ?? -1);
-    const levelKey = `${level}|${topic}`;
-    if (!byLevelAndTopic.has(levelKey)) byLevelAndTopic.set(levelKey, []);
-    byLevelAndTopic.get(levelKey).push(item);
-    if (!byTopic.has(topic)) byTopic.set(topic, []);
-    byTopic.get(topic).push(item);
-  }
-
-  nodeElements.forEach((el) => {
-    const datum = el.__data__ || {};
-    let target = null;
-    const label = extractNodeLabel(el);
-    const depth = Number.isFinite(Number(datum?.depth)) ? Number(datum.depth) : -1;
-    const levelKey = `${depth}|${label}`;
-
-    const levelBucket = byLevelAndTopic.get(levelKey) || [];
-    while (levelBucket.length) {
-      const candidate = levelBucket.shift();
-      if (!usedNodeIds.has(candidate.node_id)) {
-        target = candidate;
-        break;
-      }
-    }
-
-    if (!target && label) {
-      const topicBucket = byTopic.get(label) || [];
-      while (topicBucket.length) {
-        const candidate = topicBucket.shift();
-        if (!usedNodeIds.has(candidate.node_id)) {
-          target = candidate;
-          break;
-        }
-      }
-    }
-
-    if (!target || !target.node_id) return;
-    usedNodeIds.add(target.node_id);
-    el.style.cursor = 'pointer';
-    el.dataset.nodeId = target.node_id;
-    el.onclick = (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      emit('node-click', {
-        nodeId: target.node_id,
-        topic: target.topic,
-        level: target.level,
-        sourceLineStart: target.source_line_start,
-        sourceLineEnd: target.source_line_end
-      });
+    const node = {
+      data: {
+        text: smartWrapText(topic, 40),
+        topic,
+        nodeId: '',
+        level,
+        sourceLineStart: i + 1,
+        sourceLineEnd: i + 1
+      },
+      children: []
     };
+
+    while (stack.length > 1 && stack[stack.length - 1].level >= level) {
+      stack.pop();
+    }
+
+    stack[stack.length - 1].node.children.push(node);
+    stack.push({ level, node });
+  }
+
+  if (!root.children.length) {
+    const rawText = lines.find((line) => normalizeText(line)) || '空文档';
+    const fallbackTopic = normalizeText(rawText);
+    root.children.push({
+      data: {
+        text: smartWrapText(fallbackTopic, 40),
+        topic: fallbackTopic,
+        nodeId: '',
+        level: 1,
+        sourceLineStart: 1,
+        sourceLineEnd: 1
+      },
+      children: []
+    });
+  }
+
+  return root;
+};
+
+const mindMapData = computed(() => {
+  if (hasStructuredTree(props.tree)) {
+    return buildMindMapNodeFromTree(props.tree, 0);
+  }
+  return buildMindMapNodeFromMarkdown(props.markdown);
+});
+
+const getThemeConfig = () => {
+  if (darkThemeEnabled) {
+    return {
+      backgroundColor: '#0f172a',
+      lineColor: '#475569',
+      lineWidth: 2,
+      root: {
+        fillColor: '#1d4ed8',
+        color: '#f8fafc',
+        borderColor: '#1e40af',
+        borderWidth: 0,
+        borderRadius: 8,
+        fontSize: 16,
+        fontWeight: 'bold',
+        paddingX: 20,
+        paddingY: 10
+      },
+      second: {
+        fillColor: '#1e293b',
+        color: '#e2e8f0',
+        borderColor: '#334155',
+        borderWidth: 1,
+        borderRadius: 7,
+        fontSize: 14,
+        fontWeight: 'normal',
+        paddingX: 16,
+        paddingY: 8
+      },
+      node: {
+        fillColor: '#0b1220',
+        color: '#cbd5e1',
+        borderColor: '#334155',
+        borderWidth: 1,
+        borderRadius: 7,
+        fontSize: 13,
+        fontWeight: 'normal',
+        paddingX: 14,
+        paddingY: 7
+      }
+    };
+  }
+
+  return {
+    backgroundColor: '#f8fafc',
+    lineColor: '#94a3b8',
+    lineWidth: 2,
+    root: {
+      fillColor: '#2563eb',
+      color: '#ffffff',
+      borderColor: '#1d4ed8',
+      borderWidth: 0,
+      borderRadius: 8,
+      fontSize: 16,
+      fontWeight: 'bold',
+      paddingX: 20,
+      paddingY: 10
+    },
+    second: {
+      fillColor: '#ffffff',
+      color: '#1e293b',
+      borderColor: '#bfdbfe',
+      borderWidth: 1,
+      borderRadius: 7,
+      fontSize: 14,
+      fontWeight: 'normal',
+      paddingX: 16,
+      paddingY: 8
+    },
+    node: {
+      fillColor: '#f8fafc',
+      color: '#334155',
+      borderColor: '#e2e8f0',
+      borderWidth: 1,
+      borderRadius: 7,
+      fontSize: 13,
+      fontWeight: 'normal',
+      paddingX: 14,
+      paddingY: 7
+    }
+  };
+};
+
+const applyTheme = () => {
+  if (!mindMapInstance.value) return;
+  mindMapInstance.value.setThemeConfig(getThemeConfig());
+};
+
+const getZoomPercent = () => {
+  const scale = Number(mindMapInstance.value?.view?.scale || 1);
+  if (!Number.isFinite(scale) || scale <= 0) return 100;
+  return Math.round(scale * 100);
+};
+
+const emitZoomChange = () => {
+  emit('zoom-change', {
+    zoomPercent: getZoomPercent()
   });
 };
 
-// 导出为 Markdown 文件
+const scheduleFit = (delay = 120, token = updateToken) => {
+  if (fitTimer) clearTimeout(fitTimer);
+  fitTimer = setTimeout(() => {
+    if (!mindMapInstance.value || token !== updateToken) return;
+    if (typeof mindMapInstance.value.resize === 'function') {
+      mindMapInstance.value.resize();
+    }
+    if (mindMapInstance.value.view && typeof mindMapInstance.value.view.fit === 'function') {
+      mindMapInstance.value.view.fit();
+    }
+    emitZoomChange();
+  }, delay);
+};
+
+const waitForContainerReady = async () => {
+  for (let i = 0; i < 20; i += 1) {
+    await nextTick();
+    const el = containerRef.value;
+    if (el && el.clientWidth > 0 && el.clientHeight > 0) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  return false;
+};
+
+const handleNodeClick = (node) => {
+  const payload = node?.nodeData?.data || {};
+  emit('node-click', {
+    nodeId: payload.nodeId || '',
+    topic: payload.topic || payload.text || '',
+    level: Number(payload.level || 0),
+    sourceLineStart: Number(payload.sourceLineStart || 0),
+    sourceLineEnd: Number(payload.sourceLineEnd || 0)
+  });
+};
+
+const handleScaleChange = () => {
+  emitZoomChange();
+};
+
+const initMindMap = async () => {
+  if (mindMapInstance.value) return;
+  if (initPromise) {
+    await initPromise;
+    return;
+  }
+  initPromise = (async () => {
+    if (!containerRef.value) return;
+    const ready = await waitForContainerReady();
+    if (!ready || !containerRef.value || mindMapInstance.value) return;
+    const MindMapCore = await ensureMindMapCore();
+
+    const instance = new MindMapCore({
+      el: containerRef.value,
+      data: mindMapData.value,
+      readonly: true,
+      layout: 'logicalStructure',
+      fit: true,
+      textAutoWrapWidth: 280,
+      mousewheelAction: 'move',
+      openPerformance: true,
+      performanceConfig: {
+        time: 200,
+        padding: 150,
+        removeNodeWhenOutCanvas: false
+      }
+    });
+
+    instance.on('node_click', handleNodeClick);
+    instance.on('scale', handleScaleChange);
+    mindMapInstance.value = instance;
+    applyTheme();
+    scheduleFit(140, updateToken);
+    emitZoomChange();
+  })();
+  try {
+    await initPromise;
+  } finally {
+    initPromise = null;
+  }
+};
+
+const refreshMindMap = async () => {
+  const token = ++updateToken;
+  if (!mindMapInstance.value) {
+    await initMindMap();
+    return;
+  }
+  mindMapInstance.value.setData(mindMapData.value);
+  applyTheme();
+  scheduleFit(120, token);
+};
+
 const exportMarkdown = () => {
   if (!props.markdown) return;
-  
+
   const blob = new Blob([props.markdown], { type: 'text/markdown;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -198,46 +416,16 @@ const exportMarkdown = () => {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-  
+
   emit('export', 'markdown');
 };
 
-// 导出为 XMind 格式
 const exportXMind = async () => {
-  if (!props.markdown) return;
-  
-  try {
-    const response = props.fileId
-      ? await fetch(`/api/export/xmind/${props.fileId}`)
-      : await fetch('/api/export/xmind', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            content: props.markdown,
-            filename: 'mindmap'
-          })
-        });
-    
-    if (!response.ok) {
-      throw new Error('导出失败');
-    }
-    
-    const disposition = response.headers.get('Content-Disposition') || '';
-    const filenameMatch = disposition.match(/filename="?([^"]+)"?/i);
-    const downloadName = filenameMatch ? filenameMatch[1] : 'mindmap.xmind';
+  if (!mindMapInstance.value) return;
 
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = downloadName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    
+  try {
+    await ensureXMindExportPlugin();
+    await mindMapInstance.value.export('xmind', true, 'mindmap');
     emit('export', 'xmind');
   } catch (err) {
     console.error('导出 XMind 失败:', err);
@@ -248,34 +436,32 @@ const exportXMind = async () => {
   }
 };
 
-// 导出为 PNG 图片
 const exportPNG = async () => {
-  if (!svgRef.value || !mm_instance) return;
-  
+  if (!mindMapInstance.value) return;
+
   try {
-    const svgElement = svgRef.value;
-    const svgData = new XMLSerializer().serializeToString(svgElement);
-    
+    const { svgHTML, rect } = mindMapInstance.value.getSvgData({});
+    const svgBlob = new Blob([svgHTML], { type: 'image/svg+xml;charset=utf-8' });
+    const svgUrl = URL.createObjectURL(svgBlob);
+
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     const img = new Image();
-    
-    const bbox = svgElement.getBBox();
-    const padding = 40;
-    canvas.width = bbox.width + padding * 2;
-    canvas.height = bbox.height + padding * 2;
-    
-    ctx.fillStyle = 'white';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    
-    const svgBlob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(svgBlob);
-    
+
+    const width = Math.max(1, Math.ceil(rect?.width || 1));
+    const height = Math.max(1, Math.ceil(rect?.height || 1));
+    canvas.width = width + 40;
+    canvas.height = height + 40;
+
     img.onload = () => {
-      ctx.drawImage(img, padding, padding);
-      URL.revokeObjectURL(url);
-      
+      if (!ctx) return;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 20, 20, width, height);
+      URL.revokeObjectURL(svgUrl);
+
       canvas.toBlob((blob) => {
+        if (!blob) return;
         const pngUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = pngUrl;
@@ -286,8 +472,8 @@ const exportPNG = async () => {
         URL.revokeObjectURL(pngUrl);
       }, 'image/png');
     };
-    
-    img.src = url;
+
+    img.src = svgUrl;
     emit('export', 'png');
   } catch (err) {
     console.error('导出 PNG 失败:', err);
@@ -299,260 +485,103 @@ const exportPNG = async () => {
 };
 
 const toggleTheme = () => {
-  if (containerRef.value) {
-    containerRef.value.classList.toggle('dark-theme');
+  darkThemeEnabled = !darkThemeEnabled;
+  applyTheme();
+};
+
+const expandAll = () => {
+  if (!mindMapInstance.value) return;
+  if (typeof mindMapInstance.value.execCommand === 'function') {
+    mindMapInstance.value.execCommand('EXPAND_ALL');
   }
+  scheduleFit(100, updateToken);
 };
 
-const updateMap = async () => {
-    if (!svgRef.value || !props.markdown) return;
-    const token = ++updateToken;
-
-    const { root } = transformer.transform(sanitizeMarkdownForMindmap(props.markdown));
-    const nodeCount = countNodes(root);
-    const isLargeMap = nodeCount >= LARGE_MAP_THRESHOLD;
-    if (containerRef.value) {
-        containerRef.value.classList.toggle('fm-perf-light', isLargeMap);
-    }
-
-    if (mm_instance) {
-        mm_instance.setData(root);
-        await nextTick();
-        if (token !== updateToken || !mm_instance) return;
-        if (fitTimer) clearTimeout(fitTimer);
-        fitTimer = setTimeout(() => {
-            if (!mm_instance || token !== updateToken) return;
-            mm_instance.fit();
-            decorateMindmapAppearance();
-            bindNodeClickHandlers();
-        }, 100);
-    } else {
-        // Remove default Markmap toolbar rendering
-        const options = {
-            autoFit: true,
-            style: (id) => `${id} * { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }`,
-            colorFreezeLevel: 3,
-            zoom: true,
-            pan: true,
-            embedGlobalCSS: true,
-            duration: isLargeMap ? 0 : 220,
-            maxWidth: isLargeMap ? 380 : 460,
-            spacingHorizontal: 90,
-            spacingVertical: isLargeMap ? 10 : 14,
-            nodeSpacing: isLargeMap ? 12 : 18,
-            radius: 10,
-        };
-        mm_instance = Markmap.create(svgRef.value, options, root);
-        
-        await nextTick();
-        if (token !== updateToken || !mm_instance) return;
-        if (fitTimer) clearTimeout(fitTimer);
-        fitTimer = setTimeout(() => {
-            if (!mm_instance || token !== updateToken) return;
-            mm_instance.fit();
-            decorateMindmapAppearance();
-            bindNodeClickHandlers();
-        }, 200);
-    }
+const collapseAll = () => {
+  if (!mindMapInstance.value) return;
+  if (typeof mindMapInstance.value.execCommand === 'function') {
+    mindMapInstance.value.execCommand('UNEXPAND_ALL', false);
+  }
+  scheduleFit(100, updateToken);
 };
 
-const handleResize = () => {
-    if (!mm_instance) return;
-    if (resizeTimer) clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => {
-        if (mm_instance) mm_instance.fit();
-    }, 180);
+const fitView = () => {
+  if (!mindMapInstance.value?.view || typeof mindMapInstance.value.view.fit !== 'function') return;
+  mindMapInstance.value.view.fit();
+  emitZoomChange();
 };
 
-onMounted(() => {
-    updateMap();
-    window.addEventListener('resize', handleResize);
+const zoomIn = () => {
+  if (!mindMapInstance.value?.view || typeof mindMapInstance.value.view.enlarge !== 'function') return;
+  mindMapInstance.value.view.enlarge();
+  emitZoomChange();
+};
+
+const zoomOut = () => {
+  if (!mindMapInstance.value?.view || typeof mindMapInstance.value.view.narrow !== 'function') return;
+  mindMapInstance.value.view.narrow();
+  emitZoomChange();
+};
+
+onMounted(async () => {
+  await initMindMap();
+  if (containerRef.value && typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(() => {
+      if (!mindMapInstance.value) return;
+      scheduleFit(100, updateToken);
+    });
+    resizeObserver.observe(containerRef.value);
+  }
 });
 
 onUnmounted(() => {
-    window.removeEventListener('resize', handleResize);
-    if (fitTimer) {
-        clearTimeout(fitTimer);
-        fitTimer = null;
-    }
-    if (resizeTimer) {
-        clearTimeout(resizeTimer);
-        resizeTimer = null;
-    }
-    if (mm_instance) {
-        mm_instance.destroy();
-        mm_instance = null;
-    }
+  if (fitTimer) {
+    clearTimeout(fitTimer);
+    fitTimer = null;
+  }
+  if (resizeObserver) {
+    resizeObserver.disconnect();
+    resizeObserver = null;
+  }
+  if (mindMapInstance.value) {
+    mindMapInstance.value.off('node_click', handleNodeClick);
+    mindMapInstance.value.off('scale', handleScaleChange);
+    mindMapInstance.value.destroy();
+    mindMapInstance.value = null;
+  }
+  initPromise = null;
+});
+
+watch(() => props.tree, () => {
+  void refreshMindMap();
 });
 
 watch(() => props.markdown, () => {
-    nextTick(updateMap);
+  if (!hasStructuredTree(props.tree)) {
+    void refreshMindMap();
+  }
 });
-
-watch(() => props.flatNodes, () => {
-    nextTick(() => {
-        decorateMindmapAppearance();
-        bindNodeClickHandlers();
-    });
-}, { deep: true });
 
 defineExpose({
   exportMarkdown,
   exportXMind,
   exportPNG,
   toggleTheme,
+  expandAll,
+  collapseAll,
+  fitView,
+  zoomIn,
+  zoomOut,
+  getZoomPercent,
 });
 </script>
 
 <template>
-  <div ref="containerRef" class="relative w-full h-full flex flex-col">
-    <!-- 顶部工具栏 -->
-    <div class="flex-shrink-0 h-14 bg-white/80 backdrop-blur-xl border-b border-slate-200/60 flex items-center justify-between px-4 z-20">
-      <!-- 工具栏占位：原生已废弃，转移至外部组件 -->
-      <div ref="toolbarRef" class="flex items-center"></div>
-
-      <!-- 导出按钮组 -->
-      <div class="flex gap-2">
-        <button
-          @click="exportMarkdown"
-          class="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded-xl hover:bg-gradient-to-r hover:from-blue-50 hover:to-indigo-50 hover:border-blue-300 hover:text-blue-600 transition-all duration-200 shadow-sm hover:shadow-md"
-          title="导出 Markdown"
-        >
-          <span class="flex items-center gap-1.5">
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-            </svg>
-            MD
-          </span>
-        </button>
-        <button
-          @click="exportXMind"
-          class="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded-xl hover:bg-gradient-to-r hover:from-amber-50 hover:to-orange-50 hover:border-amber-300 hover:text-amber-600 transition-all duration-200 shadow-sm hover:shadow-md"
-          title="导出 XMind"
-        >
-          <span class="flex items-center gap-1.5">
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4-4m0 0L8 8m4-4v12"></path>
-            </svg>
-            XM
-          </span>
-        </button>
-        <button
-          @click="exportPNG"
-          class="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-200 rounded-xl hover:bg-gradient-to-r hover:from-emerald-50 hover:to-teal-50 hover:border-emerald-300 hover:text-emerald-600 transition-all duration-200 shadow-sm hover:shadow-md"
-          title="导出 PNG"
-        >
-          <span class="flex items-center gap-1.5">
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
-            </svg>
-            PNG
-          </span>
-        </button>
-      </div>
-    </div>
-
-    <!-- SVG 容器 - 占据剩余空间 -->
-    <div class="flex-grow w-full h-full relative overflow-hidden bg-gradient-to-br from-white via-slate-50/30 to-white">
-      <svg ref="svgRef" class="w-full h-full outline-none block"></svg>
-    </div>
-  </div>
+  <div ref="containerRef" class="mindmap-host w-full h-full bg-slate-50"></div>
 </template>
 
-<style>
-.markmap-toolbar {
-    background: rgba(255, 255, 255, 0.9) !important;
-    backdrop-filter: blur(8px);
-    border: 1px solid rgba(203, 213, 225, 0.4) !important;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04) !important;
-    padding: 6px !important;
-    border-radius: 10px !important;
-    display: flex !important;
-    gap: 6px !important;
-}
-.markmap-toolbar .mm-toolbar-item {
-    color: #64748b !important;
-    border-radius: 8px !important;
-    width: 32px !important;
-    height: 32px !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
-}
-.markmap-toolbar .mm-toolbar-item:hover {
-    background: linear-gradient(135deg, rgba(59, 130, 246, 0.1), rgba(147, 51, 234, 0.1)) !important;
-    color: #3b82f6 !important;
-    transform: translateY(-1px);
-    box-shadow: 0 2px 8px rgba(59, 130, 246, 0.2) !important;
-}
-
-/* 节点容器与悬停 */
-.markmap-node .markmap-foreign {
-    transform-origin: center center;
-    transition: box-shadow 0.16s ease;
-}
-.markmap-node:hover .markmap-foreign {
-    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12);
-}
-
-/* 默认节点底色 */
-.markmap-node .markmap-foreign > div,
-.markmap-node foreignObject > div {
-    border-radius: 10px !important;
-    padding: 4px 8px !important;
-    border: 1px solid #cbd5e1 !important;
-    background: #f8fafc !important;
-    color: #0f172a !important;
-    line-height: 1.35 !important;
-    white-space: normal !important;
-    word-break: break-word !important;
-    overflow: visible !important;
-    box-sizing: border-box !important;
-}
-
-/* 根节点：主色渐变 + 大号粗体 */
-.markmap-node.fm-root .markmap-foreign > div,
-.markmap-node.fm-root foreignObject > div {
-    background: linear-gradient(90deg, #2563eb, #4f46e5) !important;
-    color: #ffffff !important;
-    border: 0 !important;
-    font-size: 1rem !important;
-    font-weight: 700 !important;
-    padding: 6px 12px !important;
-}
-
-/* 二级节点：白底 + 主色边框 */
-.markmap-node.fm-level2 .markmap-foreign > div,
-.markmap-node.fm-level2 foreignObject > div {
-    background: #ffffff !important;
-    border: 1px solid #bfdbfe !important;
-    color: #1e3a8a !important;
-    font-weight: 600 !important;
-}
-
-/* 叶子节点：浅灰底 */
-.markmap-node.fm-leaf:not(.fm-root):not(.fm-level2) .markmap-foreign > div,
-.markmap-node.fm-leaf:not(.fm-root):not(.fm-level2) foreignObject > div {
-    background: #f8fafc !important;
-    border: 1px solid #e2e8f0 !important;
-    color: #334155 !important;
-}
-
-/* 连线：浅蓝色曲线风格 */
-.markmap-link,
-.markmap-link.fm-link {
-    stroke: #93c5fd !important;
-    stroke-width: 1.8px !important;
-    stroke-opacity: 0.8 !important;
-    fill: none !important;
-}
-
-/* 大图性能模式：禁用高开销效果 */
-.fm-perf-light .markmap-node .markmap-foreign {
-    transition: none !important;
-}
-.fm-perf-light .markmap-node:hover .markmap-foreign {
-    transform: none !important;
+<style scoped>
+.mindmap-host {
+  min-height: 0;
 }
 </style>

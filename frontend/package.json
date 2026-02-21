@@ -6,15 +6,18 @@
     "scripts": {
         "dev": "vite",
         "build": "vite build",
-        "preview": "vite preview"
+        "preview": "vite preview",
+        "test:e2e": "playwright test"
     },
     "dependencies": {
-        "markmap-lib": "^0.18.12",
-        "markmap-toolbar": "^0.18.12",
-        "markmap-view": "^0.18.12",
-        "vue": "^3.4.21"
+        "events": "^3.3.0",
+        "simple-mind-map": "^0.14.0-fix.1",
+        "stream-browserify": "^3.0.0",
+        "vue": "^3.4.21",
+        "vue-router": "^4.5.1"
     },
     "devDependencies": {
+        "@playwright/test": "^1.54.2",
         "@tailwindcss/postcss": "^4.1.18",
         "@vitejs/plugin-vue": "^5.0.4",
         "autoprefixer": "^10.4.24",

@@ -8,6 +8,7 @@ import asyncio
 import logging
 import hashlib
 import json
+import html
 from datetime import datetime, timezone
 import re
 import threading
@@ -44,7 +45,6 @@ except Exception:
 # 导入扩展模块
 from parser_service import process_pdf_safely, get_parser_runtime_config, update_parser_runtime_config
 from cognitive_engine import generate_mindmap_structure, update_client_config, test_connection, set_model, set_account_type
-from xmind_exporter import generate_xmind_content
 
 
 
@@ -328,11 +328,17 @@ class ParserSettingsPayload(BaseModel):
     marker_prefer_api: bool = False
     task_timeout_seconds: int = 600
 
+class AdvancedSettingsPayload(BaseModel):
+    engine_concurrency: int = 5
+    engine_temperature: float = 0.3
+    engine_max_tokens: int = 8192
+
 
 class ConfigStorePayload(BaseModel):
     active_profile_id: str
     profiles: List[ProfilePayload] = Field(default_factory=list)
     parser: ParserSettingsPayload = Field(default_factory=ParserSettingsPayload)
+    advanced: AdvancedSettingsPayload = Field(default_factory=AdvancedSettingsPayload)
 
 
 class ProfileView(BaseModel):
@@ -352,6 +358,7 @@ class ConfigStoreView(BaseModel):
     active_profile_id: str
     profiles: List[ProfileView] = Field(default_factory=list)
     parser: ParserSettingsPayload = Field(default_factory=ParserSettingsPayload)
+    advanced: AdvancedSettingsPayload = Field(default_factory=AdvancedSettingsPayload)
 
 
 class ModelListRequest(BaseModel):
@@ -362,12 +369,32 @@ class ConfigImportPayload(BaseModel):
     active_profile_id: str
     profiles: List[Dict[str, Any]] = Field(default_factory=list)
     parser: Optional[Dict[str, Any]] = None
+    advanced: Optional[Dict[str, Any]] = None
+
+
+class SourceIndexRebuildPayload(BaseModel):
+    dry_run: bool = False
+    force: bool = False
+    only_shallow: bool = True
+    include_precise_anchor: bool = False
+    file_ids: List[str] = Field(default_factory=list)
+    max_files: Optional[int] = Field(default=None, ge=1, le=2000)
+    verbose: bool = False
 
 
 MIN_TASK_TIMEOUT_SECONDS = 60
 MAX_TASK_TIMEOUT_SECONDS = 7200
 DEFAULT_TASK_TIMEOUT_SECONDS = 600
 _task_timeout_seconds_runtime = DEFAULT_TASK_TIMEOUT_SECONDS
+DEFAULT_ENGINE_CONCURRENCY = 5
+MIN_ENGINE_CONCURRENCY = 1
+MAX_ENGINE_CONCURRENCY = 10
+DEFAULT_ENGINE_TEMPERATURE = 0.3
+MIN_ENGINE_TEMPERATURE = 0.0
+MAX_ENGINE_TEMPERATURE = 1.0
+DEFAULT_ENGINE_MAX_TOKENS = 8192
+MIN_ENGINE_MAX_TOKENS = 1000
+MAX_ENGINE_MAX_TOKENS = 16000
 
 
 def get_task_timeout_seconds_runtime() -> int:
@@ -414,6 +441,14 @@ def _default_parser_config() -> Dict[str, Any]:
         "hybrid_marker_min_length": int(runtime.get("hybrid_marker_min_length", 200)),
         "marker_prefer_api": bool(runtime.get("marker_prefer_api", False)),
         "task_timeout_seconds": int(get_task_timeout_seconds_runtime()),
+    }
+
+
+def _default_advanced_config() -> Dict[str, Any]:
+    return {
+        "engine_concurrency": int(DEFAULT_ENGINE_CONCURRENCY),
+        "engine_temperature": float(DEFAULT_ENGINE_TEMPERATURE),
+        "engine_max_tokens": int(DEFAULT_ENGINE_MAX_TOKENS),
     }
 
 
@@ -550,9 +585,32 @@ def _validate_parser_config(parser: Any, field_prefix: str = "parser") -> Dict[s
 
     def _as_int(name: str, min_v: int, max_v: int, default: int) -> int:
         raw = parser.get(name, default)
-        try:
+        if isinstance(raw, bool):
+            raise ConfigValidationError(
+                f"INVALID_{name.upper()}",
+                f"{name} 必须是整数",
+                f"{field_prefix}.{name}",
+            )
+        if isinstance(raw, int):
+            val = raw
+        elif isinstance(raw, float):
+            if not raw.is_integer():
+                raise ConfigValidationError(
+                    f"INVALID_{name.upper()}",
+                    f"{name} 必须是整数",
+                    f"{field_prefix}.{name}",
+                )
             val = int(raw)
-        except (TypeError, ValueError):
+        elif isinstance(raw, str):
+            text = raw.strip()
+            if not re.fullmatch(r"[+-]?\d+", text):
+                raise ConfigValidationError(
+                    f"INVALID_{name.upper()}",
+                    f"{name} 必须是整数",
+                    f"{field_prefix}.{name}",
+                )
+            val = int(text)
+        else:
             raise ConfigValidationError(
                 f"INVALID_{name.upper()}",
                 f"{name} 必须是整数",
@@ -584,6 +642,93 @@ def _validate_parser_config(parser: Any, field_prefix: str = "parser") -> Dict[s
             MIN_TASK_TIMEOUT_SECONDS,
             MAX_TASK_TIMEOUT_SECONDS,
             DEFAULT_TASK_TIMEOUT_SECONDS,
+        ),
+    }
+
+
+def _validate_advanced_config(advanced: Any, field_prefix: str = "advanced") -> Dict[str, Any]:
+    if advanced is None:
+        advanced = {}
+    if not isinstance(advanced, dict):
+        raise ConfigValidationError("INVALID_ADVANCED_CONFIG", "高级引擎配置格式无效", field_prefix)
+
+    def _as_int(name: str, min_v: int, max_v: int, default: int) -> int:
+        raw = advanced.get(name, default)
+        if isinstance(raw, bool):
+            raise ConfigValidationError(
+                f"INVALID_{name.upper()}",
+                f"{name} 必须是整数",
+                f"{field_prefix}.{name}",
+            )
+        if isinstance(raw, int):
+            val = raw
+        elif isinstance(raw, float):
+            if not raw.is_integer():
+                raise ConfigValidationError(
+                    f"INVALID_{name.upper()}",
+                    f"{name} 必须是整数",
+                    f"{field_prefix}.{name}",
+                )
+            val = int(raw)
+        elif isinstance(raw, str):
+            text = raw.strip()
+            if not re.fullmatch(r"[+-]?\d+", text):
+                raise ConfigValidationError(
+                    f"INVALID_{name.upper()}",
+                    f"{name} 必须是整数",
+                    f"{field_prefix}.{name}",
+                )
+            val = int(text)
+        else:
+            raise ConfigValidationError(
+                f"INVALID_{name.upper()}",
+                f"{name} 必须是整数",
+                f"{field_prefix}.{name}",
+            )
+        if val < min_v or val > max_v:
+            raise ConfigValidationError(
+                f"OUT_OF_RANGE_{name.upper()}",
+                f"{name} 必须在 {min_v} 到 {max_v} 之间",
+                f"{field_prefix}.{name}",
+            )
+        return val
+
+    def _as_float(name: str, min_v: float, max_v: float, default: float) -> float:
+        raw = advanced.get(name, default)
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            raise ConfigValidationError(
+                f"INVALID_{name.upper()}",
+                f"{name} 必须是数字",
+                f"{field_prefix}.{name}",
+            )
+        if val < min_v or val > max_v:
+            raise ConfigValidationError(
+                f"OUT_OF_RANGE_{name.upper()}",
+                f"{name} 必须在 {min_v} 到 {max_v} 之间",
+                f"{field_prefix}.{name}",
+            )
+        return val
+
+    return {
+        "engine_concurrency": _as_int(
+            "engine_concurrency",
+            MIN_ENGINE_CONCURRENCY,
+            MAX_ENGINE_CONCURRENCY,
+            DEFAULT_ENGINE_CONCURRENCY,
+        ),
+        "engine_temperature": _as_float(
+            "engine_temperature",
+            MIN_ENGINE_TEMPERATURE,
+            MAX_ENGINE_TEMPERATURE,
+            DEFAULT_ENGINE_TEMPERATURE,
+        ),
+        "engine_max_tokens": _as_int(
+            "engine_max_tokens",
+            MIN_ENGINE_MAX_TOKENS,
+            MAX_ENGINE_MAX_TOKENS,
+            DEFAULT_ENGINE_MAX_TOKENS,
         ),
     }
 
@@ -647,11 +792,13 @@ def _migrate_legacy_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     })
     profile = _validate_profile(profile, "profiles[0]")
     parser = _validate_parser_config(raw.get("parser", _default_parser_config()), "parser")
+    advanced = _validate_advanced_config(raw.get("advanced", _default_advanced_config()), "advanced")
     return {
         "schema_version": CONFIG_SCHEMA_VERSION,
         "active_profile_id": profile["id"],
         "profiles": [profile],
         "parser": parser,
+        "advanced": advanced,
     }
 
 
@@ -685,12 +832,14 @@ def _normalize_config_store(raw: Any) -> Dict[str, Any]:
         raise ConfigValidationError("ACTIVE_PROFILE_NOT_FOUND", "激活配置档案不存在", "active_profile_id")
 
     parser = _validate_parser_config(raw.get("parser", _default_parser_config()), "parser")
+    advanced = _validate_advanced_config(raw.get("advanced", _default_advanced_config()), "advanced")
 
     return {
         "schema_version": CONFIG_SCHEMA_VERSION,
         "active_profile_id": active_profile_id,
         "profiles": profiles,
         "parser": parser,
+        "advanced": advanced,
     }
 
 
@@ -775,6 +924,7 @@ def _config_to_view(config_store: Dict[str, Any]) -> ConfigStoreView:
         active_profile_id=config_store.get("active_profile_id", ""),
         profiles=profiles_view,
         parser=_validate_parser_config(config_store.get("parser", _default_parser_config()), "parser"),
+        advanced=_validate_advanced_config(config_store.get("advanced", _default_advanced_config()), "advanced"),
     )
 
 
@@ -799,11 +949,13 @@ def _config_export_payload(config_store: Dict[str, Any]) -> Dict[str, Any]:
         "active_profile_id": config_store.get("active_profile_id", ""),
         "profiles": profiles,
         "parser": _validate_parser_config(config_store.get("parser", _default_parser_config()), "parser"),
+        "advanced": _validate_advanced_config(config_store.get("advanced", _default_advanced_config()), "advanced"),
     }
 
 
 def _apply_runtime_config(config_store: Dict[str, Any]):
     parser_config = _validate_parser_config(config_store.get("parser", _default_parser_config()), "parser")
+    advanced_config = _validate_advanced_config(config_store.get("advanced", _default_advanced_config()), "advanced")
     update_parser_runtime_config(parser_config)
     update_task_timeout_seconds_runtime(parser_config.get("task_timeout_seconds", DEFAULT_TASK_TIMEOUT_SECONDS))
 
@@ -813,6 +965,7 @@ def _apply_runtime_config(config_store: Dict[str, Any]):
         return
 
     runtime_config = _profile_to_runtime(profile)
+    runtime_config["advanced"] = advanced_config
     if not runtime_config.get("api_key") and not _is_ollama_url(runtime_config.get("base_url", "")):
         logger.info("当前激活配置缺少 API Key，请在前端设置")
         return
@@ -823,7 +976,9 @@ def _apply_runtime_config(config_store: Dict[str, Any]):
     logger.info(
         f"配置已应用: profile={profile.get('name')} ({profile.get('provider')}), "
         f"parser_backend={parser_config.get('parser_backend')}, "
-        f"task_timeout={parser_config.get('task_timeout_seconds')}s"
+        f"task_timeout={parser_config.get('task_timeout_seconds')}s, "
+        f"engine_concurrency={advanced_config.get('engine_concurrency')}, "
+        f"engine_temperature={advanced_config.get('engine_temperature')}"
     )
 
 
@@ -1209,38 +1364,159 @@ def _persist_source_index(file_id: str, root_node, source_md_path: str, parser_b
     return index_payload
 
 
-def _build_index_from_markdown_headings(file_id: str, markdown: str, source_md_path: str) -> Dict[str, Any]:
-    """
-    兼容旧数据：直接按 Markdown 标题构建索引，保证与前端导图节点数量一致。
-    """
-    lines = markdown.splitlines()
-    heading_re = re.compile(r'^(#{1,6})\s+(.*)')
-    entries: List[Dict[str, Any]] = []
+_MD_HEADING_RE = re.compile(r'^(#{1,6})\s+(.*)$')
+_MD_LIST_RE = re.compile(r'^(?P<indent>\s*)(?P<marker>[-*+]|\d+[.)])\s+(?P<body>\S.*)$')
+_MD_NUMERIC_RE = re.compile(r'^(\d+(?:\.\d+)*)\s*[\.、):：-]\s*(.+)$')
+_MD_TABLE_RULE_RE = re.compile(r'^\s*\|?[\-:\s]{3,}\|[\-:\s|]+\s*$')
+_MD_ANCHOR_RE = re.compile(r'<!--\s*fm_anchor:.*?-->', flags=re.IGNORECASE)
+_MD_STRONG_RE = re.compile(r'(\*\*|__|`|~~)')
+_MD_LINK_RE = re.compile(r'!\[([^\]]*)\]\([^)]*\)|\[([^\]]+)\]\([^)]*\)')
+_MD_DOT_LEADER_RE = re.compile(r'[.\u2026·•]{3,}\s*\d+\s*$')
+_MD_TRAILING_PAGE_RE = re.compile(r'\s+\d+\s*$')
+_MAX_FALLBACK_INDEX_NODES = 220
 
-    for line_no, raw in enumerate(lines, start=1):
-        m = heading_re.match(raw.strip())
-        if not m:
-            continue
-        level = len(m.group(1))
-        topic = m.group(2).strip()
+
+def _clean_markdown_topic(raw: str) -> str:
+    text = _MD_ANCHOR_RE.sub('', str(raw or ''))
+    text = html.unescape(text)
+    text = _MD_LINK_RE.sub(lambda m: m.group(1) or m.group(2) or '', text)
+    text = _MD_STRONG_RE.sub('', text)
+    text = text.replace('\\_', '_')
+    text = text.strip().strip('|').strip()
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def _is_valid_outline_topic(topic: str) -> bool:
+    if not topic:
+        return False
+    if len(topic) < 1 or len(topic) > 140:
+        return False
+    if not re.search(r'[A-Za-z0-9\u4e00-\u9fff]', topic):
+        return False
+    if re.fullmatch(r'[★☆\-\s\|\.]+', topic):
+        return False
+    return True
+
+
+def _parse_outline_topic_level(topic: str, has_heading: bool) -> Tuple[str, Optional[int]]:
+    normalized = _clean_markdown_topic(topic)
+    normalized = _MD_DOT_LEADER_RE.sub('', normalized)
+    normalized = _MD_TRAILING_PAGE_RE.sub('', normalized)
+    normalized = normalized.strip()
+    if not _is_valid_outline_topic(normalized):
+        return "", None
+
+    m = _MD_NUMERIC_RE.match(normalized)
+    if not m:
+        return normalized, None
+
+    serial = m.group(1).strip()
+    title = _clean_markdown_topic(m.group(2))
+    if not _is_valid_outline_topic(title):
+        return normalized, None
+
+    level_offset = 1 if has_heading else 0
+    level = min(6, max(1, len(serial.split('.')) + level_offset))
+    return f"{serial} {title}".strip(), level
+
+
+def _collect_markdown_structure_entries(file_id: str, markdown: str) -> List[Dict[str, Any]]:
+    lines = markdown.splitlines()
+    entries: List[Dict[str, Any]] = []
+    seen_signatures = set()
+    total_lines = max(1, len(lines))
+    has_heading = False
+    last_heading_level = 0
+
+    def append_entry(topic: str, level: int, line_no: int, kind: str):
+        if len(entries) >= _MAX_FALLBACK_INDEX_NODES:
+            return
+        topic_norm = re.sub(r'\s+', ' ', topic).strip()
+        if not _is_valid_outline_topic(topic_norm):
+            return
+        signature = (line_no, topic_norm.lower())
+        if signature in seen_signatures:
+            return
+        seen_signatures.add(signature)
         serial = len(entries)
-        key = f"{file_id}|{serial}|{level}|{topic}|{line_no}"
+        key = f"{file_id}|{serial}|{kind}|{level}|{topic_norm}|{line_no}"
         node_id = f"n_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}"
         entries.append(
             {
                 "node_id": node_id,
-                "topic": topic,
-                "level": level,
-                "source_line_start": line_no,
-                "source_line_end": line_no,
+                "topic": topic_norm,
+                "level": int(max(1, min(6, level))),
+                "source_line_start": int(line_no),
+                "source_line_end": int(line_no),
                 "children": [],
             }
         )
 
-    total_lines = len(lines)
+    for line_no, raw in enumerate(lines, start=1):
+        line = _MD_ANCHOR_RE.sub('', raw or '')
+        if not line.strip():
+            continue
+        stripped = line.strip()
+        if _MD_TABLE_RULE_RE.match(stripped):
+            continue
+
+        heading_match = _MD_HEADING_RE.match(stripped)
+        if heading_match:
+            topic = _clean_markdown_topic(heading_match.group(2))
+            level = len(heading_match.group(1))
+            append_entry(topic, level, line_no, "heading")
+            has_heading = True
+            last_heading_level = level
+            continue
+
+        list_match = _MD_LIST_RE.match(line)
+        if list_match:
+            body = _clean_markdown_topic(list_match.group("body"))
+            indent = len((list_match.group("indent") or '').replace('\t', '    '))
+            list_depth = (indent // 2) + 1
+            parent_level = last_heading_level if has_heading else 0
+            level = min(6, max(1, parent_level + list_depth))
+            append_entry(body, level, line_no, "list")
+            continue
+
+        # TOC/table fallback: extract candidate cells and map numeric entries to hierarchy.
+        if stripped.startswith('|') or _MD_DOT_LEADER_RE.search(stripped):
+            cells = [stripped]
+            if stripped.startswith('|'):
+                cells = [cell.strip() for cell in stripped.strip('|').split('|') if cell.strip()]
+            for cell in cells:
+                topic, parsed_level = _parse_outline_topic_level(cell, has_heading)
+                if not topic:
+                    continue
+                level = parsed_level if parsed_level is not None else (last_heading_level + 1 if has_heading else 1)
+                append_entry(topic, level, line_no, "outline")
+            continue
+
+        # Plain outline line fallback, e.g. "1. 章节".
+        topic, parsed_level = _parse_outline_topic_level(stripped, has_heading)
+        if topic and parsed_level is not None:
+            append_entry(topic, parsed_level, line_no, "outline")
+
+    if not entries:
+        first_non_empty = next((line for line in lines if line.strip()), "文档")
+        append_entry(_clean_markdown_topic(first_non_empty), 1, 1, "fallback")
+
     for i, item in enumerate(entries):
         next_start = entries[i + 1]["source_line_start"] if i + 1 < len(entries) else (total_lines + 1)
         item["source_line_end"] = max(item["source_line_start"], next_start - 1)
+
+    return entries
+
+
+def _build_index_from_markdown_headings(file_id: str, markdown: str, source_md_path: str) -> Dict[str, Any]:
+    """
+    兼容旧数据：按 Markdown 结构构建索引。
+    优先标题；标题不足时补充列表/编号大纲，避免 tree 退化成单节点。
+    """
+    lines = markdown.splitlines()
+    total_lines = len(lines)
+    entries = _collect_markdown_structure_entries(file_id=file_id, markdown=markdown)
 
     root = {
         "node_id": "root",
@@ -1289,7 +1565,193 @@ def _build_index_from_markdown_headings(file_id: str, markdown: str, source_md_p
         "tree": root,
         "flat_nodes": flat_nodes,
         "node_index": {item["node_id"]: item for item in flat_nodes},
-        "index_mode": "markdown_headings",
+        "index_mode": "markdown_outline_v2",
+    }
+
+
+def _count_source_index_nodes(source_index: Any) -> int:
+    if not isinstance(source_index, dict):
+        return 0
+    flat_nodes = source_index.get("flat_nodes", [])
+    node_index = source_index.get("node_index", {})
+    flat_count = len(flat_nodes) if isinstance(flat_nodes, list) else 0
+    node_index_count = len(node_index) if isinstance(node_index, dict) else 0
+    return max(flat_count, node_index_count)
+
+
+def _evaluate_source_index_rebuild(
+    file_id: str,
+    markdown: str,
+    source_index: Optional[Dict[str, Any]],
+    force: bool,
+    only_shallow: bool,
+    include_precise_anchor: bool,
+) -> Tuple[bool, str]:
+    if force:
+        return True, "forced"
+    if not source_index:
+        return True, "missing_index"
+
+    capabilities = source_index.get("capabilities", {}) if isinstance(source_index, dict) else {}
+    has_precise_anchor = bool(capabilities.get("has_precise_anchor", False))
+    if has_precise_anchor and not include_precise_anchor:
+        return False, "skip_precise_anchor"
+
+    if not only_shallow:
+        return True, "rebuild_non_shallow_mode"
+
+    actual_nodes = _count_source_index_nodes(source_index)
+    if actual_nodes > 2:
+        return False, f"healthy_nodes={actual_nodes}"
+
+    potential_nodes = len(_collect_markdown_structure_entries(file_id, markdown))
+    if potential_nodes <= 2:
+        return False, f"no_gain_potential={potential_nodes}"
+
+    return True, f"shallow_actual={actual_nodes},potential={potential_nodes}"
+
+
+def rebuild_source_indexes_batch(
+    file_ids: Optional[List[str]] = None,
+    dry_run: bool = False,
+    force: bool = False,
+    only_shallow: bool = True,
+    include_precise_anchor: bool = False,
+    max_files: Optional[int] = None,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    started_at = datetime.now(timezone.utc).isoformat()
+    target_ids = {
+        str(item).strip()
+        for item in (file_ids or [])
+        if str(item).strip()
+    }
+    history = load_history()
+
+    scanned = 0
+    rebuilt = 0
+    skipped = 0
+    failed = 0
+    items: List[Dict[str, Any]] = []
+
+    for record in history:
+        file_id = str(record.get("file_id", "")).strip()
+        if not file_id:
+            continue
+        if target_ids and file_id not in target_ids:
+            continue
+        if max_files and scanned >= max_files:
+            break
+
+        scanned += 1
+        filename = str(record.get("filename", "")).strip()
+        status = str(record.get("status", "")).strip().lower()
+        md_path = str(record.get("md_path", "")).strip()
+
+        item = {
+            "file_id": file_id,
+            "filename": filename,
+        }
+
+        if status != "completed":
+            skipped += 1
+            item.update({
+                "action": "skipped",
+                "reason": f"status={status or 'unknown'}",
+            })
+            if verbose:
+                logger.info(f"[rebuild] skip {file_id}: {item['reason']}")
+            items.append(item)
+            continue
+
+        if not md_path or not os.path.exists(md_path):
+            failed += 1
+            item.update({
+                "action": "failed",
+                "reason": f"md_not_found:{md_path}",
+            })
+            items.append(item)
+            continue
+
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                markdown = f.read()
+            source_index = _load_source_index(file_id)
+            old_nodes = _count_source_index_nodes(source_index)
+            should_rebuild, reason = _evaluate_source_index_rebuild(
+                file_id=file_id,
+                markdown=markdown,
+                source_index=source_index,
+                force=force,
+                only_shallow=only_shallow,
+                include_precise_anchor=include_precise_anchor,
+            )
+            if not should_rebuild:
+                skipped += 1
+                item.update({
+                    "action": "skipped",
+                    "reason": reason,
+                    "old_nodes": old_nodes,
+                })
+                if verbose:
+                    logger.info(f"[rebuild] skip {file_id}: {reason}")
+                items.append(item)
+                continue
+
+            source_md_path = _source_md_path(file_id)
+            if not os.path.exists(source_md_path):
+                source_md_path = md_path
+            rebuilt_index = _build_index_from_markdown_headings(file_id, markdown, source_md_path)
+            new_nodes = _count_source_index_nodes(rebuilt_index)
+            index_mode = str(rebuilt_index.get("index_mode", "unknown"))
+
+            if not dry_run:
+                _atomic_write_json(_source_index_path(file_id), rebuilt_index)
+
+            rebuilt += 1
+            action = "would_rebuild" if dry_run else "rebuilt"
+            item.update({
+                "action": action,
+                "reason": reason,
+                "old_nodes": old_nodes,
+                "new_nodes": new_nodes,
+                "index_mode": index_mode,
+            })
+            if verbose:
+                logger.info(
+                    f"[rebuild] {action} {file_id}: old_nodes={old_nodes}, new_nodes={new_nodes}, reason={reason}"
+                )
+            items.append(item)
+        except Exception as exc:
+            failed += 1
+            item.update({
+                "action": "failed",
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
+            items.append(item)
+
+    finished_at = datetime.now(timezone.utc).isoformat()
+    success = failed == 0
+    return {
+        "success": success,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "dry_run": bool(dry_run),
+        "options": {
+            "force": bool(force),
+            "only_shallow": bool(only_shallow),
+            "include_precise_anchor": bool(include_precise_anchor),
+            "max_files": int(max_files) if max_files else None,
+            "file_ids": sorted(target_ids),
+        },
+        "summary": {
+            "scanned": scanned,
+            "rebuilt": rebuilt,
+            "skipped": skipped,
+            "failed": failed,
+        },
+        "items": items,
+        "message": f"扫描 {scanned} 个文件，重建 {rebuilt}，跳过 {skipped}，失败 {failed}",
     }
 
 
@@ -1329,6 +1791,26 @@ def _rebuild_source_index_from_markdown(file_id: str, markdown_path: str) -> Dic
 def _ensure_source_index(file_id: str, markdown_path: str) -> Dict[str, Any]:
     source_index = _load_source_index(file_id)
     if source_index:
+        capabilities = source_index.get("capabilities", {}) if isinstance(source_index, dict) else {}
+        # 对于带精确锚点的索引，优先保留，避免重建丢失 PDF 精确定位信息。
+        if bool(capabilities.get("has_precise_anchor", False)):
+            return source_index
+        actual_nodes = _count_source_index_nodes(source_index)
+        # 历史脏索引常见症状：只有 root（或 root+1），会导致导图退化成单节点。
+        if actual_nodes > 2:
+            return source_index
+        try:
+            with open(markdown_path, "r", encoding="utf-8") as f:
+                markdown = f.read()
+            potential_nodes = len(_collect_markdown_structure_entries(file_id, markdown))
+            if potential_nodes <= 2:
+                return source_index
+            logger.info(
+                f"source index 结构过浅，触发重建: file_id={file_id}, actual={actual_nodes}, potential={potential_nodes}"
+            )
+            return _rebuild_source_index_from_markdown(file_id, markdown_path)
+        except Exception as exc:
+            logger.warning(f"检测 source index 质量失败，沿用旧索引: file_id={file_id}, err={exc}")
         return source_index
     logger.info(f"source index 缺失，开始重建: file_id={file_id}")
     return _rebuild_source_index_from_markdown(file_id, markdown_path)
@@ -2009,60 +2491,6 @@ async def delete_file(file_id: str):
         return {"message": "文件已删除"}
     raise HTTPException(status_code=500, detail="删除历史记录失败")
 
-@app.get("/export/xmind/{file_id}")
-async def export_xmind(file_id: str):
-    """
-    导出 XMind 格式
-    """
-    from fastapi.responses import Response
-
-    history = load_history()
-    for item in history:
-        if item['file_id'] == file_id:
-            if item['status'] != 'completed':
-                raise HTTPException(status_code=400, detail="文件尚未处理完成")
-
-            if not os.path.exists(item['md_path']):
-                raise HTTPException(status_code=404, detail="文件内容不存在")
-
-            with open(item['md_path'], 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            # 生成 XMind
-            # step 4: 传入图片目录
-            images_dir = os.path.join(IMAGES_DIR, file_id)
-            xmind_data = generate_xmind_content(content, item['filename'], images_dir=images_dir)
-
-            filename = item['filename'].replace('.pdf', '') + '.xmind'
-
-            return Response(
-                content=xmind_data,
-                media_type="application/octet-stream",
-                headers={"Content-Disposition": f"attachment; filename={filename}"}
-            )
-
-    raise HTTPException(status_code=404, detail="文件记录不存在")
-
-@app.post("/export/xmind")
-async def export_xmind_from_content(request: Request):
-    """
-    直接从 Markdown 数据导出 XMind
-    """
-    request_data = await request.json()
-    content = request_data.get('content', '')
-    filename = request_data.get('filename', 'mindmap')
-
-    if not content:
-        raise HTTPException(status_code=400, detail="内容不能为空")
-
-    xmind_data = generate_xmind_content(content, filename)
-
-    return Response(
-        content=xmind_data,
-        media_type="application/octet-stream",
-        headers={"Content-Disposition": f"attachment; filename={filename}.xmind"}
-    )
-
 @app.get("/health")
 async def health_check():
     """健康检查"""
@@ -2085,6 +2513,33 @@ async def get_system_features():
         "FEATURE_VIRTUAL_PDF": bool(settings.get("feature_virtual_pdf", True)),
         "FEATURE_SIDECAR_ANCHOR": False
     }
+
+
+@app.post("/admin/source-index/rebuild")
+async def admin_rebuild_source_index(payload: SourceIndexRebuildPayload):
+    """批量重建 source index，支持 dry-run 并返回逐文件日志。"""
+    try:
+        data = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+        result = await asyncio.to_thread(
+            rebuild_source_indexes_batch,
+            data.get("file_ids", []),
+            bool(data.get("dry_run", False)),
+            bool(data.get("force", False)),
+            bool(data.get("only_shallow", True)),
+            bool(data.get("include_precise_anchor", False)),
+            data.get("max_files"),
+            bool(data.get("verbose", False)),
+        )
+        return result
+    except Exception as exc:
+        logger.error(f"重建 source index 失败: {exc}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "SOURCE_INDEX_REBUILD_FAILED",
+                "message": f"重建 source index 失败: {exc}",
+            },
+        )
 
 # ==================== 配置 API ====================
 @app.get("/config", response_model=ConfigStoreView)
@@ -2111,6 +2566,7 @@ async def import_config(payload: ConfigImportPayload):
             "active_profile_id": raw_payload.get("active_profile_id", ""),
             "profiles": raw_payload.get("profiles", []),
             "parser": raw_payload.get("parser", _default_parser_config()),
+            "advanced": raw_payload.get("advanced", _default_advanced_config()),
         })
         existing = _load_config_store()
 

@@ -18,6 +18,19 @@ except ImportError:
 # DeepSeek API 配置 - 使用全局客户端，支持动态更新
 _client = None
 
+# Advanced limits configuration
+_engine_settings = {
+    "concurrency": 5,
+    "temperature": 0.3,
+    "max_tokens": 8192
+}
+
+ENGINE_LIMITS = {
+    "concurrency": {"min": 1, "max": 10, "default": 5},
+    "temperature": {"min": 0.0, "max": 1.0, "default": 0.3},
+    "max_tokens": {"min": 1000, "max": 16000, "default": 8192},
+}
+
 def get_client():
     """获取或创建全局客户端"""
     global _client
@@ -37,6 +50,29 @@ def update_client_config(config: dict):
     base_url = config.get("base_url", "https://api.minimaxi.com/v1")
     api_key = config.get("api_key", "")
     model = config.get("model", "MiniMax-M2.5")
+    advanced = config.get("advanced", {})
+    
+    global _engine_settings
+    if advanced:
+        _engine_settings["concurrency"] = _clamp_int(
+            advanced.get("engine_concurrency"),
+            ENGINE_LIMITS["concurrency"]["default"],
+            ENGINE_LIMITS["concurrency"]["min"],
+            ENGINE_LIMITS["concurrency"]["max"],
+        )
+        _engine_settings["temperature"] = _clamp_float(
+            advanced.get("engine_temperature"),
+            ENGINE_LIMITS["temperature"]["default"],
+            ENGINE_LIMITS["temperature"]["min"],
+            ENGINE_LIMITS["temperature"]["max"],
+        )
+        _engine_settings["max_tokens"] = _clamp_int(
+            advanced.get("engine_max_tokens"),
+            ENGINE_LIMITS["max_tokens"]["default"],
+            ENGINE_LIMITS["max_tokens"]["min"],
+            ENGINE_LIMITS["max_tokens"]["max"],
+        )
+        _reset_engine_runtime_limiter()
     
     # 1. Base URL 规范化 (自动补全 /v1)
     if not base_url.endswith("/v1"):
@@ -59,6 +95,28 @@ def update_client_config(config: dict):
     # 更新模型
     set_model(model)
     print(f"Client updated: base_url={base_url}, model={model}")
+
+
+def _clamp_int(raw, default, min_v, max_v):
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(min_v, min(max_v, value))
+
+
+def _clamp_float(raw, default, min_v, max_v):
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = float(default)
+    return max(min_v, min(max_v, value))
+
+
+def _reset_engine_runtime_limiter():
+    global _semaphore, _rate_limiter
+    _semaphore = None
+    _rate_limiter = None
 
 async def fetch_models_detailed(base_url: str, api_key: str = "") -> dict:
     """从 API 获取模型列表，返回结构化结果"""
@@ -171,6 +229,7 @@ def set_model(model: str):
     """设置当前模型"""
     global _current_model
     _current_model = model
+    _reset_engine_runtime_limiter()
 
 def get_model() -> str:
     """获取当前模型"""
@@ -210,6 +269,7 @@ def set_account_type(account_type: str):
     global _current_account_type
     if account_type in ["free", "paid"]:
         _current_account_type = account_type
+        _reset_engine_runtime_limiter()
 
 def get_account_type() -> str:
     """获取当前账户类型"""
@@ -283,10 +343,10 @@ def get_rate_limiter():
             # 免费版更严格
             if account_type == "free":
                 rpm = 20  # 极度保守
-                concurrency = 2
+                concurrency = _engine_settings.get("concurrency", ENGINE_LIMITS["concurrency"]["default"])
             else:
-                rpm = strategy["rpm"] # 默认 120
-                concurrency = strategy["concurrency"]
+                rpm = strategy.get("rpm", 120)
+                concurrency = _engine_settings.get("concurrency", ENGINE_LIMITS["concurrency"]["default"])
             
             _rate_limiter = RateLimiter(rpm)
             _semaphore = asyncio.Semaphore(concurrency)
@@ -295,7 +355,7 @@ def get_rate_limiter():
         else: # DeepSeek (Adaptive)
             # DeepSeek 不需要严格的 RateLimiter，只需信号量控制并发
             _rate_limiter = None 
-            concurrency = strategy["initial_concurrency"]
+            concurrency = _engine_settings.get("concurrency", ENGINE_LIMITS["concurrency"]["default"])
             _semaphore = asyncio.Semaphore(concurrency)
             print(f"策略应用: DeepSeek (Adaptive), Start Concurrency={concurrency}")
             
@@ -308,9 +368,7 @@ def cleanup():
 
 atexit.register(cleanup)
 
-# 任务超时配置
-TASK_TIMEOUT = 900  # 15分钟，给予更多重试时间
-
+# (Task timeout is now managed by the frontend settings and injected into app.py's task runner)
 SYSTEM_PROMPT = """
 你是一位专业的知识架构师。你的任务是从文档段落中提取完整、结构化的思维导图。
 
@@ -439,8 +497,8 @@ async def summarize_chunk(text_chunk: str, chunk_id: int, task=None, process_inf
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": user_prompt}
                     ],
-                    temperature=0.3,
-                    max_tokens=8192
+                    temperature=_engine_settings.get("temperature", 0.3),
+                    max_tokens=_engine_settings.get("max_tokens", 8192)
                 )
 
                 ai_content = response.choices[0].message.content
@@ -533,8 +591,8 @@ async def generate_root_summary(full_markdown: str):
 目录大纲：
 {toc_content}"""}
             ],
-            temperature=0.3,
-            max_tokens=2000
+            temperature=_engine_settings.get("temperature", ENGINE_LIMITS["temperature"]["default"]),
+            max_tokens=_engine_settings.get("max_tokens", ENGINE_LIMITS["max_tokens"]["default"])
         )
         
         # 后置防护：移除 AI 可能误生成的 H2+ 标题
