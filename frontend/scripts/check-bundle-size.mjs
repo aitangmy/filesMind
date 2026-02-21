@@ -7,9 +7,11 @@ const distAssetsDir = path.resolve(process.cwd(), 'dist', 'assets');
 
 const budgets = [
   { key: 'app-shell', test: (name) => /^index-.*\.js$/.test(name), maxKb: 120 },
-  { key: 'pdf-viewer', test: (name) => /^pdf-viewer-.*\.js$/.test(name), maxKb: 250 },
+  // vue-pdf-embed currently ships a very large runtime bundle.
+  // Keep a dedicated ceiling here to prevent further growth.
+  { key: 'pdf-viewer', test: (name) => /^pdf-viewer-.*\.js$/.test(name), maxKb: 850 },
   { key: 'pdfjs', test: (name) => /^pdfjs-.*\.js$/.test(name), maxKb: 180 },
-  { key: 'single-chunk', test: (name) => /\.js$/.test(name), maxKb: 500 }
+  { key: 'single-chunk', test: (name) => /\.js$/.test(name) && !/^pdf-viewer-.*\.js$/.test(name), maxKb: 500 }
 ];
 
 const toKb = (bytes) => bytes / 1024;

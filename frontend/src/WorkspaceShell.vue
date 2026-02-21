@@ -1,5 +1,5 @@
 ﻿<script setup>
-import { ref, nextTick, onMounted, onUnmounted, computed, defineAsyncComponent, watch } from 'vue';
+import { ref, nextTick, onMounted, onUnmounted, computed, defineAsyncComponent, watch, defineComponent, h } from 'vue';
 import { useRouter } from 'vue-router';
 
 const props = defineProps({
@@ -14,8 +14,40 @@ const isSettingsRoute = computed(() => props.routeMode === 'settings');
 
 const loadMindMapComponent = () => import('./components/MindMap.vue');
 const loadVirtualPdfViewerComponent = () => import('./components/VirtualPdfViewer.vue');
-const MindMap = defineAsyncComponent(loadMindMapComponent);
-const VirtualPdfViewer = defineAsyncComponent(loadVirtualPdfViewerComponent);
+
+const createAsyncState = (message, tone = 'info') => defineComponent({
+  name: tone === 'error' ? 'AsyncErrorState' : 'AsyncLoadingState',
+  setup() {
+    const className = tone === 'error'
+      ? 'absolute inset-0 flex items-center justify-center bg-rose-50/70 text-rose-600 text-xs'
+      : 'absolute inset-0 flex items-center justify-center bg-slate-50/70 text-slate-500 text-xs';
+    return () => h('div', { class: className }, message);
+  }
+});
+
+const createResilientAsyncComponent = (loader, options = {}) => defineAsyncComponent({
+  loader,
+  delay: 120,
+  timeout: 20000,
+  loadingComponent: createAsyncState(options.loadingText || 'Loading module...'),
+  errorComponent: createAsyncState(options.errorText || 'Module load failed. Please refresh.', 'error'),
+  onError(error, retry, fail, attempts) {
+    if (attempts <= 2) {
+      retry();
+      return;
+    }
+    fail(error);
+  }
+});
+
+const MindMap = createResilientAsyncComponent(loadMindMapComponent, {
+  loadingText: 'Loading mind map...',
+  errorText: 'Mind map module failed to load. Please refresh.'
+});
+const VirtualPdfViewer = createResilientAsyncComponent(loadVirtualPdfViewerComponent, {
+  loadingText: 'Loading PDF viewer...',
+  errorText: 'PDF viewer failed to load. Please refresh.'
+});
 
 let pdfPrefetchPromise = null;
 const prefetchPdfViewerAssets = () => {
