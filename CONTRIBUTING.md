@@ -34,6 +34,14 @@ npm run dev
 3. Include reproduction steps for bug fixes.
 4. Update docs when behavior or setup changes.
 
+## Contribution License Terms
+
+By submitting a contribution to this repository, you agree that:
+
+1. Your contribution is licensed under `AGPL-3.0-or-later` as part of this project.
+2. The project maintainer may also use and distribute your contribution under commercial license terms as part of FilesMind's dual-licensing model.
+3. You confirm you have the legal right to submit the contribution under these terms.
+
 ## Local Checks
 
 Run full project checks before opening a PR:

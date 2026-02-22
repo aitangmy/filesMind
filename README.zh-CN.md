@@ -4,7 +4,7 @@
 
 将长篇 PDF 转换为结构化思维导图，支持来源追溯、可编辑流程与可配置的大模型处理参数。
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![License](https://img.shields.io/badge/license-AGPLv3-blue.svg)
 ![Backend](https://img.shields.io/badge/Backend-FastAPI-009688.svg)
 ![Frontend](https://img.shields.io/badge/Frontend-Vue3-4FC08D.svg)
 
@@ -369,4 +369,9 @@ uv run uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
 
 ## 📄 许可证
 
-MIT License，详见 [LICENSE](LICENSE)。
+FilesMind 采用双许可证模式：
+
+1. 开源许可证：GNU Affero General Public License v3.0 或更高版本（`AGPL-3.0-or-later`），详见 [LICENSE](LICENSE)。
+2. 商业许可证：适用于需要闭源分发或闭源运营衍生版本的组织，详见 [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md)。
+
+除非你与版权所有者另行签署书面商业授权协议，否则默认适用 AGPL v3.0 或更高版本。

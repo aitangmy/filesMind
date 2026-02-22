@@ -4,7 +4,7 @@
 
 Convert long PDFs into structured mind maps with source traceability, editable workflow, and configurable LLM processing.
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![License](https://img.shields.io/badge/license-AGPLv3-blue.svg)
 ![Backend](https://img.shields.io/badge/Backend-FastAPI-009688.svg)
 ![Frontend](https://img.shields.io/badge/Frontend-Vue3-4FC08D.svg)
 
@@ -369,4 +369,9 @@ For repository guidelines, see `CONTRIBUTING.md`.
 
 ## 📄 License
 
-MIT License. See [LICENSE](LICENSE).
+FilesMind is dual-licensed:
+
+1. Open-source license: GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`), see [LICENSE](LICENSE).
+2. Commercial license: available for organizations that need to distribute or operate proprietary derivatives, see [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
+
+Unless you have a separate written commercial agreement with the copyright holder, your use is governed by AGPL v3.0 or later.
