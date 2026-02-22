@@ -1,8 +1,9 @@
 <script setup>
-import { ref, shallowRef, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent } from 'vue';
+import { ref, shallowRef, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent, computed } from 'vue';
 
 const VuePdfEmbed = defineAsyncComponent(async () => {
   await import('vue-pdf-embed/dist/styles/annotationLayer.css');
+  await import('vue-pdf-embed/dist/styles/textLayer.css');
   const module = await import('vue-pdf-embed');
   return module.default;
 });
@@ -34,6 +35,10 @@ const props = defineProps({
     type: Number,
     default: null
   },
+  navigateKey: {
+    type: Number,
+    default: 0
+  },
   // Max number of pages to mount at once
   maxMountedPages: {
     type: Number,
@@ -61,6 +66,8 @@ const totalPages = ref(0);
 const pageA4Ratio = 1.414;
 const estimatedPageHeight = ref(800);
 const pageHeights = ref({});
+const basePageWidth = ref(595);
+const containerWidth = ref(0);
 
 // For tracking mounted pages via IntersectionObserver
 const mountedPages = ref(new Set());
@@ -76,11 +83,20 @@ let loadToken = 0;
 let preloadDebounceTimer = null;
 let preloadAbortController = null;
 let preloadRunPromise = null;
+let navigateTimer = null;
+let navigateToken = 0;
+let containerResizeObserver = null;
+let rescaleSettledTimer = null;
+let scrollNoticeTimer = null;
+let internalScrollAdjusting = false;
+const renderEpoch = ref(0);
+const scrollLimitNotice = ref('');
 
 const PRELOAD_DEBOUNCE_MS = 160;
 const PRELOAD_EAGER_PAGES = 12;
 const PRELOAD_MAX_PAGES = 1500;
 const PRELOAD_CONCURRENCY = 2;
+const PAGE_HORIZONTAL_PADDING_PX = 16; // px-2 on each placeholder
 
 const toErrorMessage = (err, fallback = '加载文档失败') => {
   if (!err) return fallback;
@@ -91,7 +107,22 @@ const toErrorMessage = (err, fallback = '加载文档失败') => {
   return fallback;
 };
 
+const isTransientRenderConflict = (err, phase = 'load') => {
+  const name = String(err?.name || '');
+  if (name === 'RenderingCancelledException' || name === 'PromiseCancelledException') {
+    return true;
+  }
+  if (phase !== 'render') return false;
+  const message = toErrorMessage(err, '');
+  return /Cannot use the same canvas during multiple render\(\) operations/i.test(message);
+};
+
 const emitViewerError = (err, phase = 'load', fallback = '加载文档失败') => {
+  if (isTransientRenderConflict(err, phase)) {
+    // Recover from partial canvas paint during rapid resize.
+    renderEpoch.value += 1;
+    return;
+  }
   const message = toErrorMessage(err, fallback);
   error.value = message;
   emit('error', { message, phase, raw: err });
@@ -102,6 +133,104 @@ const clearPreloadDebounce = () => {
     clearTimeout(preloadDebounceTimer);
     preloadDebounceTimer = null;
   }
+};
+
+const clearNavigateTimer = () => {
+  if (navigateTimer) {
+    clearTimeout(navigateTimer);
+    navigateTimer = null;
+  }
+};
+
+const clearRescaleSettledTimer = () => {
+  if (rescaleSettledTimer) {
+    clearTimeout(rescaleSettledTimer);
+    rescaleSettledTimer = null;
+  }
+};
+
+const clearScrollNoticeTimer = () => {
+  if (scrollNoticeTimer) {
+    clearTimeout(scrollNoticeTimer);
+    scrollNoticeTimer = null;
+  }
+};
+
+const showScrollLimitNotice = (direction) => {
+  scrollLimitNotice.value = direction === 'up'
+    ? '已到当前可浏览上限，请选择节点重新定位'
+    : '已到当前可浏览下限，请选择节点重新定位';
+  clearScrollNoticeTimer();
+  scrollNoticeTimer = setTimeout(() => {
+    scrollLimitNotice.value = '';
+    scrollNoticeTimer = null;
+  }, 1500);
+};
+
+const resolveMountedScrollBounds = () => {
+  const container = containerRef.value;
+  if (!container || !mountedPages.value.size) return null;
+  const sortedPages = Array.from(mountedPages.value).sort((a, b) => a - b);
+  const firstPage = sortedPages[0];
+  const lastPage = sortedPages[sortedPages.length - 1];
+  const firstEl = container.querySelector(`#vpdf-page-${firstPage}`);
+  const lastEl = container.querySelector(`#vpdf-page-${lastPage}`);
+  if (!firstEl || !lastEl) return null;
+  const minScroll = Math.max(0, firstEl.offsetTop - 8);
+  const maxScroll = Math.max(
+    minScroll,
+    lastEl.offsetTop + Math.max(lastEl.clientHeight, 1) - container.clientHeight + 8
+  );
+  return { minScroll, maxScroll };
+};
+
+const clampScrollWithinMountedRange = (directionHint = null) => {
+  const container = containerRef.value;
+  if (!container || loading.value || !pdfDoc.value) return;
+  const bounds = resolveMountedScrollBounds();
+  if (!bounds) return;
+  const top = container.scrollTop;
+  if (top < bounds.minScroll) {
+    internalScrollAdjusting = true;
+    container.scrollTop = bounds.minScroll;
+    requestAnimationFrame(() => {
+      internalScrollAdjusting = false;
+    });
+    showScrollLimitNotice(directionHint || 'up');
+    return;
+  }
+  if (top > bounds.maxScroll) {
+    internalScrollAdjusting = true;
+    container.scrollTop = bounds.maxScroll;
+    requestAnimationFrame(() => {
+      internalScrollAdjusting = false;
+    });
+    showScrollLimitNotice(directionHint || 'down');
+  }
+};
+
+const onContainerWheel = (event) => {
+  const container = containerRef.value;
+  if (!container || !pdfDoc.value || !mountedPages.value.size) return;
+  const bounds = resolveMountedScrollBounds();
+  if (!bounds) return;
+  const top = container.scrollTop;
+  const scrollingUp = event.deltaY < 0;
+  const scrollingDown = event.deltaY > 0;
+  if (scrollingUp && top <= bounds.minScroll + 1) {
+    event.preventDefault();
+    showScrollLimitNotice('up');
+    return;
+  }
+  if (scrollingDown && top >= bounds.maxScroll - 1) {
+    event.preventDefault();
+    showScrollLimitNotice('down');
+  }
+};
+
+const onContainerScroll = () => {
+  if (internalScrollAdjusting) return;
+  clampScrollWithinMountedRange();
 };
 
 const cancelScheduledPreload = () => {
@@ -142,8 +271,36 @@ const runWhenBrowserIdle = async () => {
   await new Promise(resolve => setTimeout(resolve, 0));
 };
 
+const resolveEffectivePageWidth = (containerWidth) => {
+  const width = Number(containerWidth);
+  if (!Number.isFinite(width) || width <= 0) {
+    return 800;
+  }
+  return Math.max(240, width - PAGE_HORIZONTAL_PADDING_PX);
+};
+
+const baseScale = computed(() => {
+  const n = Number(props.scale);
+  if (!Number.isFinite(n) || n <= 0) return 1;
+  return n;
+});
+
+const effectiveScale = computed(() => {
+  const availableWidth = resolveEffectivePageWidth(containerWidth.value || containerRef.value?.clientWidth || 0);
+  const rawPageWidth = Number(basePageWidth.value || 0);
+  if (!Number.isFinite(rawPageWidth) || rawPageWidth <= 0) {
+    return baseScale.value;
+  }
+  const fitScale = availableWidth / rawPageWidth;
+  // Auto-shrink to fit pane width; keep caller-provided scale as upper bound.
+  return Math.max(0.35, Math.min(baseScale.value, fitScale));
+});
+const renderScaleKey = computed(() => Math.round(effectiveScale.value * 1000));
+
 // Clean up existing PDF proxy to free memory
 const disposeCurrentPdf = async () => {
+  navigateToken += 1;
+  clearNavigateTimer();
   cancelScheduledPreload();
   await waitForPreloadToStop();
   if (currentLoadingTask) {
@@ -203,16 +360,17 @@ const loadPdf = async () => {
       // Calculate aspect ratio dynamically for initial rendering fallback
       let containerWidth = containerRef.value ? containerRef.value.clientWidth : 800;
       if (containerWidth <= 0) containerWidth = 800;
-      const ratio = viewport.height / viewport.width;
-      estimatedPageHeight.value = (containerWidth * ratio) * props.scale;
+      basePageWidth.value = viewport.width;
+      estimatedPageHeight.value = viewport.height * effectiveScale.value;
       if (typeof page.cleanup === 'function') page.cleanup();
       
       // Debounce and lazily preload heights to reduce worker pressure during rapid switches.
-      schedulePageHeightPreload(doc, containerWidth * props.scale);
+      schedulePageHeightPreload(doc, effectiveScale.value);
     }
     if (token !== loadToken) return;
     // Mount initial pages
     updateMountedPages(1);
+    scheduleNavigateToTarget(0, 10);
     if (token !== loadToken) return;
     emit('loaded', { numPages: doc.numPages });
   } catch (err) {
@@ -233,7 +391,7 @@ const loadPdf = async () => {
   }
 };
 
-const preloadPageHeightsBatch = async (doc, defaultWidth, token, signal, startPage, endPage) => {
+const preloadPageHeightsBatch = async (doc, renderScale, token, signal, startPage, endPage) => {
   if (startPage > endPage) return;
   let pageCursor = startPage;
 
@@ -249,8 +407,8 @@ const preloadPageHeightsBatch = async (doc, defaultWidth, token, signal, startPa
           if (typeof page.cleanup === 'function') page.cleanup();
           return;
         }
-        const viewport = page.getViewport({ scale: 1.0 });
-        pageHeights.value[pageIndex] = defaultWidth * (viewport.height / viewport.width);
+        const viewport = page.getViewport({ scale: renderScale });
+        pageHeights.value[pageIndex] = viewport.height;
         if (typeof page.cleanup === 'function') page.cleanup();
       } catch {
         // Best-effort preloading only.
@@ -265,22 +423,22 @@ const preloadPageHeightsBatch = async (doc, defaultWidth, token, signal, startPa
   await Promise.all(workers);
 };
 
-const preloadAllPageHeights = async (doc, defaultWidth, token, signal) => {
+const preloadAllPageHeights = async (doc, renderScale, token, signal) => {
   const numToPreload = Math.min(doc.numPages, PRELOAD_MAX_PAGES);
   if (numToPreload <= 0) return;
 
   const eagerEnd = Math.min(numToPreload, PRELOAD_EAGER_PAGES);
-  await preloadPageHeightsBatch(doc, defaultWidth, token, signal, 1, eagerEnd);
+  await preloadPageHeightsBatch(doc, renderScale, token, signal, 1, eagerEnd);
   if (isPreloadCancelled(token, signal) || eagerEnd >= numToPreload) return;
 
   await runWhenBrowserIdle();
   if (isPreloadCancelled(token, signal)) return;
 
-  await preloadPageHeightsBatch(doc, defaultWidth, token, signal, eagerEnd + 1, numToPreload);
+  await preloadPageHeightsBatch(doc, renderScale, token, signal, eagerEnd + 1, numToPreload);
 };
 
-const schedulePageHeightPreload = (doc, defaultWidth) => {
-  if (!doc || !Number.isFinite(defaultWidth) || defaultWidth <= 0) return;
+const schedulePageHeightPreload = (doc, renderScale) => {
+  if (!doc || !Number.isFinite(renderScale) || renderScale <= 0) return;
 
   cancelScheduledPreload();
   const token = preloadToken;
@@ -289,7 +447,7 @@ const schedulePageHeightPreload = (doc, defaultWidth) => {
 
   preloadDebounceTimer = setTimeout(() => {
     preloadDebounceTimer = null;
-    const run = preloadAllPageHeights(doc, defaultWidth, token, controller.signal)
+    const run = preloadAllPageHeights(doc, renderScale, token, controller.signal)
       .catch(() => {
         // Best-effort preloading only.
       })
@@ -389,14 +547,26 @@ watch(() => props.sourceUrl, () => {
 watch(totalPages, async () => {
   await nextTick();
   observePlaceholders();
+  if (props.pageNo) {
+    scheduleNavigateToTarget(40, 8);
+  }
 });
 
-watch(() => props.scale, () => {
-  // Clear the pre-calculated heights so they adapt to new scale
+watch(effectiveScale, () => {
+  // Clear the pre-calculated heights so they adapt to fit scale changes
   pageHeights.value = {};
-  if (pdfDoc.value && containerRef.value) {
-     const containerWidth = containerRef.value.clientWidth > 0 ? containerRef.value.clientWidth : 800;
-     schedulePageHeightPreload(pdfDoc.value, containerWidth * props.scale);
+  renderEpoch.value += 1;
+  clearRescaleSettledTimer();
+  // Run one extra rerender when resize settles to avoid half-drawn pages.
+  rescaleSettledTimer = setTimeout(() => {
+    renderEpoch.value += 1;
+    rescaleSettledTimer = null;
+  }, 120);
+  if (pdfDoc.value) {
+     schedulePageHeightPreload(pdfDoc.value, effectiveScale.value);
+  }
+  if (props.pageNo) {
+    scheduleNavigateToTarget(32, 4);
   }
 });
 
@@ -411,7 +581,7 @@ const clampRatio = (ratio) => {
 // Navigation
 const navigateToTarget = async () => {
   const targetPage = props.pageNo;
-  if (!targetPage || targetPage < 1 || targetPage > totalPages.value) return;
+  if (!targetPage || targetPage < 1 || targetPage > totalPages.value) return false;
   
   // Force mount the target page if it's not mounted
   updateMountedPages(targetPage);
@@ -420,33 +590,99 @@ const navigateToTarget = async () => {
   await nextTick();
   
   const container = containerRef.value;
-  const pageEl = document.getElementById(`vpdf-page-${targetPage}`);
+  const pageEl = container?.querySelector(`#vpdf-page-${targetPage}`);
   
   if (container && pageEl) {
-    const pageHeight = pageEl.clientHeight || estimatedPageHeight.value;
-    const scrollTarget = pageEl.offsetTop + pageHeight * clampRatio(props.yRatio) - container.clientHeight * 0.3;
-    container.scrollTo({ top: scrollTarget, behavior: 'smooth' });
+    const renderedEl = pageEl.querySelector('.vue-pdf-embed');
+    const renderedHeight = renderedEl?.clientHeight || 0;
+    const cachedHeight = Number(pageHeights.value[targetPage] || 0);
+    const pageHeight = (
+      (cachedHeight > 100 && cachedHeight) ||
+      (renderedHeight > 100 && renderedHeight) ||
+      pageEl.clientHeight ||
+      estimatedPageHeight.value
+    );
+    const scrollTarget = pageEl.offsetTop + pageHeight * clampRatio(props.yRatio) - container.clientHeight * 0.18;
+    container.scrollTo({ top: Math.max(0, scrollTarget), left: 0, behavior: 'auto' });
+    return Boolean(renderedEl && renderedHeight > 100);
   }
+  return false;
 };
 
-watch([() => props.pageNo, () => props.yRatio], () => {
+const scheduleNavigateToTarget = (delayMs = 80, retries = 6, token = ++navigateToken) => {
+  clearNavigateTimer();
+  navigateTimer = setTimeout(async () => {
+    if (token !== navigateToken) return;
+    const targetPage = Number(props.pageNo);
+    if (!Number.isFinite(targetPage) || targetPage < 1) return;
+    if (!totalPages.value || targetPage > totalPages.value) {
+      if (retries > 0) {
+        scheduleNavigateToTarget(120, retries - 1, token);
+      }
+      return;
+    }
+    const container = containerRef.value;
+    const pageEl = container?.querySelector(`#vpdf-page-${targetPage}`);
+    if (!container || !pageEl) {
+      if (retries > 0) {
+        scheduleNavigateToTarget(120, retries - 1, token);
+      }
+      return;
+    }
+    const rendered = await navigateToTarget();
+    if (!rendered && retries > 0) {
+      scheduleNavigateToTarget(90, retries - 1, token);
+    }
+  }, delayMs);
+};
+
+watch([() => props.pageNo, () => props.yRatio, () => props.navigateKey], () => {
   if (props.pageNo) {
-    setTimeout(navigateToTarget, 100);
+    scheduleNavigateToTarget(80, 8);
   }
-});
+}, { immediate: true });
 
 onMounted(() => {
   setupObserver();
+  nextTick(() => {
+    containerWidth.value = containerRef.value?.clientWidth || 0;
+    const container = containerRef.value;
+    if (container) {
+      container.addEventListener('wheel', onContainerWheel, { passive: false });
+      container.addEventListener('scroll', onContainerScroll, { passive: true });
+    }
+  });
+  if (typeof ResizeObserver !== 'undefined') {
+    containerResizeObserver = new ResizeObserver(() => {
+      containerWidth.value = containerRef.value?.clientWidth || 0;
+    });
+    if (containerRef.value) {
+      containerResizeObserver.observe(containerRef.value);
+    }
+  }
   loadPdf();
 });
 
 onUnmounted(() => {
   loadToken += 1;
+  navigateToken += 1;
+  clearNavigateTimer();
+  clearRescaleSettledTimer();
+  clearScrollNoticeTimer();
   if (observer) {
     observer.disconnect();
   }
   if (destroyTimeout) {
     clearTimeout(destroyTimeout);
+  }
+  if (containerResizeObserver) {
+    containerResizeObserver.disconnect();
+    containerResizeObserver = null;
+  }
+  const container = containerRef.value;
+  if (container) {
+    container.removeEventListener('wheel', onContainerWheel);
+    container.removeEventListener('scroll', onContainerScroll);
   }
   void disposeCurrentPdf();
 });
@@ -459,13 +695,29 @@ const onPageRendered = (pageIndex) => {
     const height = inner ? inner.clientHeight : pageEl.clientHeight;
     if (height && height > 100) {
       pageHeights.value[pageIndex] = height;
+      if (Number(props.pageNo) === Number(pageIndex)) {
+        scheduleNavigateToTarget(16, 2);
+      }
     }
   }
+};
+
+const handlePageLoadingFailed = (err) => {
+  emitViewerError(err, 'render', 'PDF 页面加载失败');
+};
+
+const handlePageRenderingFailed = (err) => {
+  emitViewerError(err, 'render', 'PDF 页面渲染失败');
 };
 </script>
 
 <template>
-  <div ref="containerRef" class="w-full h-full overflow-y-auto overflow-x-hidden bg-slate-100 relative custom-scrollbar">
+  <div ref="containerRef" class="w-full h-full overflow-y-auto overflow-x-auto bg-slate-100 relative custom-scrollbar">
+    <div v-if="scrollLimitNotice" class="pointer-events-none sticky top-3 z-30 w-full flex justify-center px-3">
+      <div class="rounded-lg border border-amber-200 bg-amber-50/95 px-3 py-1.5 text-[11px] text-amber-700 shadow-sm">
+        {{ scrollLimitNotice }}
+      </div>
+    </div>
     
     <div v-if="loading" class="absolute inset-0 flex items-center justify-center p-4">
       <div class="text-xs text-blue-600 bg-blue-50 border border-blue-200 rounded-lg p-3 shadow-sm flex items-center gap-2">
@@ -490,10 +742,10 @@ const onPageRendered = (pageIndex) => {
         :key="pageIndex"
         :data-page-index="pageIndex"
         :id="'vpdf-page-' + pageIndex"
-        class="pdf-page-placeholder relative w-full px-4 max-w-4xl mx-auto transition-all shadow-sm rounded-sm"
+        class="pdf-page-placeholder relative w-full px-2 transition-all shadow-sm rounded-sm"
         :style="{ minHeight: `${pageHeights[pageIndex] || estimatedPageHeight}px` }"
       >
-        <div class="bg-white w-full h-full rounded shadow-sm overflow-hidden flex flex-col relative border border-slate-200/60">
+        <div class="bg-white w-full min-h-full rounded shadow-sm overflow-visible flex flex-col relative border border-slate-200/60">
           <!-- Page Overlay Loader -->
           <div v-if="!mountedPages.has(pageIndex)" class="absolute inset-0 flex flex-col items-center justify-center bg-slate-50/50">
             <span class="text-slate-300 font-mono text-xs">{{ pageIndex }}</span>
@@ -502,15 +754,16 @@ const onPageRendered = (pageIndex) => {
           <!-- Actual Page Container -->
           <VuePdfEmbed
             v-if="mountedPages.has(pageIndex)"
+            :key="`pdf-page-${pageIndex}-${renderScaleKey}-${renderEpoch}`"
             :source="pdfDoc"
             :page="pageIndex"
-            :scale="props.scale"
-            text-layer
+            :scale="effectiveScale"
+            :text-layer="false"
             annotation-layer
-            class="w-full h-full"
+            class="pdf-page-embed w-full"
             @rendered="() => onPageRendered(pageIndex)"
-            @loading-failed="(err) => emitViewerError(err, 'render', 'PDF 页面加载失败')"
-            @rendering-failed="(err) => emitViewerError(err, 'render', 'PDF 页面渲染失败')"
+            @loading-failed="handlePageLoadingFailed"
+            @rendering-failed="handlePageRenderingFailed"
           />
         </div>
       </div>
@@ -531,5 +784,10 @@ const onPageRendered = (pageIndex) => {
 }
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
   background: rgba(148, 163, 184, 0.6);
+}
+
+.pdf-page-embed :deep(canvas) {
+  width: 100% !important;
+  height: auto !important;
 }
 </style>
