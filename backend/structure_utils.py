@@ -37,14 +37,48 @@ _HF_MAX_LINE_LEN = 120  # very long lines are never headers/footers
 _HF_POSITION_ZONE = 0.30  # top/bottom 30% of each page segment = HF zone
 
 _FM_ANCHOR_RE = re.compile(
-    r"<!--\s*fm_anchor:(.*?)\s*--|(?:\\)?&lt;!--\s*fm_anchor:(.*?)\s*--(?:\\)?&gt;",
+    r"<!--\s*fm_anchor:(.*?)\s*-->|(?:\\)?&lt;!--\s*fm_anchor:(.*?)\s*--(?:\\)?&gt;",
     re.IGNORECASE | re.DOTALL,
 )
+_FM_CONFIDENCE_RE = re.compile(
+    r"<!--\s*fm-confidence\s*:\s*([+-]?\d+(?:\.\d+)?)\s*-->",
+    re.IGNORECASE,
+)
+_LOW_CONFIDENCE_SIDE_TAG_THRESHOLD = 0.50
+_LOW_CONFIDENCE_DEMOTE_THRESHOLD = 0.50
+_LOW_CONFIDENCE_HARD_DEMOTE_THRESHOLD = 0.35
 
 
 def _anchor_payload_from_match(match: re.Match) -> str:
     payload = match.group(1) if match.group(1) is not None else match.group(2)
     return html.unescape((payload or "").strip())
+
+
+def _clamp_confidence(raw: float | int | None, default: float | None = None) -> float | None:
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(1.0, value))
+
+
+def _extract_confidence_sidecar(text: str) -> tuple[str, float | None]:
+    """
+    Strip FM-Confidence comments from text and return (clean_text, confidence_hint).
+    If multiple markers exist, the last valid one wins.
+    """
+    hint = None
+
+    def _replace(match: re.Match) -> str:
+        nonlocal hint
+        hint = _clamp_confidence(match.group(1), hint)
+        return ""
+
+    cleaned = _FM_CONFIDENCE_RE.sub(_replace, str(text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned, hint
 
 
 def _normalise_hf_line(line: str) -> str:
@@ -504,6 +538,55 @@ def _should_demote_bridge_heading(heading_meta: list, pos: int) -> bool:
     return True
 
 
+def _should_demote_low_confidence_heading(heading_meta: list, pos: int) -> bool:
+    """
+    Demote low-confidence headings before they are committed as tree nodes.
+    This keeps suspicious OCR fragments out of the skeleton while preserving
+    them as content lines for traceability.
+    """
+    current = heading_meta[pos]
+    if not current.get("valid"):
+        return False
+    if current.get("numeric") is not None:
+        return False
+
+    topic = current.get("topic", "")
+    if _has_structured_prefix(topic):
+        return False
+
+    confidence = _clamp_confidence(current.get("confidence"), 1.0)
+    if confidence >= _LOW_CONFIDENCE_DEMOTE_THRESHOLD:
+        return False
+
+    # Very low confidence and weak morphology can be demoted directly.
+    if confidence <= _LOW_CONFIDENCE_HARD_DEMOTE_THRESHOLD and _is_weak_unstructured_heading(topic):
+        return True
+
+    # Otherwise require nearby numeric context to avoid over-demoting real prose headings.
+    prev_numeric = None
+    next_numeric = None
+
+    for i in range(pos - 1, -1, -1):
+        candidate = heading_meta[i]
+        if candidate.get("valid") and candidate.get("numeric") is not None:
+            prev_numeric = candidate
+            break
+
+    for i in range(pos + 1, len(heading_meta)):
+        candidate = heading_meta[i]
+        if candidate.get("valid") and candidate.get("numeric") is not None:
+            next_numeric = candidate
+            break
+
+    if _is_weak_unstructured_heading(topic) and (prev_numeric or next_numeric):
+        return True
+
+    if len(topic) >= 22 and _SENTENCE_PUNCT_RE.search(topic) and (prev_numeric or next_numeric):
+        return True
+
+    return False
+
+
 def is_valid_heading(topic: str) -> bool:
     """
     Heuristic filter: decide whether a Markdown heading line is a genuine
@@ -570,6 +653,79 @@ def is_valid_heading(topic: str) -> bool:
         return False
 
     return True
+
+
+def compute_heading_confidence(topic: str, markdown_level: int = 2) -> float:
+    """
+    Return heading confidence in [0, 1].
+
+    This is a soft signal used to guide LLM/post-processing decisions.
+    It does NOT replace is_valid_heading's hard gate.
+    """
+    topic = _normalize_heading_topic(topic or "")
+    if not is_valid_heading(topic):
+        return 0.0
+
+    score = 0.55
+    structured = _has_structured_prefix(topic)
+    numeric = _extract_numeric_segments(topic)
+
+    if structured:
+        score += 0.30
+    if numeric is not None:
+        score += 0.10
+
+    # Keep short top-level labels (e.g. 前言/附录) from being over-penalized.
+    if markdown_level <= 2 and not structured and len(topic) <= 4:
+        score += 0.05
+
+    if _is_weak_unstructured_heading(topic):
+        score -= 0.25
+
+    if len(topic) >= 22 and not structured:
+        score -= 0.12
+
+    if _SENTENCE_PUNCT_RE.search(topic) and not structured:
+        score -= 0.08
+
+    if _WEAK_END_PUNCT_RE.search(topic):
+        score -= 0.08
+
+    if _FORMULA_PATTERNS.search(topic) and not structured:
+        score -= 0.25
+
+    return round(max(0.0, min(1.0, score)), 3)
+
+
+def add_heading_confidence_sidecar(
+    markdown_text: str, threshold: float = _LOW_CONFIDENCE_SIDE_TAG_THRESHOLD
+) -> str:
+    """
+    Add FM-Confidence sidecar comments for low-confidence headings only.
+    Existing FM-Confidence comments are normalized/rewritten.
+    """
+    threshold = _clamp_confidence(threshold, _LOW_CONFIDENCE_SIDE_TAG_THRESHOLD)
+    lines = str(markdown_text or "").split("\n")
+    rebuilt = []
+
+    for line in lines:
+        header_match = re.match(r"^(#{1,6})\s+(.*)", line)
+        if not header_match:
+            rebuilt.append(line)
+            continue
+
+        hashes = header_match.group(1)
+        body = header_match.group(2).strip()
+        body_without_conf, _hint = _extract_confidence_sidecar(body)
+        topic_for_score = _normalize_heading_topic(_FM_ANCHOR_RE.sub("", body_without_conf).strip())
+        score = compute_heading_confidence(topic_for_score, markdown_level=len(hashes))
+
+        if score < threshold:
+            rebuilt.append(f"{hashes} {body_without_conf} <!-- FM-Confidence: {score:.2f} -->")
+        else:
+            rebuilt.append(f"{hashes} {body_without_conf}")
+
+    return "\n".join(rebuilt)
 
 
 # ── Solution C: numeric level inference ──────────────────────────────────────
@@ -705,6 +861,7 @@ class TreeNode:
         self.id = ""
         self.topic = topic
         self.level = level
+        self.heading_confidence = None
         self.content_lines = []
         self.children = []
         self.ai_details = []
@@ -736,6 +893,7 @@ class TreeNode:
             "id": self.id,
             "topic": self.topic,
             "level": self.level,
+            "heading_confidence": self.heading_confidence,
             "source_line_start": self.source_line_start,
             "source_line_end": self.source_line_end,
             "pdf_page_no": self.pdf_page_no,
@@ -746,6 +904,21 @@ class TreeNode:
 
 
 # ── Main parsing function ─────────────────────────────────────────────────────
+
+
+def _parse_heading_topic_with_sidecars(raw_heading_topic: str) -> tuple[str, dict | None, float | None]:
+    cleaned_topic, confidence_hint = _extract_confidence_sidecar(raw_heading_topic)
+
+    anchor_match = _FM_ANCHOR_RE.search(cleaned_topic)
+    anchor_data = None
+    if anchor_match:
+        try:
+            anchor_data = json.loads(_anchor_payload_from_match(anchor_match))
+        except Exception:
+            pass
+        cleaned_topic = (cleaned_topic[: anchor_match.start()] + cleaned_topic[anchor_match.end() :]).strip()
+
+    return _normalize_heading_topic(cleaned_topic), anchor_data, confidence_hint
 
 
 def build_hierarchy_tree(markdown_text):
@@ -775,20 +948,15 @@ def build_hierarchy_tree(markdown_text):
         if not m:
             continue
 
-        raw_topic = m.group(2).strip()
-        anchor_match = _FM_ANCHOR_RE.search(raw_topic)
-        anchor_data = None
-        if anchor_match:
-            try:
-                anchor_data = json.loads(_anchor_payload_from_match(anchor_match))
-            except Exception:
-                pass
-            raw_topic = (raw_topic[: anchor_match.start()] + raw_topic[anchor_match.end() :]).strip()
-
-        topic = _normalize_heading_topic(raw_topic)
         markdown_level = len(m.group(1))
+        topic, anchor_data, confidence_hint = _parse_heading_topic_with_sidecars(m.group(2).strip())
         valid = is_valid_heading(topic)
         numeric = _extract_numeric_segments(topic) if valid else None
+        confidence = (
+            _clamp_confidence(confidence_hint, None)
+            if confidence_hint is not None
+            else compute_heading_confidence(topic, markdown_level)
+        )
 
         raw_header_topics.append(topic)
         if valid:
@@ -796,7 +964,14 @@ def build_hierarchy_tree(markdown_text):
 
         heading_pos_by_line_index[line_index] = len(heading_meta)
         heading_meta.append(
-            {"topic": topic, "level": markdown_level, "valid": valid, "numeric": numeric, "anchor_data": anchor_data}
+            {
+                "topic": topic,
+                "level": markdown_level,
+                "valid": valid,
+                "numeric": numeric,
+                "confidence": confidence,
+                "anchor_data": anchor_data,
+            }
         )
 
     numbered_count = sum(
@@ -818,9 +993,15 @@ def build_hierarchy_tree(markdown_text):
     total_raw = len(raw_header_topics)
     total_valid = len(valid_header_topics)
     demoted = total_raw - total_valid
+    low_conf = sum(
+        1
+        for meta in heading_meta
+        if meta.get("valid") and _clamp_confidence(meta.get("confidence"), 1.0) < _LOW_CONFIDENCE_DEMOTE_THRESHOLD
+    )
     print(
         f"[build_hierarchy_tree] Raw headings: {total_raw}, "
         f"Valid: {total_valid}, Demoted: {demoted}, "
+        f"LowConfidence(<{_LOW_CONFIDENCE_DEMOTE_THRESHOLD:.2f}): {low_conf}, "
         f"Numbered: {numbered_count} → "
         f"{'Numeric inference ON' if use_numbering_inference else 'Markdown # count mode'}"
     )
@@ -829,13 +1010,8 @@ def build_hierarchy_tree(markdown_text):
         header_match = re.match(r"^(#+)\s+(.*)", line)
 
         if header_match:
-            raw_topic = header_match.group(2).strip()
-            anchor_match = _FM_ANCHOR_RE.search(raw_topic)
-            if anchor_match:
-                raw_topic = (raw_topic[: anchor_match.start()] + raw_topic[anchor_match.end() :]).strip()
-
             markdown_level = len(header_match.group(1))
-            topic = _normalize_heading_topic(raw_topic.strip())
+            topic, _anchor_data, _confidence_hint = _parse_heading_topic_with_sidecars(header_match.group(2).strip())
 
             if not is_valid_heading(topic):
                 if topic:
@@ -844,7 +1020,10 @@ def build_hierarchy_tree(markdown_text):
                 continue
 
             heading_pos = heading_pos_by_line_index.get(line_index)
-            if heading_pos is not None and _should_demote_bridge_heading(heading_meta, heading_pos):
+            if heading_pos is not None and (
+                _should_demote_bridge_heading(heading_meta, heading_pos)
+                or _should_demote_low_confidence_heading(heading_meta, heading_pos)
+            ):
                 stack[-1].content_lines.append(topic)
                 stack[-1].source_line_end = max(stack[-1].source_line_end, line_index + 1)
                 continue
@@ -855,6 +1034,8 @@ def build_hierarchy_tree(markdown_text):
                 level = markdown_level
 
             new_node = TreeNode(topic, level)
+            if heading_pos is not None:
+                new_node.heading_confidence = _clamp_confidence(heading_meta[heading_pos].get("confidence"), None)
             new_node.source_line_start = line_index + 1
             new_node.source_line_end = line_index + 1
 
@@ -909,6 +1090,7 @@ def build_hierarchy_tree(markdown_text):
 
                 line = (line[: anchor_match.start()] + line[anchor_match.end() :]).strip()
                 anchor_match = _FM_ANCHOR_RE.search(line)
+            line, _confidence_hint = _extract_confidence_sidecar(line)
 
             if line:
                 stack[-1].content_lines.append(line)

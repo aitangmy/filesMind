@@ -53,6 +53,50 @@ class StructureUtilsTests(unittest.TestCase):
         self.assertNotIn("it (InitialNode)", topics)
         self.assertNotIn("2212", topics)
 
+    def test_add_heading_confidence_sidecar_marks_only_low_confidence(self):
+        md = "\n".join(
+            [
+                "## 1. 软件工程概述",
+                "## 段号 + 段内地址。",
+                "## 前言",
+            ]
+        )
+        tagged = su.add_heading_confidence_sidecar(md)
+        lines = tagged.split("\n")
+
+        self.assertNotIn("FM-Confidence", lines[0])
+        self.assertIn("FM-Confidence", lines[1])
+        self.assertNotIn("FM-Confidence", lines[2])
+
+    def test_build_hierarchy_tree_demotes_low_confidence_sidecar_heading(self):
+        md = "\n".join(
+            [
+                "## 11.2. 内存管理",
+                "## 段号 + 段内地址。 <!-- FM-Confidence: 0.20 -->",
+                "### 11.2.2. 虚拟内存",
+            ]
+        )
+        tree = su.build_hierarchy_tree(md)
+        topics = _flatten_topics(tree)
+
+        self.assertIn("11.2. 内存管理", topics)
+        self.assertIn("11.2.2. 虚拟内存", topics)
+        self.assertNotIn("段号 + 段内地址。", topics)
+
+    def test_build_hierarchy_tree_keeps_high_confidence_sidecar_heading(self):
+        md = "\n".join(
+            [
+                "## 前言 <!-- FM-Confidence: 0.95 -->",
+                "这里是前言内容",
+                "## 1. 软件工程概述",
+            ]
+        )
+        tree = su.build_hierarchy_tree(md)
+        topics = _flatten_topics(tree)
+
+        self.assertIn("前言", topics)
+        self.assertIn("1. 软件工程概述", topics)
+
     def test_phase2_noise_filters_watermarks(self):
         self.assertFalse(su.is_valid_heading("CONFIDENTIAL"))
         self.assertFalse(su.is_valid_heading("Draft"))

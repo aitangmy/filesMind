@@ -126,6 +126,29 @@ class RefineNodeTests(unittest.TestCase):
         self.assertEqual(len(data), 1)
         self.assertEqual(data[0]["topic"], "RUP")
 
+    def test_refine_low_confidence_adds_confidence_instruction(self):
+        fake_client = _FakeClient(
+            "https://api.openai.com/v1",
+            [_make_response('{"items":[{"topic":"子点","details":["细节"]}]}')],
+        )
+
+        with patch.object(ce, "get_client", return_value=fake_client):
+            with patch.object(ce, "get_model", return_value="gpt-4o-mini"):
+                data = asyncio.run(
+                    ce.refine_node_content(
+                        "标题",
+                        "正文",
+                        "路径",
+                        heading_confidence=0.2,
+                    )
+                )
+
+        self.assertEqual(len(data), 1)
+        first_call = fake_client.chat.completions.calls[0]
+        system_text = first_call["messages"][0]["content"]
+        self.assertIn("章节置信度", system_text)
+        self.assertIn("返回空数组 []", system_text)
+
 
 class EngineSettingsTests(unittest.TestCase):
     def setUp(self):
@@ -269,6 +292,101 @@ class RefineLimiterAndRetryTests(unittest.TestCase):
             with patch.object(ce, "get_model", return_value="MiniMax-M2.5"):
                 with self.assertRaises(ce.RefineNodeRequestError):
                     asyncio.run(ce.refine_node_content("Title", "Body", "Path"))
+
+
+class SanitizeBranchTests(unittest.TestCase):
+    def test_snap_prefers_shallower_level_when_jitter_is_ambiguous(self):
+        level_stack = [(0, 1), (3, 3), (5, 4)]
+        snapped = ce._snap_orig_level_for_stack(4, level_stack, jitter_tolerance=1)
+        self.assertEqual(snapped, 3)
+
+    def test_numbering_resolution_prefers_sibling_level_over_parent_level(self):
+        history = [
+            {"sig": (1,), "level": 2},
+            {"sig": (1, 1), "level": 5},
+        ]
+
+        level = ce._resolve_level_by_numbering((1, 3), history, fallback_level=3)
+        self.assertEqual(level, 5)
+
+    def test_sanitize_branch_aligns_numbered_siblings(self):
+        branch = "\n".join(
+            [
+                "## 1.1 背景",
+                "###### 1.2 发展阶段",
+            ]
+        )
+        sanitized = ce.sanitize_branch(branch)
+        lines = sanitized.split("\n")
+        self.assertEqual(lines[0], "### 1.1 背景")
+        self.assertEqual(lines[1], "### 1.2 发展阶段")
+
+    def test_sanitize_branch_builds_parent_child_levels_by_numbering(self):
+        branch = "\n".join(
+            [
+                "## 1. 概述",
+                "## 1.1 背景",
+                "## 1.1.1 定义",
+            ]
+        )
+        sanitized = ce.sanitize_branch(branch)
+        lines = sanitized.split("\n")
+        self.assertEqual(lines[0], "## 1. 概述")
+        self.assertEqual(lines[1], "### 1.1 背景")
+        self.assertEqual(lines[2], "#### 1.1.1 定义")
+
+    def test_sanitize_branch_removes_confidence_comments(self):
+        branch = "## 2. 方法 <!-- FM-Confidence: 0.20 -->"
+        sanitized = ce.sanitize_branch(branch)
+        self.assertEqual(sanitized.strip(), "## 2. 方法")
+
+    def test_sanitize_branch_prevents_staircase_on_repeated_noisy_headings(self):
+        branch = "\n".join(
+            [
+                "## 1. 核心理论",
+                "###### 假标题A",
+                "###### 假标题B",
+                "###### 假标题C",
+            ]
+        )
+        sanitized = ce.sanitize_branch(branch)
+        lines = sanitized.split("\n")
+        self.assertEqual(lines[0], "## 1. 核心理论")
+        self.assertEqual(lines[1], "### 假标题A")
+        self.assertEqual(lines[2], "### 假标题B")
+        self.assertEqual(lines[3], "### 假标题C")
+
+    def test_sanitize_branch_handles_ocr_jitter_for_non_numbered_siblings(self):
+        branch = "\n".join(
+            [
+                "## 1. 核心理论",
+                "#### 假标题A",
+                "##### 假标题B",
+                "#### 假标题C",
+            ]
+        )
+        sanitized = ce.sanitize_branch(branch)
+        lines = sanitized.split("\n")
+        self.assertEqual(lines[0], "## 1. 核心理论")
+        self.assertEqual(lines[1], "### 假标题A")
+        self.assertEqual(lines[2], "### 假标题B")
+        self.assertEqual(lines[3], "### 假标题C")
+
+    def test_sanitize_branch_keeps_shallow_context_after_deep_numbered_anchor(self):
+        branch = "\n".join(
+            [
+                "## 1. 架构",
+                "#### 无编号分组",
+                "###### 1.1.1 深层锚点",
+                "#### 分组B",
+            ]
+        )
+        sanitized = ce.sanitize_branch(branch)
+        lines = sanitized.split("\n")
+        self.assertEqual(lines[0], "## 1. 架构")
+        self.assertEqual(lines[1], "### 无编号分组")
+        self.assertEqual(lines[2], "#### 1.1.1 深层锚点")
+        self.assertEqual(lines[3], "### 分组B")
 
 
 if __name__ == "__main__":

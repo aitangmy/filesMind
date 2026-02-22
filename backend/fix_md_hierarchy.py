@@ -6,6 +6,86 @@ Markdown层级修复工具
 
 import re
 
+_OCR_LEVEL_JITTER_TOLERANCE = 1
+
+
+def _extract_heading_number_signature(title: str):
+    chapter_pattern = re.compile(r"^(\d+(?:\.\d+)*)\.?\s*(.*)")
+    m = chapter_pattern.match((title or "").strip())
+    if not m:
+        return None
+    parts = []
+    for token in m.group(1).split("."):
+        if not token:
+            continue
+        try:
+            parts.append(int(token))
+        except (TypeError, ValueError):
+            return None
+    return tuple(parts) if parts else None
+
+
+def _resolve_level_by_numbering(sig, history: list, fallback_level: int) -> int:
+    if not sig:
+        return fallback_level
+
+    # Sibling-first: in malformed docs, preserve local sibling continuity before
+    # falling back to parent+1.
+    for item in reversed(history):
+        prev_sig = item.get("sig")
+        if not prev_sig:
+            continue
+        if len(prev_sig) == len(sig) and prev_sig[:-1] == sig[:-1]:
+            return int(item.get("level", fallback_level))
+
+    if len(sig) > 1:
+        parent_sig = sig[:-1]
+        for item in reversed(history):
+            if item.get("sig") == parent_sig:
+                return int(item.get("level", fallback_level)) + 1
+
+    if len(sig) == 1:
+        for item in reversed(history):
+            prev_sig = item.get("sig")
+            if prev_sig and len(prev_sig) == 1:
+                return int(item.get("level", fallback_level))
+
+    return fallback_level
+
+
+def _snap_orig_level_for_stack(orig_level: int, level_stack: list, jitter_tolerance: int = _OCR_LEVEL_JITTER_TOLERANCE) -> int:
+    if jitter_tolerance <= 0 or len(level_stack) <= 1:
+        return orig_level
+    best_orig = None
+    best_key = None
+    for idx, (stack_orig, _stack_fixed) in enumerate(level_stack[1:], start=1):
+        diff = abs(stack_orig - orig_level)
+        if diff > jitter_tolerance:
+            continue
+        # Prefer: (1) closest level, (2) shallower/equal than current level,
+        # (3) most recent stack position.
+        key = (diff, 0 if stack_orig <= orig_level else 1, -idx)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_orig = stack_orig
+    return best_orig if best_orig is not None else orig_level
+
+
+def _resolve_non_numbered_level(orig_level: int, level_stack: list) -> int:
+    effective_orig_level = _snap_orig_level_for_stack(orig_level, level_stack)
+
+    # Close deeper branches first; this prevents stale deep contexts from
+    # contaminating sibling alignment.
+    while len(level_stack) > 1 and level_stack[-1][0] > effective_orig_level:
+        level_stack.pop()
+
+    if level_stack[-1][0] == effective_orig_level:
+        return int(level_stack[-1][1])
+
+    fixed_level = int(level_stack[-1][1]) + 1
+    level_stack.append((effective_orig_level, fixed_level))
+    return fixed_level
+
 
 def fix_markdown_hierarchy(markdown_content):
     """
@@ -19,42 +99,40 @@ def fix_markdown_hierarchy(markdown_content):
     """
     lines = markdown_content.split("\n")
     fixed_lines = []
-
-    # 章节编号匹配模式 - 更精确地匹配数字编号
-    # 支持: 1.  1.1  1.1.1  1.2.3.4  等格式
-    chapter_pattern = re.compile(r"^(\d+(?:\.\d+)*)\.?\s*(.*)")
+    level_stack = [(0, 1)]  # (orig_level, fixed_level)
+    numbering_history = []
 
     for line in lines:
         stripped = line.strip()
-
-        # 检查是否是标题行
         header_match = re.match(r"^(#{1,6})\s+(.*)", stripped)
-        if header_match:
-            hash_mark = header_match.group(1)
-            title = header_match.group(2)
-
-            # 尝试匹配章节编号
-            chapter_match = chapter_pattern.match(title)
-            if chapter_match:
-                num = chapter_match.group(1)
-                text = chapter_match.group(2) if chapter_match.group(2) else ""
-
-                # 根据编号确定层级
-                num_parts = [p for p in num.split(".") if p]  # 过滤空字符串
-                level = len(num_parts) + 1  # 1. → H2, 1.1. → H3
-
-                # 限制在H2-H6范围内
-                level = min(max(level, 2), 6)
-
-                # 生成新的标题
-                new_header = "#" * level + " " + title
-                fixed_lines.append(new_header)
-            else:
-                # 没有章节编号，保持原样
-                fixed_lines.append(stripped)
-        else:
-            # 非标题行，保持原样
+        if not header_match:
             fixed_lines.append(stripped)
+            continue
+
+        title = header_match.group(2).strip()
+        orig_level = len(header_match.group(1))
+        sig = _extract_heading_number_signature(title)
+
+        if sig:
+            fallback = len(sig) + 1
+            level = _resolve_level_by_numbering(sig, numbering_history, fallback)
+            anchor_orig_level = _snap_orig_level_for_stack(orig_level, level_stack)
+        else:
+            level = _resolve_non_numbered_level(orig_level, level_stack)
+
+        level = min(max(level, 2), 6)
+        fixed_lines.append("#" * level + " " + title)
+        numbering_history.append({"sig": sig, "level": level})
+
+        if sig:
+            # Keep shallower parent context, drop same/deeper stale branches,
+            # then anchor at current numbering depth.
+            while len(level_stack) > 1 and level_stack[-1][0] >= anchor_orig_level:
+                level_stack.pop()
+            level_stack.append((anchor_orig_level, level))
+        elif len(level_stack) > 1:
+            top_orig_level, _top_fixed_level = level_stack[-1]
+            level_stack[-1] = (top_orig_level, level)
 
     return "\n".join(fixed_lines)
 

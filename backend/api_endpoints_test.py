@@ -107,6 +107,20 @@ class FastAPIEndpointTests(unittest.TestCase):
         with open(app_module.HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump([], f)
 
+    def test_build_source_markdown_strips_all_sidecar_comments(self):
+        raw = "\n".join(
+            [
+                "## 标题 <!-- fm_anchor:{\"page_no\":1} --> <!-- FM-Confidence: 0.31 -->",
+                "正文 <!-- FM-Confidence: 0.10 -->",
+            ]
+        )
+
+        cleaned = app_module._build_source_markdown(raw)
+
+        self.assertNotIn("fm_anchor", cleaned.lower())
+        self.assertNotIn("fm-confidence", cleaned.lower())
+        self.assertEqual(len(raw.splitlines()), len(cleaned.splitlines()))
+
     def test_task_status_includes_file_id(self):
         task = app_module.create_task("task-1", file_id="file-1")
         task.status = app_module.TaskStatus.PROCESSING

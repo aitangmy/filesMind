@@ -70,9 +70,9 @@ npm run check:bundle # enforce budget and fail on violation
 ## ✨ Key Features
 
 - Parser backend switching (`docling`, `marker`, `hybrid`) with runtime config.
+- Numbering-aware hierarchy validator (Level Stack AST mapping) for high resistance to OCR noise and structural jitter.
 - Settings center with model profiles, parser controls, and advanced engine controls.
 - Debounced auto-save for advanced settings.
-- Runtime task timeout control (`60` to `7200` seconds).
 - Source index tree + per-node source excerpt API.
 - Config import/export and encrypted config persistence on backend.
 - Frontend workspace + settings routes (`/workspace`, `/settings`).

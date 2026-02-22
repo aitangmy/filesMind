@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import re
 import threading
 import time
+import inspect
 from copy import deepcopy
 from contextlib import asynccontextmanager
 from concurrent.futures import ProcessPoolExecutor
@@ -1634,6 +1635,7 @@ def _serialize_tree_for_ui(root_node) -> Dict[str, Any]:
         "node_id": root_node.id,
         "topic": root_node.topic,
         "level": root_node.level,
+        "heading_confidence": getattr(root_node, "heading_confidence", None),
         "source_line_start": int(root_node.source_line_start or 0),
         "source_line_end": int(root_node.source_line_end or 0),
         "pdf_page_no": getattr(root_node, "pdf_page_no", None),
@@ -1651,6 +1653,7 @@ def _flatten_ui_tree(tree: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "node_id": node.get("node_id", ""),
                 "topic": node.get("topic", ""),
                 "level": int(node.get("level", 0)),
+                "heading_confidence": node.get("heading_confidence"),
                 "source_line_start": int(node.get("source_line_start", 0)),
                 "source_line_end": int(node.get("source_line_end", 0)),
                 "pdf_page_no": node.get("pdf_page_no"),
@@ -1691,6 +1694,7 @@ _MD_LIST_RE = re.compile(r"^(?P<indent>\s*)(?P<marker>[-*+]|\d+[.)])\s+(?P<body>
 _MD_NUMERIC_RE = re.compile(r"^(\d+(?:\.\d+)*)\s*[\.、):：-]\s*(.+)$")
 _MD_TABLE_RULE_RE = re.compile(r"^\s*\|?[\-:\s]{3,}\|[\-:\s|]+\s*$")
 _MD_ANCHOR_RE = re.compile(r"<!--\s*fm_anchor:.*?-->", flags=re.IGNORECASE)
+_MD_CONFIDENCE_RE = re.compile(r"<!--\s*fm-confidence\s*:\s*[+-]?\d+(?:\.\d+)?\s*-->", flags=re.IGNORECASE)
 _MD_STRONG_RE = re.compile(r"(\*\*|__|`|~~)")
 _MD_LINK_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)|\[([^\]]+)\]\([^)]*\)")
 _MD_DOT_LEADER_RE = re.compile(r"[.\u2026·•]{3,}\s*\d+\s*$")
@@ -1703,11 +1707,13 @@ def _build_source_markdown(markdown: str) -> str:
     Build source markdown without changing line positions.
     Keep line numbers aligned with build_hierarchy_tree(md_content).
     """
-    return _MD_ANCHOR_RE.sub("", str(markdown or ""))
+    content = _MD_ANCHOR_RE.sub("", str(markdown or ""))
+    return _MD_CONFIDENCE_RE.sub("", content)
 
 
 def _clean_markdown_topic(raw: str) -> str:
     text = _MD_ANCHOR_RE.sub("", str(raw or ""))
+    text = _MD_CONFIDENCE_RE.sub("", text)
     text = html.unescape(text)
     text = _MD_LINK_RE.sub(lambda m: m.group(1) or m.group(2) or "", text)
     text = _MD_STRONG_RE.sub("", text)
@@ -2225,15 +2231,21 @@ async def _process_document_task_legacy(
             tree_to_markdown,
             assign_stable_node_ids,
         )
+        try:
+            from structure_utils import add_heading_confidence_sidecar
+        except ImportError:
+            logger.warning("structure_utils.add_heading_confidence_sidecar 不可用，回退为无 sidecar 注入")
+            add_heading_confidence_sidecar = lambda text: text
 
-        root_node = build_hierarchy_tree(md_content)
+        md_for_tree = add_heading_confidence_sidecar(md_content)
+        root_node = build_hierarchy_tree(md_for_tree)
         assign_stable_node_ids(root_node, file_id=file_id)
         settings = get_parser_runtime_config()
         parser_backend = str(settings.get("parser_backend", "docling")).lower()
 
-        # Phase 2 End: strip anchors only; never fold blank lines.
+        # Phase 2 End: strip parser sidecar comments only; never fold blank lines.
         source_md_path = _source_md_path(file_id)
-        source_md = _build_source_markdown(md_content)
+        source_md = _build_source_markdown(md_for_tree)
         _atomic_write_text(source_md_path, source_md)
 
         _persist_source_index(file_id, root_node, source_md_path, parser_backend)
@@ -2257,6 +2269,7 @@ async def _process_document_task_legacy(
 
         # 阶段 3: 并行 Refinement (20-95%)
         from cognitive_engine import refine_node_content
+        refine_accepts_confidence = "heading_confidence" in inspect.signature(refine_node_content).parameters
 
         total_nodes = len(nodes_to_refine)
         completed_count = 0
@@ -2267,11 +2280,20 @@ async def _process_document_task_legacy(
             try:
                 ensure_task_active()
                 context_path = node.get_breadcrumbs()
+                heading_confidence = getattr(node, "heading_confidence", None)
 
                 # Concurrency/rate limiting is centrally enforced in cognitive_engine.
-                details = await refine_node_content(
-                    node_title=node.topic, content_chunk=node.full_content, context_path=context_path
-                )
+                if refine_accepts_confidence:
+                    details = await refine_node_content(
+                        node_title=node.topic,
+                        content_chunk=node.full_content,
+                        context_path=context_path,
+                        heading_confidence=heading_confidence,
+                    )
+                else:
+                    details = await refine_node_content(
+                        node_title=node.topic, content_chunk=node.full_content, context_path=context_path
+                    )
                 ensure_task_active()
 
                 if details:

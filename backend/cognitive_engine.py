@@ -405,13 +405,64 @@ def cleanup():
 atexit.register(cleanup)
 
 # (Task timeout is now managed by the frontend settings and injected into app.py's task runner)
+_FM_CONFIDENCE_COMMENT_RE = re.compile(
+    r"<!--\s*fm-confidence\s*:\s*([+-]?\d+(?:\.\d+)?)\s*-->",
+    re.IGNORECASE,
+)
+_FM_CONFIDENCE_LOW_THRESHOLD = 0.5
+_SANITIZE_NUMBERING_RE = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+(?=\S)")
+_SANITIZE_OCR_LEVEL_JITTER_TOLERANCE = 1
+
+
+def _extract_heading_confidence_hint(text: str):
+    m = _FM_CONFIDENCE_COMMENT_RE.search(str(text or ""))
+    if not m:
+        return None
+    try:
+        value = float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, value))
+
+
+def _normalize_heading_confidence(value):
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, parsed))
+
+
+def _strip_fm_confidence_comments(text: str) -> str:
+    return _FM_CONFIDENCE_COMMENT_RE.sub("", str(text or "")).strip()
+
+
+def _count_required_headings(text_chunk: str):
+    total = 0
+    required = 0
+    low_conf_optional = 0
+    for line in str(text_chunk or "").split("\n"):
+        if not re.match(r"^#{1,6}\s", line.strip()):
+            continue
+        total += 1
+        hint = _extract_heading_confidence_hint(line)
+        if hint is not None and hint < _FM_CONFIDENCE_LOW_THRESHOLD:
+            low_conf_optional += 1
+        else:
+            required += 1
+    return total, required, low_conf_optional
+
+
 SYSTEM_PROMPT = """
 你是一位专业的知识架构师。你的任务是从文档段落中提取完整、结构化的思维导图。
 
-【最高优先级规则 - 标题 1:1 保留】：
-- 输入文本中出现的 **每一个** 标题（# / ## / ### / #### / ##### / ######）都 **必须** 在输出中保留
-- **禁止省略、合并或删除** 任何标题，即使内容看似重复或不重要
-- 如果输入有 N 个标题，你的输出也必须有 N 个标题
+【最高优先级规则 - 置信度感知保留】：
+- 对未标注置信度、或带有高置信度标记（`<!-- FM-Confidence: >=0.50 -->`）的标题，必须保留其层级结构
+- 对低置信度标记（`<!-- FM-Confidence: <0.50 -->`）的标题，你有权限结合上下文进行降级判断：
+  可将其降为正文或列表，不强制保留为标题节点
+- 严禁把 `FM-Confidence` 注释原样输出到结果中
 
 【最高优先级规则 - 保留原始标题级别】：
 - **严格保留** 输入文本中标题的原始级别（# 的数量）
@@ -510,8 +561,8 @@ async def summarize_chunk(
                 client = get_client()
 
                 # 构建带上下文的用户提示 - 中文强化版
-                # 统计输入标题数量（用于验证）
-                input_header_count = sum(1 for line in text_chunk.split("\n") if re.match(r"^#{1,6}\s", line.strip()))
+                # 统计标题数量：高置信度标题强保留，低置信度标题可降级
+                input_header_count, required_header_count, low_conf_heading_count = _count_required_headings(text_chunk)
 
                 user_prompt = f"""
 【当前位置】：{parent_context if parent_context else "文档根节点"}
@@ -520,9 +571,11 @@ async def summarize_chunk(
 以下文本位于路径 "{parent_context if parent_context else "文档根节点"}" 下。
 请严格遵守以下要求：
 1. 保留输入文本中标题的原始级别（# 的数量），不要修改标题级别
-2. 输入文本中包含 {input_header_count} 个标题，你的输出中也必须包含这 {input_header_count} 个标题（1:1 保留）
-3. context 路径中的标题已在全局存在，不要在输出中重复它们
-4. 禁止生成 # (H1) 标题，H1 只用于文档根节点
+2. 输入文本中共有 {input_header_count} 个标题，其中至少 {required_header_count} 个高置信度标题必须保留
+3. 低置信度标题（共 {low_conf_heading_count} 个）允许降级为正文/列表，不强制保留为标题
+4. 输出中不得保留任何 FM-Confidence 注释
+5. context 路径中的标题已在全局存在，不要在输出中重复它们
+6. 禁止生成 # (H1) 标题，H1 只用于文档根节点
 
 【注意】：本段文本来自 PDF 自动解析，可能包含页眉页脚、水印、页码等噪声内容，请智能过滤，不要将它们作为节点输出。
 
@@ -550,15 +603,16 @@ async def summarize_chunk(
 
                 # 标题计数验证
                 output_header_count = sum(1 for line in result.split("\n") if re.match(r"^#{1,6}\s", line.strip()))
-                if input_header_count > 0 and output_header_count > 0:
-                    retention_rate = output_header_count / input_header_count
-                    if retention_rate < 0.5:
+                expected_headers = max(1, required_header_count) if required_header_count > 0 else input_header_count
+                if expected_headers > 0 and output_header_count > 0:
+                    retention_rate = output_header_count / expected_headers
+                    if retention_rate < 0.7:
                         print(
-                            f"\u26a0\ufe0f Chunk {chunk_id} 标题保留率低: 输入 {input_header_count} \u2192 输出 {output_header_count} ({retention_rate:.0%})"
+                            f"\u26a0\ufe0f Chunk {chunk_id} 标题保留率低: 期望 {expected_headers} \u2192 输出 {output_header_count} ({retention_rate:.0%})"
                         )
                     else:
                         print(
-                            f"\u2705 Chunk {chunk_id} 标题保留: 输入 {input_header_count} \u2192 输出 {output_header_count} ({retention_rate:.0%})"
+                            f"\u2705 Chunk {chunk_id} 标题保留: 期望 {expected_headers} \u2192 输出 {output_header_count} ({retention_rate:.0%})"
                         )
 
                 # 更新进度（chunk 完成后）
@@ -689,6 +743,81 @@ async def extract_global_outline(full_text: str) -> dict:
         return ""
 
 
+def _extract_numeric_signature(topic: str):
+    m = _SANITIZE_NUMBERING_RE.match((topic or "").strip())
+    if not m:
+        return None
+    parts = []
+    for token in m.group(1).split("."):
+        try:
+            parts.append(int(token))
+        except (TypeError, ValueError):
+            return None
+    return tuple(parts) if parts else None
+
+
+def _resolve_level_by_numbering(sig, history: list, fallback_level: int) -> int:
+    if not sig:
+        return fallback_level
+
+    # Sibling-first to avoid parent-priority inversion on malformed chains.
+    for item in reversed(history):
+        prev_sig = item.get("sig")
+        if not prev_sig:
+            continue
+        if len(prev_sig) == len(sig) and prev_sig[:-1] == sig[:-1]:
+            return int(item.get("level", fallback_level))
+
+    if len(sig) > 1:
+        parent_sig = sig[:-1]
+        for item in reversed(history):
+            if item.get("sig") == parent_sig:
+                return int(item.get("level", fallback_level)) + 1
+
+    if len(sig) == 1:
+        for item in reversed(history):
+            prev_sig = item.get("sig")
+            if prev_sig and len(prev_sig) == 1:
+                return int(item.get("level", fallback_level))
+
+    return fallback_level
+
+
+def _snap_orig_level_for_stack(
+    orig_level: int,
+    level_stack: list[tuple[int, int]],
+    jitter_tolerance: int = _SANITIZE_OCR_LEVEL_JITTER_TOLERANCE,
+) -> int:
+    if jitter_tolerance <= 0 or len(level_stack) <= 1:
+        return orig_level
+    best_orig: int | None = None
+    best_key: tuple[int, int, int] | None = None
+    for idx, (stack_orig, _stack_fixed) in enumerate(level_stack[1:], start=1):
+        diff = abs(stack_orig - orig_level)
+        if diff > jitter_tolerance:
+            continue
+        # Prefer: (1) nearest, (2) shallower/equal level, (3) most recent.
+        key = (diff, 0 if stack_orig <= orig_level else 1, -idx)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_orig = stack_orig
+    return best_orig if best_orig is not None else orig_level
+
+
+def _resolve_non_numbered_level(orig_level: int, level_stack: list[tuple[int, int]]) -> int:
+    effective_orig_level = _snap_orig_level_for_stack(orig_level, level_stack)
+
+    while len(level_stack) > 1 and level_stack[-1][0] > effective_orig_level:
+        level_stack.pop()
+
+    if level_stack[-1][0] == effective_orig_level:
+        return int(level_stack[-1][1])
+
+    fixed_level = int(level_stack[-1][1]) + 1
+    level_stack.append((effective_orig_level, fixed_level))
+    return fixed_level
+
+
 def sanitize_branch(branch: str) -> str:
     """
     轻量级清理：只处理 AI 输出中的明显错误，不修改标题级别
@@ -698,13 +827,42 @@ def sanitize_branch(branch: str) -> str:
     """
     header_pattern = re.compile(r"^(#{1,6})\s+(.*)")
     result_lines = []
+    level_stack: list[tuple[int, int]] = [(0, 1)]  # (orig_level, fixed_level)
+    numbering_history = []
+
     for line in branch.split("\n"):
+        line = _FM_CONFIDENCE_COMMENT_RE.sub("", line).rstrip()
         m = header_pattern.match(line.strip())
-        if m and len(m.group(1)) == 1:
-            # H1 → H2
-            result_lines.append(f"## {m.group(2)}")
-        else:
+        if not m:
             result_lines.append(line)
+            continue
+
+        orig_level = len(m.group(1))
+        topic = m.group(2).strip()
+
+        # H1 only belongs to root; branches start from H2.
+        if orig_level == 1:
+            orig_level = 2
+
+        sig = _extract_numeric_signature(topic)
+        if sig:
+            fallback = len(sig) + 1
+            level = _resolve_level_by_numbering(sig, numbering_history, fallback)
+            anchor_orig_level = _snap_orig_level_for_stack(orig_level, level_stack)
+        else:
+            level = _resolve_non_numbered_level(orig_level, level_stack)
+
+        level = max(2, min(6, level))
+        result_lines.append(f"{'#' * level} {topic}")
+
+        numbering_history.append({"sig": sig, "level": level})
+        if sig:
+            while len(level_stack) > 1 and level_stack[-1][0] >= anchor_orig_level:
+                level_stack.pop()
+            level_stack.append((anchor_orig_level, level))
+        elif len(level_stack) > 1:
+            top_orig_level, _top_fixed_level = level_stack[-1]
+            level_stack[-1] = (top_orig_level, level)
     return "\n".join(result_lines)
 
 
@@ -1046,13 +1204,32 @@ def _parse_refine_response(content: str, node_title: str) -> list:
     return []
 
 
-async def refine_node_content(node_title: str, content_chunk: str, context_path: str = "") -> list:
+async def refine_node_content(
+    node_title: str,
+    content_chunk: str,
+    context_path: str = "",
+    heading_confidence: float | None = None,
+) -> list:
     """
     Refinement Phase: 针对特定节点生成子级详情
     强制 JSON 输出
 
     :return: List[Dict] e.g. [{"topic": "...", "details": [...]}]
     """
+    heading_confidence = _normalize_heading_confidence(heading_confidence)
+    node_title = _strip_fm_confidence_comments(node_title)
+    content_chunk = _strip_fm_confidence_comments(content_chunk)
+
+    confidence_note = ""
+    if heading_confidence is not None and heading_confidence < _FM_CONFIDENCE_LOW_THRESHOLD:
+        confidence_note = f"""
+    【章节置信度】：
+    当前章节标题置信度为 {heading_confidence:.2f}（低于 {_FM_CONFIDENCE_LOW_THRESHOLD:.2f}）。
+    你必须先判断该章节是否真实有效：
+    - 若判断为噪声或误识别标题，返回空数组 []。
+    - 若判断为真实章节，再提取子节点。
+    """
+
     system_prompt = """
     你是一个专业的文档分析助手。你的任务是根据给定的段落内容，
     生成该章节下的详细思维导图分支。
@@ -1082,6 +1259,8 @@ async def refine_node_content(node_title: str, content_chunk: str, context_path:
     - 不输出 URL、文件路径、纯符号行
     - 输出前请自检，确保 JSON 数组中的每个对象都包含 topic 字段
     """
+    if confidence_note:
+        system_prompt = system_prompt + "\n" + confidence_note.strip() + "\n"
 
     user_prompt = f"""
     【上下文路径】：{context_path}
