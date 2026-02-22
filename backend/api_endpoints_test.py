@@ -4,10 +4,13 @@ import sys
 import tempfile
 import asyncio
 import types
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
 
@@ -723,6 +726,66 @@ class FastAPIEndpointTests(unittest.TestCase):
             self.assertAlmostEqual(advanced.get("engine_temperature"), 0.7, places=2)
             self.assertEqual(advanced.get("engine_max_tokens"), 12000)
 
+    def test_config_key_rotation_keeps_non_secret_fields_and_returns_alert(self):
+        payload = {
+            "active_profile_id": "p1",
+            "parser": {
+                "parser_backend": "hybrid",
+                "hybrid_noise_threshold": 0.31,
+                "hybrid_docling_skip_score": 66,
+                "hybrid_switch_min_delta": 3.5,
+                "hybrid_marker_min_length": 256,
+                "marker_prefer_api": True,
+                "task_timeout_seconds": 900,
+            },
+            "advanced": {
+                "engine_concurrency": 4,
+                "engine_temperature": 0.55,
+                "engine_max_tokens": 10000,
+            },
+            "profiles": [
+                {
+                    "id": "p1",
+                    "name": "default",
+                    "provider": "deepseek",
+                    "base_url": "https://api.deepseek.com",
+                    "model": "deepseek-chat",
+                    "api_key": "sk-rotate-key",
+                    "account_type": "free",
+                    "manual_models": ["deepseek-chat"],
+                }
+            ],
+        }
+
+        with TestClient(app_module.app) as client:
+            save_res = client.post("/config", json=payload)
+            self.assertEqual(save_res.status_code, 200)
+
+            before = Path(app_module.CONFIG_FILE).read_text(encoding="utf-8")
+            self.assertIn("enc:v1:", before)
+
+            Path(app_module.CONFIG_KEY_FILE).write_bytes(Fernet.generate_key())
+            app_module._config_cipher = None
+
+            get_res = client.get("/config")
+            self.assertEqual(get_res.status_code, 200)
+            data = get_res.json()
+
+            self.assertEqual(data.get("active_profile_id"), "p1")
+            self.assertEqual(data.get("profiles", [])[0].get("base_url"), "https://api.deepseek.com")
+            self.assertEqual(data.get("profiles", [])[0].get("model"), "deepseek-chat")
+            self.assertEqual(data.get("profiles", [])[0].get("api_key"), "")
+            self.assertFalse(data.get("profiles", [])[0].get("has_api_key"))
+            self.assertEqual(data.get("parser", {}).get("parser_backend"), "hybrid")
+            self.assertEqual(data.get("advanced", {}).get("engine_concurrency"), 4)
+
+            alerts = data.get("alerts", [])
+            self.assertTrue(any(item.get("code") == "CONFIG_SECRET_RECOVERY_REQUIRED" for item in alerts))
+            self.assertTrue(any(item.get("requires_api_key_reentry") for item in alerts))
+
+            after = Path(app_module.CONFIG_FILE).read_text(encoding="utf-8")
+            self.assertEqual(before, after)
+
     def test_config_rejects_non_integer_task_timeout(self):
         payload = {
             "active_profile_id": "p1",
@@ -759,6 +822,39 @@ class FastAPIEndpointTests(unittest.TestCase):
             self.assertEqual(save_res.status_code, 422)
             detail = save_res.json().get("detail", {})
             self.assertEqual(detail.get("code"), "INVALID_TASK_TIMEOUT_SECONDS")
+
+    def test_local_filelock_blocks_concurrent_access(self):
+        lock_path = str(self.base / "data" / "concurrency.lock")
+        entered = threading.Event()
+        release = threading.Event()
+        timings = {}
+
+        def _holder():
+            with app_module._LocalFileLock(lock_path, timeout=1):
+                entered.set()
+                release.wait(timeout=1.0)
+
+        worker = threading.Thread(target=_holder, daemon=True)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+
+        start = time.monotonic()
+        release_delay = 0.2
+
+        def _release_later():
+            time.sleep(release_delay)
+            release.set()
+
+        releaser = threading.Thread(target=_release_later, daemon=True)
+        releaser.start()
+
+        with app_module._LocalFileLock(lock_path, timeout=1):
+            timings["waited"] = time.monotonic() - start
+
+        worker.join(timeout=1.0)
+        releaser.join(timeout=1.0)
+
+        self.assertGreaterEqual(timings.get("waited", 0.0), 0.12)
 
     def test_cancel_task_endpoint_marks_task_as_cancelling(self):
         task = app_module.create_task("task-cancel", file_id="file-1")
@@ -810,6 +906,60 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertEqual(len(source_md.splitlines()), len(raw_md.splitlines()))
         self.assertNotIn("fm_anchor", source_md)
         self.assertIn("\n\n\n", source_md)
+
+    def test_process_document_task_uses_durable_pipeline_when_available(self):
+        called = {"durable": 0, "legacy": 0}
+
+        async def _durable(*args, **kwargs):
+            called["durable"] += 1
+
+        async def _legacy(*args, **kwargs):
+            called["legacy"] += 1
+
+        with patch.dict(os.environ, {"FILESMIND_WORKFLOW_ENGINE": "auto"}, clear=False):
+            with patch.object(app_module, "_durable_workflow_prerequisites", return_value=(True, "")):
+                with patch.object(app_module, "_process_document_task_durable", side_effect=_durable):
+                    with patch.object(app_module, "_process_document_task_legacy", side_effect=_legacy):
+                        asyncio.run(
+                            app_module.process_document_task(
+                                task_id="task-dispatch-durable",
+                                file_location="/tmp/doc.pdf",
+                                file_id="file-dispatch-durable",
+                                original_filename="doc.pdf",
+                                file_hash="hash-dispatch-durable",
+                            )
+                        )
+
+        self.assertEqual(called["durable"], 1)
+        self.assertEqual(called["legacy"], 0)
+
+    def test_process_document_task_fallbacks_to_legacy_when_durable_unavailable(self):
+        called = {"durable": 0, "legacy": 0}
+
+        async def _durable(*args, **kwargs):
+            called["durable"] += 1
+
+        async def _legacy(*args, **kwargs):
+            called["legacy"] += 1
+
+        with patch.dict(os.environ, {"FILESMIND_WORKFLOW_ENGINE": "auto"}, clear=False):
+            with patch.object(
+                app_module, "_durable_workflow_prerequisites", return_value=(False, "FILESMIND_DB_DSN is required")
+            ):
+                with patch.object(app_module, "_process_document_task_durable", side_effect=_durable):
+                    with patch.object(app_module, "_process_document_task_legacy", side_effect=_legacy):
+                        asyncio.run(
+                            app_module.process_document_task(
+                                task_id="task-dispatch-legacy",
+                                file_location="/tmp/doc.pdf",
+                                file_id="file-dispatch-legacy",
+                                original_filename="doc.pdf",
+                                file_hash="hash-dispatch-legacy",
+                            )
+                        )
+
+        self.assertEqual(called["durable"], 0)
+        self.assertEqual(called["legacy"], 1)
 
     def test_process_document_task_uses_engine_level_limiter_only(self):
         file_id = "file-engine-limiter"

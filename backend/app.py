@@ -13,6 +13,7 @@ import html
 from datetime import datetime, timezone
 import re
 import threading
+import time
 from copy import deepcopy
 from contextlib import asynccontextmanager
 from concurrent.futures import ProcessPoolExecutor
@@ -46,19 +47,111 @@ from urllib.parse import urlparse
 import shutil
 from cryptography.fernet import Fernet, InvalidToken
 
+_local_filelock_registry_guard = threading.Lock()
+_local_filelock_registry: Dict[str, threading.RLock] = {}
+
+
+def _local_filelock_thread_lock(path: str) -> threading.RLock:
+    normalized = os.path.abspath(path)
+    with _local_filelock_registry_guard:
+        lock = _local_filelock_registry.get(normalized)
+        if lock is None:
+            lock = threading.RLock()
+            _local_filelock_registry[normalized] = lock
+        return lock
+
+
+if os.name == "nt":
+    import msvcrt
+
+    def _try_lock_fd(file_obj) -> None:
+        file_obj.seek(0)
+        try:
+            msvcrt.locking(file_obj.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            raise
+
+    def _unlock_fd(file_obj) -> None:
+        file_obj.seek(0)
+        msvcrt.locking(file_obj.fileno(), msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _try_lock_fd(file_obj) -> None:
+        fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock_fd(file_obj) -> None:
+        fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
+
+
+class _LocalFileLock:
+    """
+    Lightweight cross-process file lock fallback.
+    Uses OS-level advisory locking + process-local RLock for thread safety.
+    """
+
+    def __init__(self, lock_file: str, timeout: float = -1, *_args, **_kwargs):
+        self.lock_file = os.path.abspath(str(lock_file))
+        self.timeout = float(timeout) if timeout is not None else -1
+        self._thread_lock = _local_filelock_thread_lock(self.lock_file)
+        self._file = None
+
+    def acquire(self):
+        deadline = None if self.timeout < 0 else (time.monotonic() + self.timeout)
+        self._thread_lock.acquire()
+        try:
+            os.makedirs(os.path.dirname(self.lock_file), exist_ok=True)
+            self._file = open(self.lock_file, "a+b")
+            while True:
+                try:
+                    _try_lock_fd(self._file)
+                    self._file.seek(0)
+                    self._file.truncate()
+                    self._file.write(str(os.getpid()).encode("utf-8"))
+                    self._file.flush()
+                    os.fsync(self._file.fileno())
+                    return self
+                except OSError:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError(f"Timed out acquiring lock: {self.lock_file}")
+                    time.sleep(0.05)
+        except Exception:
+            self.release()
+            raise
+
+    def release(self):
+        try:
+            if self._file is not None:
+                try:
+                    _unlock_fd(self._file)
+                except Exception:
+                    pass
+                try:
+                    self._file.close()
+                except Exception:
+                    pass
+                self._file = None
+        finally:
+            try:
+                self._thread_lock.release()
+            except RuntimeError:
+                # Ignore double-release in exceptional paths.
+                pass
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        self.release()
+        return False
+
+
 try:
-    from filelock import FileLock
+    from filelock import FileLock as FileLock  # type: ignore[assignment]
 except Exception:
-
-    class FileLock:  # type: ignore[override]
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, _exc_type, _exc, _tb):
-            return False
+    FileLock = _LocalFileLock  # type: ignore[assignment]
+    logger.warning("filelock is not installed; using built-in local file lock fallback.")
 
 
 # 导入扩展模块
@@ -289,6 +382,7 @@ MASKED_SECRET = "***"
 CONFIG_SCHEMA_VERSION = 3
 ENCRYPTION_PREFIX = "enc:v1:"
 _config_cipher: Optional[Fernet] = None
+_config_load_alerts: List[Dict[str, Any]] = []
 
 
 def _atomic_write_text(path: str, content: str):
@@ -384,12 +478,20 @@ class ProfileView(BaseModel):
     manual_models: List[str] = Field(default_factory=list)
 
 
+class ConfigAlert(BaseModel):
+    code: str
+    message: str
+    level: str = "warning"
+    requires_api_key_reentry: bool = False
+
+
 class ConfigStoreView(BaseModel):
     schema_version: int
     active_profile_id: str
     profiles: List[ProfileView] = Field(default_factory=list)
     parser: ParserSettingsPayload = Field(default_factory=ParserSettingsPayload)
     advanced: AdvancedSettingsPayload = Field(default_factory=AdvancedSettingsPayload)
+    alerts: List[ConfigAlert] = Field(default_factory=list)
 
 
 class ModelListRequest(BaseModel):
@@ -583,6 +685,33 @@ def _decrypt_store_inplace(raw: Dict[str, Any]):
     elif "api_key" in raw:
         # legacy 单配置
         raw["api_key"] = _decrypt_secret(str(raw.get("api_key", "")))
+
+
+def _clear_encrypted_api_keys_inplace(raw: Dict[str, Any]) -> int:
+    cleared = 0
+    if "profiles" in raw and isinstance(raw.get("profiles"), list):
+        for profile in raw["profiles"]:
+            if not isinstance(profile, dict):
+                continue
+            secret = str(profile.get("api_key", "") or "")
+            if secret.startswith(ENCRYPTION_PREFIX):
+                profile["api_key"] = ""
+                cleared += 1
+    elif "api_key" in raw:
+        secret = str(raw.get("api_key", "") or "")
+        if secret.startswith(ENCRYPTION_PREFIX):
+            raw["api_key"] = ""
+            cleared += 1
+    return cleared
+
+
+def _set_config_load_alerts(alerts: List[Dict[str, Any]]):
+    global _config_load_alerts
+    _config_load_alerts = [dict(item) for item in (alerts or []) if isinstance(item, dict)]
+
+
+def _get_config_load_alerts() -> List[Dict[str, Any]]:
+    return [dict(item) for item in _config_load_alerts]
 
 
 def _encrypt_store_for_disk(config_store: Dict[str, Any]) -> Dict[str, Any]:
@@ -907,13 +1036,54 @@ def _load_config_store() -> Dict[str, Any]:
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     raw = json.load(f)
+            except Exception as e:
+                logger.warning(f"读取配置失败，将回退默认配置: {e}")
+                _set_config_load_alerts([])
+                return _migrate_legacy_config({})
+
+            try:
                 _decrypt_store_inplace(raw)
-                return _normalize_config_store(raw)
+            except Exception as decrypt_err:
+                recovered = deepcopy(raw) if isinstance(raw, dict) else {}
+                cleared_count = _clear_encrypted_api_keys_inplace(recovered)
+                if cleared_count > 0:
+                    try:
+                        normalized = _normalize_config_store(recovered)
+                        logger.warning(
+                            "Config secret key is unavailable or changed; non-secret settings were kept and API keys were cleared."
+                        )
+                        _set_config_load_alerts(
+                            [
+                                {
+                                    "code": "CONFIG_SECRET_RECOVERY_REQUIRED",
+                                    "message": "Config key is unavailable or changed. API keys were cleared; please re-enter them.",
+                                    "level": "warning",
+                                    "requires_api_key_reentry": True,
+                                }
+                            ]
+                        )
+                        return normalized
+                    except ConfigValidationError as recover_err:
+                        logger.warning(
+                            f"配置密钥恢复失败，将回退默认配置: {recover_err.message} (decrypt_err={decrypt_err})"
+                        )
+                    except Exception as recover_err:
+                        logger.warning(f"配置密钥恢复失败，将回退默认配置: {recover_err} (decrypt_err={decrypt_err})")
+                else:
+                    logger.warning(f"配置解密失败且无可恢复密钥字段，将回退默认配置: {decrypt_err}")
+                _set_config_load_alerts([])
+                return _migrate_legacy_config({})
+
+            try:
+                normalized = _normalize_config_store(raw)
+                _set_config_load_alerts([])
+                return normalized
             except ConfigValidationError as e:
                 logger.warning(f"配置文件结构无效，将回退默认配置: {e.message}")
             except Exception as e:
                 logger.warning(f"读取配置失败，将回退默认配置: {e}")
 
+    _set_config_load_alerts([])
     return _migrate_legacy_config({})
 
 
@@ -960,7 +1130,7 @@ def _profile_to_runtime(profile: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _config_to_view(config_store: Dict[str, Any]) -> ConfigStoreView:
+def _config_to_view(config_store: Dict[str, Any], alerts: Optional[List[Dict[str, Any]]] = None) -> ConfigStoreView:
     profiles_view = []
     for profile in config_store.get("profiles", []):
         api_key = profile.get("api_key", "")
@@ -983,6 +1153,7 @@ def _config_to_view(config_store: Dict[str, Any]) -> ConfigStoreView:
         profiles=profiles_view,
         parser=_validate_parser_config(config_store.get("parser", _default_parser_config()), "parser"),
         advanced=_validate_advanced_config(config_store.get("advanced", _default_advanced_config()), "advanced"),
+        alerts=[ConfigAlert(**item) for item in (alerts or []) if isinstance(item, dict)],
     )
 
 
@@ -1165,10 +1336,69 @@ TERMINAL_TASK_STATUSES = {
     TaskStatus.FAILED,
     TaskStatus.CANCELLED,
 }
+WORKFLOW_ENGINE_AUTO = "auto"
+WORKFLOW_ENGINE_DURABLE = "durable"
+WORKFLOW_ENGINE_LEGACY = "legacy"
 
 
 def _is_ready_file_status(status: Any) -> bool:
     return str(status or "").strip().lower() in READY_FILE_STATUSES
+
+
+def _workflow_engine_mode() -> str:
+    raw = str(os.getenv("FILESMIND_WORKFLOW_ENGINE", WORKFLOW_ENGINE_AUTO)).strip().lower()
+    if raw in {WORKFLOW_ENGINE_AUTO, WORKFLOW_ENGINE_DURABLE, WORKFLOW_ENGINE_LEGACY}:
+        return raw
+    logger.warning(
+        f"FILESMIND_WORKFLOW_ENGINE={raw!r} invalid, fallback={WORKFLOW_ENGINE_AUTO}"
+    )
+    return WORKFLOW_ENGINE_AUTO
+
+
+def _durable_workflow_prerequisites() -> Tuple[bool, str]:
+    dsn = str(os.getenv("FILESMIND_DB_DSN", "")).strip()
+    if not dsn:
+        return False, "FILESMIND_DB_DSN is required"
+    try:
+        from repo import db as repo_db
+    except Exception as exc:
+        return False, f"workflow repo import failed: {exc}"
+    if getattr(repo_db, "psycopg", None) is None:
+        return False, "psycopg is not installed"
+    return True, ""
+
+
+def _map_document_status_to_task_status(status: Any) -> TaskStatus:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"running", "processing"}:
+        return TaskStatus.PROCESSING
+    if normalized == TaskStatus.COMPLETED_WITH_GAPS.value:
+        return TaskStatus.COMPLETED_WITH_GAPS
+    if normalized == TaskStatus.COMPLETED.value:
+        return TaskStatus.COMPLETED
+    if normalized == TaskStatus.CANCELLED.value:
+        return TaskStatus.CANCELLED
+    if normalized == TaskStatus.FAILED.value:
+        return TaskStatus.FAILED
+    return TaskStatus.PENDING
+
+
+def _normalize_failed_node_rows(rows: Any) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    if not isinstance(rows, list):
+        return normalized
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        error_message = str(row.get("error_message") or row.get("error_code") or row.get("status") or "").strip()
+        normalized.append(
+            {
+                "node_id": str(row.get("node_id", "")),
+                "topic": str(row.get("topic", "")),
+                "error": error_message,
+            }
+        )
+    return normalized
 
 
 # ==================== 任务存储（内存） ====================
@@ -1926,7 +2156,13 @@ def _ensure_source_index(file_id: str, markdown_path: str) -> Dict[str, Any]:
 # ==================== 后台任务 ====================
 
 
-async def process_document_task(task_id: str, file_location: str, file_id: str, original_filename: str):
+async def _process_document_task_legacy(
+    task_id: str,
+    file_location: str,
+    file_id: str,
+    original_filename: str,
+    file_hash: Optional[str] = None,
+):
     """
     异步处理文档任务 - Skeleton-Refinement Strategy
     """
@@ -2154,6 +2390,217 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
 
 # ==================== API 路由 ====================
 
+async def _cancel_workflow_task(worker: Optional[asyncio.Task]):
+    if worker is None or worker.done():
+        return
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+
+
+async def _process_document_task_durable(
+    task_id: str,
+    file_location: str,
+    file_id: str,
+    original_filename: str,
+    file_hash: Optional[str] = None,
+):
+    logger.info(f"开始 Durable Workflow 任务：{task_id}")
+    task = get_task(task_id)
+
+    if not task:
+        logger.error(f"任务不存在：{task_id}")
+        return
+
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    timeout_seconds = int(get_task_timeout_seconds_runtime())
+    workflow_task: Optional[asyncio.Task] = None
+    nodes_repo = None
+
+    task.timeout_seconds = timeout_seconds
+    task.started_at = datetime.now(timezone.utc).isoformat()
+
+    def commit_state():
+        _persist_task_snapshot(task)
+
+    def ensure_task_active():
+        _sync_cancel_flag_from_snapshot(task)
+        if task.cancel_requested:
+            raise TaskCancelled(task.cancel_reason or "任务已取消")
+        if timeout_seconds > 0 and (loop.time() - started_at) > timeout_seconds:
+            raise TaskTimeoutExceeded(f"任务超时（>{timeout_seconds} 秒）")
+
+    try:
+        from repo.documents_repo import DocumentsRepo
+        from repo.nodes_repo import NodesRepo
+        from workflow_contracts.models import WorkflowInput
+        from workflows.document_workflow import DocumentWorkflow
+
+        documents_repo = DocumentsRepo()
+        nodes_repo = NodesRepo()
+
+        parser_backend = str(get_parser_runtime_config().get("parser_backend", "docling")).lower()
+        resolved_hash = file_hash or get_file_hash(file_location)
+
+        task.file_id = file_id
+        task.failure_details = []
+        task.status = TaskStatus.PROCESSING
+        task.progress = 3
+        task.message = "Starting durable workflow..."
+        update_file_status(file_id, "processing")
+        commit_state()
+        ensure_task_active()
+
+        workflow = DocumentWorkflow()
+        workflow_input = WorkflowInput(
+            doc_id=file_id,
+            filename=original_filename,
+            file_path=file_location,
+            file_hash=resolved_hash,
+            parser_backend=parser_backend,
+            model_profile="default",
+            runtime_config={},
+        )
+        workflow_task = asyncio.create_task(workflow.run(workflow_input))
+
+        while not workflow_task.done():
+            ensure_task_active()
+            try:
+                row = await asyncio.to_thread(documents_repo.get_document, file_id)
+            except Exception as repo_exc:
+                logger.debug(f"读取 durable workflow 状态失败: {repo_exc}")
+                row = None
+
+            if isinstance(row, dict):
+                task.status = _map_document_status_to_task_status(row.get("status"))
+                progress_raw = row.get("progress")
+                if progress_raw is not None:
+                    try:
+                        task.progress = max(0, min(100, int(progress_raw)))
+                    except (TypeError, ValueError):
+                        pass
+                db_message = str(row.get("message") or "").strip()
+                if db_message:
+                    task.message = db_message
+                commit_state()
+
+            await asyncio.sleep(0.8)
+
+        workflow_result = await workflow_task
+        ensure_task_active()
+
+        summary = getattr(workflow_result, "summary", None)
+        md_path = str(getattr(summary, "markdown_path", "") or "").strip() or os.path.join(MD_DIR, f"{file_id}.md")
+        final_status = str(getattr(getattr(workflow_result, "status", None), "value", "") or "").strip().lower()
+
+        failed_rows = []
+        try:
+            failed_rows = await asyncio.to_thread(nodes_repo.get_failed_nodes, file_id)
+        except Exception as failed_nodes_exc:
+            logger.debug(f"读取失败节点详情失败: {failed_nodes_exc}")
+
+        task.failure_details = _normalize_failed_node_rows(failed_rows)
+        if final_status not in {TaskStatus.COMPLETED.value, TaskStatus.COMPLETED_WITH_GAPS.value}:
+            final_status = TaskStatus.COMPLETED_WITH_GAPS.value if task.failure_details else TaskStatus.COMPLETED.value
+
+        update_file_status(file_id, final_status, md_path)
+        task.status = _map_document_status_to_task_status(final_status)
+        task.progress = 100
+        task.message = (
+            f"Completed with gaps ({len(task.failure_details)} node(s) not refined, retry available)."
+            if task.status == TaskStatus.COMPLETED_WITH_GAPS
+            else "Completed"
+        )
+        if os.path.exists(md_path):
+            with open(md_path, "r", encoding="utf-8") as f:
+                task.result = f.read()
+        commit_state()
+        logger.info(f"任务 {task_id}: Durable Workflow 处理完成")
+
+    except TaskTimeoutExceeded as e:
+        logger.warning(f"任务 {task_id} 超时：{e}")
+        await _cancel_workflow_task(workflow_task)
+        task.cancel_requested = True
+        task.cancel_reason = str(e)
+        task.status = TaskStatus.CANCELLED
+        task.error = "TASK_TIMEOUT"
+        task.message = str(e)
+        update_file_status(file_id, "cancelled")
+        commit_state()
+    except TaskCancelled as e:
+        logger.info(f"任务 {task_id} 已取消：{e}")
+        await _cancel_workflow_task(workflow_task)
+        task.status = TaskStatus.CANCELLED
+        task.error = "TASK_CANCELLED"
+        task.message = str(e)
+        update_file_status(file_id, "cancelled")
+        commit_state()
+    except asyncio.CancelledError:
+        reason = task.cancel_reason or "任务已取消"
+        logger.info(f"任务 {task_id} 收到取消信号：{reason}")
+        await _cancel_workflow_task(workflow_task)
+        task.cancel_requested = True
+        task.status = TaskStatus.CANCELLED
+        task.error = "TASK_CANCELLED"
+        task.message = reason
+        update_file_status(file_id, "cancelled")
+        commit_state()
+    except Exception as e:
+        logger.error(f"任务 {task_id} Durable Workflow 处理失败：{e}", exc_info=True)
+        if nodes_repo is not None:
+            try:
+                failed_rows = await asyncio.to_thread(nodes_repo.get_failed_nodes, file_id)
+                task.failure_details = _normalize_failed_node_rows(failed_rows)
+            except Exception as failed_nodes_exc:
+                logger.debug(f"读取失败节点详情失败: {failed_nodes_exc}")
+        task.status = TaskStatus.FAILED
+        task.error = str(e)
+        task.message = f"处理失败：{str(e)}"
+        update_file_status(file_id, "failed")
+        commit_state()
+    finally:
+        task.worker = None
+        commit_state()
+
+
+async def process_document_task(
+    task_id: str,
+    file_location: str,
+    file_id: str,
+    original_filename: str,
+    file_hash: Optional[str] = None,
+):
+    """
+    任务执行分发器：
+    - `FILESMIND_WORKFLOW_ENGINE=durable` 强制使用 Durable Workflow
+    - `FILESMIND_WORKFLOW_ENGINE=legacy` 强制使用旧版协程
+    - `FILESMIND_WORKFLOW_ENGINE=auto` (默认) 在 Durable 依赖可用时启用新引擎，否则回退旧引擎
+    """
+    mode = _workflow_engine_mode()
+    if mode == WORKFLOW_ENGINE_LEGACY:
+        await _process_document_task_legacy(task_id, file_location, file_id, original_filename, file_hash=file_hash)
+        return
+
+    ready, reason = _durable_workflow_prerequisites()
+    if ready:
+        await _process_document_task_durable(task_id, file_location, file_id, original_filename, file_hash=file_hash)
+        return
+
+    if mode == WORKFLOW_ENGINE_DURABLE:
+        logger.error(f"Durable workflow requested but unavailable: {reason}")
+        task = get_task(task_id)
+        if task:
+            task.status = TaskStatus.FAILED
+            task.error = "DURABLE_WORKFLOW_UNAVAILABLE"
+            task.message = f"Durable workflow unavailable: {reason}"
+            update_file_status(file_id, "failed")
+            task.worker = None
+            _persist_task_snapshot(task)
+        return
+
+    logger.info(f"Durable workflow unavailable ({reason}), fallback to legacy task processor.")
+    await _process_document_task_legacy(task_id, file_location, file_id, original_filename, file_hash=file_hash)
+
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -2297,7 +2744,9 @@ async def upload_document(file: UploadFile = File(...)):
                 # 创建新任务，使用原有 PDF 路径
                 task = create_task(task_id, file_id=old_file_id)
                 task.worker = asyncio.create_task(
-                    process_document_task(task_id, pdf_path, old_file_id, existing["filename"])
+                    process_document_task(
+                        task_id, pdf_path, old_file_id, existing["filename"], file_hash=file_hash
+                    )
                 )
                 _persist_task_snapshot(task)
 
@@ -2342,7 +2791,9 @@ async def upload_document(file: UploadFile = File(...)):
                 )
                 restarted_task = create_task(restarted_task_id, file_id=old_file_id)
                 restarted_task.worker = asyncio.create_task(
-                    process_document_task(restarted_task_id, pdf_path, old_file_id, existing["filename"])
+                    process_document_task(
+                        restarted_task_id, pdf_path, old_file_id, existing["filename"], file_hash=file_hash
+                    )
                 )
                 _persist_task_snapshot(restarted_task)
                 logger.info(f"历史处理中任务已失效，自动重启：task_id={restarted_task_id}, file_id={old_file_id}")
@@ -2368,7 +2819,9 @@ async def upload_document(file: UploadFile = File(...)):
     task = create_task(task_id, file_id=file_id)
 
     # 启动后台任务
-    task.worker = asyncio.create_task(process_document_task(task_id, pdf_path, file_id, file.filename))
+    task.worker = asyncio.create_task(
+        process_document_task(task_id, pdf_path, file_id, file.filename, file_hash=file_hash)
+    )
     _persist_task_snapshot(task)
     logger.info(f"后台任务已创建：{task_id}")
 
@@ -2729,7 +3182,7 @@ async def admin_rebuild_source_index(payload: SourceIndexRebuildPayload):
 async def get_config():
     """获取配置中心数据（多 profile）"""
     config_store = _load_config_store()
-    return _config_to_view(config_store)
+    return _config_to_view(config_store, alerts=_get_config_load_alerts())
 
 
 @app.get("/config/export")

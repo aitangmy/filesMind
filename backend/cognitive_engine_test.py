@@ -132,6 +132,7 @@ class EngineSettingsTests(unittest.TestCase):
         self._old_engine = dict(ce._engine_settings)
         self._old_semaphore = ce._semaphore
         self._old_rate = ce._rate_limiter
+        self._old_refresh = ce._limiter_needs_refresh
         self._old_model = ce.get_model()
 
     def tearDown(self):
@@ -139,11 +140,14 @@ class EngineSettingsTests(unittest.TestCase):
         ce.set_model(self._old_model)
         ce._semaphore = self._old_semaphore
         ce._rate_limiter = self._old_rate
+        ce._limiter_needs_refresh = self._old_refresh
 
-    def test_update_client_config_clamps_advanced_values_and_resets_limiters(self):
+    def test_update_client_config_clamps_advanced_values_and_marks_limiter_refresh(self):
         with patch.object(ce, "AsyncOpenAI", return_value=SimpleNamespace()):
-            ce._semaphore = object()
-            ce._rate_limiter = object()
+            marker = object()
+            ce._semaphore = marker
+            ce._rate_limiter = marker
+            ce._limiter_needs_refresh = False
             ce.update_client_config(
                 {
                     "base_url": "https://api.deepseek.com",
@@ -160,30 +164,73 @@ class EngineSettingsTests(unittest.TestCase):
         self.assertEqual(ce._engine_settings["concurrency"], 10)
         self.assertEqual(ce._engine_settings["temperature"], 0.0)
         self.assertEqual(ce._engine_settings["max_tokens"], 16000)
-        self.assertIsNone(ce._semaphore)
-        self.assertIsNone(ce._rate_limiter)
+        self.assertIs(ce._semaphore, marker)
+        self.assertIs(ce._rate_limiter, marker)
+        self.assertTrue(ce._limiter_needs_refresh)
 
-    def test_set_model_resets_runtime_limiter(self):
-        ce._semaphore = object()
-        ce._rate_limiter = object()
+    def test_set_model_marks_runtime_limiter_refresh_without_replacing_objects(self):
+        marker = object()
+        ce._semaphore = marker
+        ce._rate_limiter = marker
+        ce._limiter_needs_refresh = False
 
         ce.set_model("gpt-4o")
 
         self.assertEqual(ce.get_model(), "gpt-4o")
-        self.assertIsNone(ce._semaphore)
-        self.assertIsNone(ce._rate_limiter)
+        self.assertIs(ce._semaphore, marker)
+        self.assertIs(ce._rate_limiter, marker)
+        self.assertTrue(ce._limiter_needs_refresh)
+
+    def test_get_rate_limiter_reuses_gate_and_updates_limit_after_refresh(self):
+        ce.cleanup()
+        with patch.object(ce, "AsyncOpenAI", return_value=SimpleNamespace()):
+            ce.update_client_config(
+                {
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "dummy",
+                    "model": "deepseek-chat",
+                    "advanced": {
+                        "engine_concurrency": 2,
+                        "engine_temperature": 0.3,
+                        "engine_max_tokens": 4096,
+                    },
+                }
+            )
+            semaphore1, limiter1 = ce.get_rate_limiter()
+            self.assertIsInstance(semaphore1, ce.DynamicConcurrencyLimiter)
+            self.assertEqual(semaphore1.get_limit(), 2)
+            self.assertIsNone(limiter1)
+
+            ce.update_client_config(
+                {
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "dummy",
+                    "model": "deepseek-chat",
+                    "advanced": {
+                        "engine_concurrency": 7,
+                        "engine_temperature": 0.3,
+                        "engine_max_tokens": 4096,
+                    },
+                }
+            )
+            semaphore2, limiter2 = ce.get_rate_limiter()
+            self.assertIs(semaphore1, semaphore2)
+            self.assertEqual(semaphore2.get_limit(), 7)
+            self.assertIsNone(limiter2)
 
 
 class RefineLimiterAndRetryTests(unittest.TestCase):
     def setUp(self):
         self._old_semaphore = ce._semaphore
         self._old_rate = ce._rate_limiter
+        self._old_refresh = ce._limiter_needs_refresh
         self._old_model = ce.get_model()
 
     def tearDown(self):
         ce._semaphore = self._old_semaphore
         ce._rate_limiter = self._old_rate
         ce.set_model(self._old_model)
+        ce._limiter_needs_refresh = self._old_refresh
 
     def test_refine_node_content_uses_rate_limiter(self):
         class _Limiter:

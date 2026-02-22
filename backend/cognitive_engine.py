@@ -8,6 +8,7 @@ import re
 import atexit
 import json
 import random
+import threading
 
 try:
     from openai import AsyncOpenAI
@@ -109,9 +110,8 @@ def _clamp_float(raw, default, min_v, max_v):
 
 
 def _reset_engine_runtime_limiter():
-    global _semaphore, _rate_limiter
-    _semaphore = None
-    _rate_limiter = None
+    global _limiter_needs_refresh
+    _limiter_needs_refresh = True
 
 
 async def fetch_models_detailed(base_url: str, api_key: str = "") -> dict:
@@ -294,6 +294,7 @@ class RateLimiter:
     """
 
     def __init__(self, rpm):
+        self.rpm = int(rpm)
         self.interval = 60.0 / rpm
         self.last_request_time = 0.0
         self.lock = asyncio.Lock()
@@ -314,8 +315,45 @@ class RefineNodeRequestError(RuntimeError):
 
 
 # 全局限流器和信号量
+class DynamicConcurrencyLimiter:
+    """
+    Async concurrency gate with runtime-updatable limit.
+    Keeps a stable object reference so in-flight waiters/holders remain valid.
+    """
+
+    def __init__(self, limit: int):
+        self._limit = max(1, int(limit))
+        self._in_flight = 0
+        self._state_lock = threading.Lock()
+
+    def set_limit(self, limit: int):
+        with self._state_lock:
+            self._limit = max(1, int(limit))
+
+    def get_limit(self) -> int:
+        with self._state_lock:
+            return self._limit
+
+    async def __aenter__(self):
+        while True:
+            with self._state_lock:
+                if self._in_flight < self._limit:
+                    self._in_flight += 1
+                    return self
+            await asyncio.sleep(0.01)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        with self._state_lock:
+            if self._in_flight > 0:
+                self._in_flight -= 1
+        return False
+
+
+# Global limiter state
 _rate_limiter = None
 _semaphore = None
+_limiter_needs_refresh = True
+_limiter_state_lock = threading.Lock()
 
 
 def get_strategy(model_name: str) -> dict:
@@ -328,42 +366,40 @@ def get_strategy(model_name: str) -> dict:
 
 
 def get_rate_limiter():
-    """获取或初始化限流器和信号量"""
-    global _rate_limiter, _semaphore
+    """Get shared limiter components with runtime-safe refresh."""
+    global _rate_limiter, _semaphore, _limiter_needs_refresh
 
-    if _semaphore is None:
+    with _limiter_state_lock:
         model = get_model()
         strategy = get_strategy(model)
+        concurrency = _engine_settings.get("concurrency", ENGINE_LIMITS["concurrency"]["default"])
+
+        if _semaphore is None:
+            _semaphore = DynamicConcurrencyLimiter(concurrency)
+            _limiter_needs_refresh = True
+        else:
+            _semaphore.set_limit(concurrency)
 
         if strategy["type"] == "static":  # MiniMax
-            # 获取账户类型以调整 RPM
             account_type = get_account_type()
-            # 免费版更严格
-            if account_type == "free":
-                rpm = 20  # 极度保守
-                concurrency = _engine_settings.get("concurrency", ENGINE_LIMITS["concurrency"]["default"])
-            else:
-                rpm = strategy.get("rpm", 120)
-                concurrency = _engine_settings.get("concurrency", ENGINE_LIMITS["concurrency"]["default"])
-
-            _rate_limiter = RateLimiter(rpm)
-            _semaphore = asyncio.Semaphore(concurrency)
-            print(f"策略应用: MiniMax (Strict Limit), RPM={rpm}, Concurrency={concurrency}")
-
+            rpm = 20 if account_type == "free" else strategy.get("rpm", 120)
+            if _limiter_needs_refresh or _rate_limiter is None or getattr(_rate_limiter, "rpm", None) != int(rpm):
+                _rate_limiter = RateLimiter(rpm)
+                print(f"Strategy applied: MiniMax (Strict Limit), RPM={rpm}, Concurrency={concurrency}")
         else:  # DeepSeek (Adaptive)
-            # DeepSeek 不需要严格的 RateLimiter，只需信号量控制并发
+            if _limiter_needs_refresh:
+                print(f"Strategy applied: DeepSeek (Adaptive), Concurrency={concurrency}")
             _rate_limiter = None
-            concurrency = _engine_settings.get("concurrency", ENGINE_LIMITS["concurrency"]["default"])
-            _semaphore = asyncio.Semaphore(concurrency)
-            print(f"策略应用: DeepSeek (Adaptive), Start Concurrency={concurrency}")
 
-    return _semaphore, _rate_limiter
+        _limiter_needs_refresh = False
+        return _semaphore, _rate_limiter
 
 
 def cleanup():
-    global _semaphore, _rate_limiter
+    global _semaphore, _rate_limiter, _limiter_needs_refresh
     _semaphore = None
     _rate_limiter = None
+    _limiter_needs_refresh = True
 
 
 atexit.register(cleanup)

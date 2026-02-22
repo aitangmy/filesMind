@@ -73,6 +73,14 @@ let destroyTimeout = null;
 let currentLoadingTask = null;
 let preloadToken = 0;
 let loadToken = 0;
+let preloadDebounceTimer = null;
+let preloadAbortController = null;
+let preloadRunPromise = null;
+
+const PRELOAD_DEBOUNCE_MS = 160;
+const PRELOAD_EAGER_PAGES = 12;
+const PRELOAD_MAX_PAGES = 1500;
+const PRELOAD_CONCURRENCY = 2;
 
 const toErrorMessage = (err, fallback = '加载文档失败') => {
   if (!err) return fallback;
@@ -89,12 +97,58 @@ const emitViewerError = (err, phase = 'load', fallback = '加载文档失败') =
   emit('error', { message, phase, raw: err });
 };
 
+const clearPreloadDebounce = () => {
+  if (preloadDebounceTimer) {
+    clearTimeout(preloadDebounceTimer);
+    preloadDebounceTimer = null;
+  }
+};
+
+const cancelScheduledPreload = () => {
+  preloadToken += 1;
+  clearPreloadDebounce();
+  if (preloadAbortController && !preloadAbortController.signal.aborted) {
+    preloadAbortController.abort();
+  }
+  preloadAbortController = null;
+};
+
+const waitForPreloadToStop = async (timeoutMs = 500) => {
+  const currentRun = preloadRunPromise;
+  if (!currentRun) return;
+  try {
+    await Promise.race([
+      currentRun,
+      new Promise(resolve => setTimeout(resolve, timeoutMs))
+    ]);
+  } catch {
+    // Best-effort shutdown path.
+  } finally {
+    if (preloadRunPromise === currentRun) {
+      preloadRunPromise = null;
+    }
+  }
+};
+
+const isPreloadCancelled = (token, signal) => token !== preloadToken || signal?.aborted;
+
+const runWhenBrowserIdle = async () => {
+  if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+    await new Promise(resolve => {
+      window.requestIdleCallback(() => resolve(), { timeout: 250 });
+    });
+    return;
+  }
+  await new Promise(resolve => setTimeout(resolve, 0));
+};
+
 // Clean up existing PDF proxy to free memory
 const disposeCurrentPdf = async () => {
-  preloadToken += 1;
+  cancelScheduledPreload();
+  await waitForPreloadToStop();
   if (currentLoadingTask) {
     try {
-      currentLoadingTask.destroy();
+      await Promise.resolve(currentLoadingTask.destroy());
     } catch (e) {
       console.warn('Destruction of incomplete task failed', e);
     }
@@ -151,10 +205,10 @@ const loadPdf = async () => {
       if (containerWidth <= 0) containerWidth = 800;
       const ratio = viewport.height / viewport.width;
       estimatedPageHeight.value = (containerWidth * ratio) * props.scale;
+      if (typeof page.cleanup === 'function') page.cleanup();
       
-      // Preload page heights with bounded concurrency to avoid UI stalls on large PDFs.
-      const preloadSeq = ++preloadToken;
-      preloadAllPageHeights(doc, containerWidth * props.scale, preloadSeq);
+      // Debounce and lazily preload heights to reduce worker pressure during rapid switches.
+      schedulePageHeightPreload(doc, containerWidth * props.scale);
     }
     if (token !== loadToken) return;
     // Mount initial pages
@@ -179,30 +233,76 @@ const loadPdf = async () => {
   }
 };
 
-const preloadAllPageHeights = async (doc, defaultWidth, token) => {
-  const numToPreload = Math.min(doc.numPages, 1500);
-  const maxConcurrent = 6;
-  let pageCursor = 1;
+const preloadPageHeightsBatch = async (doc, defaultWidth, token, signal, startPage, endPage) => {
+  if (startPage > endPage) return;
+  let pageCursor = startPage;
 
   const worker = async () => {
-    while (pageCursor <= numToPreload) {
-      if (token !== preloadToken) return;
+    while (pageCursor <= endPage) {
+      if (isPreloadCancelled(token, signal)) return;
       const pageIndex = pageCursor;
       pageCursor += 1;
       if (pageHeights.value[pageIndex]) continue;
       try {
         const page = await doc.getPage(pageIndex);
-        if (token !== preloadToken) return;
+        if (isPreloadCancelled(token, signal)) {
+          if (typeof page.cleanup === 'function') page.cleanup();
+          return;
+        }
         const viewport = page.getViewport({ scale: 1.0 });
         pageHeights.value[pageIndex] = defaultWidth * (viewport.height / viewport.width);
+        if (typeof page.cleanup === 'function') page.cleanup();
       } catch {
         // Best-effort preloading only.
       }
     }
   };
 
-  const workers = Array.from({ length: Math.min(maxConcurrent, numToPreload) }, () => worker());
+  const workers = Array.from(
+    { length: Math.min(PRELOAD_CONCURRENCY, endPage - startPage + 1) },
+    () => worker()
+  );
   await Promise.all(workers);
+};
+
+const preloadAllPageHeights = async (doc, defaultWidth, token, signal) => {
+  const numToPreload = Math.min(doc.numPages, PRELOAD_MAX_PAGES);
+  if (numToPreload <= 0) return;
+
+  const eagerEnd = Math.min(numToPreload, PRELOAD_EAGER_PAGES);
+  await preloadPageHeightsBatch(doc, defaultWidth, token, signal, 1, eagerEnd);
+  if (isPreloadCancelled(token, signal) || eagerEnd >= numToPreload) return;
+
+  await runWhenBrowserIdle();
+  if (isPreloadCancelled(token, signal)) return;
+
+  await preloadPageHeightsBatch(doc, defaultWidth, token, signal, eagerEnd + 1, numToPreload);
+};
+
+const schedulePageHeightPreload = (doc, defaultWidth) => {
+  if (!doc || !Number.isFinite(defaultWidth) || defaultWidth <= 0) return;
+
+  cancelScheduledPreload();
+  const token = preloadToken;
+  const controller = new AbortController();
+  preloadAbortController = controller;
+
+  preloadDebounceTimer = setTimeout(() => {
+    preloadDebounceTimer = null;
+    const run = preloadAllPageHeights(doc, defaultWidth, token, controller.signal)
+      .catch(() => {
+        // Best-effort preloading only.
+      })
+      .finally(() => {
+        if (preloadRunPromise === run) {
+          preloadRunPromise = null;
+        }
+        if (preloadAbortController === controller) {
+          preloadAbortController = null;
+        }
+      });
+    preloadRunPromise = run;
+  }, PRELOAD_DEBOUNCE_MS);
 };
 
 // Intersection Observer Setup
@@ -296,8 +396,7 @@ watch(() => props.scale, () => {
   pageHeights.value = {};
   if (pdfDoc.value && containerRef.value) {
      const containerWidth = containerRef.value.clientWidth > 0 ? containerRef.value.clientWidth : 800;
-     const token = ++preloadToken;
-     preloadAllPageHeights(pdfDoc.value, containerWidth * props.scale, token);
+     schedulePageHeightPreload(pdfDoc.value, containerWidth * props.scale);
   }
 });
 
@@ -349,7 +448,7 @@ onUnmounted(() => {
   if (destroyTimeout) {
     clearTimeout(destroyTimeout);
   }
-  disposeCurrentPdf();
+  void disposeCurrentPdf();
 });
 
 // A small helper to emit rendered state for any inner vue-pdf-embed component
