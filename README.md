@@ -372,6 +372,6 @@ For repository guidelines, see `CONTRIBUTING.md`.
 FilesMind is dual-licensed:
 
 1. Open-source license: GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`), see [LICENSE](LICENSE).
-2. Commercial license: available for organizations that need to distribute or operate proprietary derivatives, see [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md).
+2. Commercial license: available for organizations that need to distribute or operate proprietary derivatives, see [COMMERCIAL.md](COMMERCIAL.md).
 
 Unless you have a separate written commercial agreement with the copyright holder, your use is governed by AGPL v3.0 or later.
