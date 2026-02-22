@@ -1113,6 +1113,7 @@ class TaskStatus(str, Enum):
     PENDING = "pending"
     PROCESSING = "processing"
     COMPLETED = "completed"
+    COMPLETED_WITH_GAPS = "completed_with_gaps"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
@@ -1155,6 +1156,19 @@ class FileRecord(BaseModel):
     md_path: str
     created_at: str
     status: str  # "completed", "processing", "failed"
+
+
+READY_FILE_STATUSES = {"completed", "completed_with_gaps"}
+TERMINAL_TASK_STATUSES = {
+    TaskStatus.COMPLETED,
+    TaskStatus.COMPLETED_WITH_GAPS,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+}
+
+
+def _is_ready_file_status(status: Any) -> bool:
+    return str(status or "").strip().lower() in READY_FILE_STATUSES
 
 
 # ==================== 任务存储（内存） ====================
@@ -1236,7 +1250,7 @@ def cleanup_old_tasks():
     now = datetime.now(timezone.utc)
     to_remove = []
     for tid, t in tasks.items():
-        if t.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+        if t.status in TERMINAL_TASK_STATUSES:
             try:
                 started = datetime.fromisoformat(t.started_at.replace("Z", "+00:00"))
                 if (now - started).total_seconds() > 3600:
@@ -1737,7 +1751,7 @@ def rebuild_source_indexes_batch(
             "filename": filename,
         }
 
-        if status != "completed":
+        if not _is_ready_file_status(status):
             skipped += 1
             item.update(
                 {
@@ -2038,6 +2052,12 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
                 raise
             except Exception as e:
                 logger.error(f"Node processing failed: {e}")
+                node.ai_details = [
+                    {
+                        "topic": "Not refined",
+                        "details": ["Refinement failed for this node. Retry this node from the UI."],
+                    }
+                ]
                 failed_nodes.append({"node_id": getattr(node, "id", ""), "topic": node.topic, "error": str(e)})
 
         if nodes_to_refine:
@@ -2067,7 +2087,7 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
             )
             if len(failed_nodes) > 3:
                 failed_preview += f" ... (+{len(failed_nodes) - 3} more)"
-            raise Exception(f"Refinement failed for {len(failed_nodes)} node(s). {failed_preview}")
+            logger.warning(f"Refinement partially failed for {len(failed_nodes)} node(s). {failed_preview}")
 
         ensure_task_active()
         task.progress = 98
@@ -2082,11 +2102,16 @@ async def process_document_task(task_id: str, file_location: str, file_id: str, 
         md_path = os.path.join(MD_DIR, f"{file_id}.md")
         _atomic_write_text(md_path, final_md)
 
-        update_file_status(file_id, "completed", md_path)
-        task.status = TaskStatus.COMPLETED
+        update_file_status(file_id, "completed_with_gaps" if failed_nodes else "completed", md_path)
+        task.status = TaskStatus.COMPLETED_WITH_GAPS if failed_nodes else TaskStatus.COMPLETED
         task.progress = 100
         task.message = "处理完成！"
         task.result = final_md
+        task.message = (
+            f"Completed with gaps ({len(failed_nodes)} node(s) not refined, retry available)."
+            if failed_nodes
+            else "Completed"
+        )
         commit_state()
         logger.info(f"任务 {task_id}: 处理完成")
 
@@ -2229,7 +2254,7 @@ async def upload_document(file: UploadFile = File(...)):
     if existing:
         existing_status = existing.get("status")
 
-        if existing_status == "completed":
+        if _is_ready_file_status(existing_status):
             # 情况 1: 已完成，直接复用 MD 结果
             # 删除临时文件
             os.remove(temp_file)
@@ -2244,7 +2269,7 @@ async def upload_document(file: UploadFile = File(...)):
             return UploadResponse(
                 task_id=task_id,
                 file_id=existing["file_id"],
-                status="completed",
+                status=str(existing_status),
                 message="文件已存在，直接加载",
                 is_duplicate=True,
                 existing_md=existing_md,
@@ -2415,7 +2440,7 @@ async def cancel_task(task_id: str, request: Request):
             "message": "已记录取消请求，等待任务进程响应",
         }
 
-    if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+    if task.status in TERMINAL_TASK_STATUSES:
         return {
             "success": True,
             "task_id": task_id,
@@ -2468,7 +2493,7 @@ async def get_file_content(file_id: str):
     history = load_history()
     for item in history:
         if item["file_id"] == file_id:
-            if item["status"] != "completed":
+            if not _is_ready_file_status(item.get("status")):
                 raise HTTPException(status_code=400, detail="文件尚未处理完成")
 
             if not os.path.exists(item["md_path"]):
@@ -2487,7 +2512,7 @@ async def get_file_tree(file_id: str):
     record = _get_history_record(file_id)
     if not record:
         raise HTTPException(status_code=404, detail="文件记录不存在")
-    if record.get("status") != "completed":
+    if not _is_ready_file_status(record.get("status")):
         raise HTTPException(status_code=400, detail="文件尚未处理完成")
 
     md_path = record.get("md_path", "")
@@ -2511,7 +2536,7 @@ async def get_node_source(file_id: str, node_id: str, context_lines: int = 2, ma
     record = _get_history_record(file_id)
     if not record:
         raise HTTPException(status_code=404, detail="文件记录不存在")
-    if record.get("status") != "completed":
+    if not _is_ready_file_status(record.get("status")):
         raise HTTPException(status_code=400, detail="文件尚未处理完成")
 
     md_path = record.get("md_path", "")

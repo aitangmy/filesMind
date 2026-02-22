@@ -881,7 +881,7 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertEqual(task.status, app_module.TaskStatus.COMPLETED)
         self.assertGreaterEqual(call_counter["count"], 1)
 
-    def test_process_document_task_fails_when_refinement_nodes_fail(self):
+    def test_process_document_task_completes_with_gaps_when_refinement_nodes_fail(self):
         file_id = "file-engine-fail"
         task_id = "task-engine-fail"
         pdf_path = Path(app_module.PDF_DIR) / "engine-fail.pdf"
@@ -941,8 +941,8 @@ class FastAPIEndpointTests(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(task.status, app_module.TaskStatus.FAILED)
-        self.assertIn("Refinement failed for", task.message)
+        self.assertEqual(task.status, app_module.TaskStatus.COMPLETED_WITH_GAPS)
+        self.assertIn("Completed with gaps", task.message)
         self.assertEqual(len(task.failure_details), 2)
         self.assertEqual(task.failure_details[0]["topic"], "Root")
 
@@ -951,7 +951,7 @@ class FastAPIEndpointTests(unittest.TestCase):
             status_res = client.get(f"/task/{task_id}")
         self.assertEqual(status_res.status_code, 200)
         status_data = status_res.json()
-        self.assertEqual(status_data["status"], "failed")
+        self.assertEqual(status_data["status"], "completed_with_gaps")
         self.assertEqual(len(status_data.get("failure_details") or []), 2)
 
 
