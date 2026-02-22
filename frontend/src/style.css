@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 
 /* Design Tokens */
 :root {
@@ -25,6 +26,7 @@
     --glow-brand: 0 0 14px rgba(79, 111, 174, 0.1);
 }
 
+:root.dark,
 :root[data-theme="dark"] {
     color-scheme: dark;
     --brand-primary: #6a86ba;
@@ -232,21 +234,36 @@ body::before {
     );
 }
 
+:root.dark .app-shell .text-slate-900,
+:root.dark .app-shell .text-slate-800,
+:root.dark .app-shell .text-slate-700,
 :root[data-theme="dark"] .app-shell .text-slate-900,
 :root[data-theme="dark"] .app-shell .text-slate-800,
 :root[data-theme="dark"] .app-shell .text-slate-700 {
     color: #e2e8f0;
 }
 
+:root.dark .app-shell .text-slate-600,
+:root.dark .app-shell .text-slate-500,
 :root[data-theme="dark"] .app-shell .text-slate-600,
 :root[data-theme="dark"] .app-shell .text-slate-500 {
     color: #cbd5e1;
 }
 
+:root.dark .app-shell .text-slate-400,
 :root[data-theme="dark"] .app-shell .text-slate-400 {
     color: #94a3b8;
 }
 
+:root.dark .app-shell .bg-white,
+:root.dark .app-shell .bg-white\/80,
+:root.dark .app-shell .bg-white\/90,
+:root.dark .app-shell .bg-white\/95,
+:root.dark .app-shell .bg-slate-50,
+:root.dark .app-shell .bg-slate-50\/50,
+:root.dark .app-shell .bg-slate-50\/80,
+:root.dark .app-shell .bg-slate-100,
+:root.dark .app-shell .bg-slate-100\/50,
 :root[data-theme="dark"] .app-shell .bg-white,
 :root[data-theme="dark"] .app-shell .bg-white\/80,
 :root[data-theme="dark"] .app-shell .bg-white\/90,
@@ -259,6 +276,11 @@ body::before {
     background-color: color-mix(in srgb, #2f3b4f 78%, transparent);
 }
 
+:root.dark .app-shell .border-slate-200,
+:root.dark .app-shell .border-slate-200\/50,
+:root.dark .app-shell .border-slate-200\/60,
+:root.dark .app-shell .border-slate-200\/70,
+:root.dark .app-shell .border-slate-300,
 :root[data-theme="dark"] .app-shell .border-slate-200,
 :root[data-theme="dark"] .app-shell .border-slate-200\/50,
 :root[data-theme="dark"] .app-shell .border-slate-200\/60,

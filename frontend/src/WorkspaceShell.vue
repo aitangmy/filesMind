@@ -192,6 +192,60 @@ const stopPdfResizing = () => {
 
 // 瀵煎浘浜や簰鐘舵€?
 const mindMapRef = ref(null);
+const THEME_STORAGE_KEY = 'filesmind.theme';
+const isDarkTheme = ref(false);
+let prefersDarkMediaQuery = null;
+
+const applyGlobalTheme = (darkEnabled) => {
+  if (typeof document === 'undefined') return;
+  const root = document.documentElement;
+  if (!root) return;
+  root.classList.toggle('dark', darkEnabled);
+  root.setAttribute('data-theme', darkEnabled ? 'dark' : 'light');
+};
+
+const setDarkTheme = (darkEnabled, persist = true) => {
+  const next = Boolean(darkEnabled);
+  isDarkTheme.value = next;
+  applyGlobalTheme(next);
+  if (persist) {
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, next ? 'dark' : 'light');
+    } catch {
+      // Ignore storage failures.
+    }
+  }
+};
+
+const readStoredTheme = () => {
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored === 'dark') return true;
+    if (stored === 'light') return false;
+  } catch {
+    // Ignore storage failures.
+  }
+  return null;
+};
+
+const syncThemeFromSystemPreference = () => {
+  const stored = readStoredTheme();
+  if (stored !== null) {
+    setDarkTheme(stored, false);
+    return;
+  }
+  const prefersDark = Boolean(prefersDarkMediaQuery?.matches);
+  setDarkTheme(prefersDark, false);
+};
+
+if (typeof window !== 'undefined') {
+  const stored = readStoredTheme();
+  if (stored !== null) {
+    setDarkTheme(stored, false);
+  } else if (typeof window.matchMedia === 'function') {
+    setDarkTheme(window.matchMedia('(prefers-color-scheme: dark)').matches, false);
+  }
+}
 
 const triggerExportPng = () => {
   if (mindMapRef.value?.exportPNG) mindMapRef.value.exportPNG();
@@ -207,7 +261,7 @@ const triggerExportXmind = () => {
 };
 
 const triggerToggleTheme = () => {
-  if (mindMapRef.value?.toggleTheme) mindMapRef.value.toggleTheme();
+  setDarkTheme(!isDarkTheme.value, true);
 };
 
 const mindMapZoomPercent = ref(100);
@@ -1390,6 +1444,12 @@ onUnmounted(() => {
     clearTimeout(advancedAutoSaveTimer);
     advancedAutoSaveTimer = null;
   }
+  if (prefersDarkMediaQuery?.removeEventListener) {
+    prefersDarkMediaQuery.removeEventListener('change', syncThemeFromSystemPreference);
+  } else if (prefersDarkMediaQuery?.removeListener) {
+    prefersDarkMediaQuery.removeListener(syncThemeFromSystemPreference);
+  }
+  prefersDarkMediaQuery = null;
   stopPdfResizing();
   stopSidebarResizing();
   window.removeEventListener('resize', updateViewport);
@@ -1711,6 +1771,15 @@ const rebuildActionClass = (action) => {
 };
 
 onMounted(() => {
+  if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+    prefersDarkMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    if (prefersDarkMediaQuery?.addEventListener) {
+      prefersDarkMediaQuery.addEventListener('change', syncThemeFromSystemPreference);
+    } else if (prefersDarkMediaQuery?.addListener) {
+      prefersDarkMediaQuery.addListener(syncThemeFromSystemPreference);
+    }
+  }
+  syncThemeFromSystemPreference();
   if (isSettingsRoute.value) {
     showSettings.value = true;
   }
@@ -2019,7 +2088,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
 <template>
   <div
     ref="appShellRef"
-    class="app-shell h-screen flex font-sans overflow-hidden relative"
+    class="app-shell h-screen flex font-sans overflow-hidden relative text-slate-700 dark:text-slate-200"
     @dragover.prevent="onDragOver"
     @dragleave.prevent="onDragLeave"
     @drop.prevent="onDrop"
@@ -2029,11 +2098,11 @@ const runSourceIndexRebuild = async (dryRun = false) => {
       v-if="isDraggingFile"
       class="absolute inset-0 z-[100] bg-blue-500/10 backdrop-blur-sm m-4 rounded-3xl border-4 border-dashed border-blue-400 flex items-center justify-center transition-all duration-300 pointer-events-none"
     >
-      <div class="bg-white/95 px-10 py-8 rounded-2xl shadow-2xl flex flex-col items-center">
+      <div class="bg-white/95 dark:bg-slate-900/95 px-10 py-8 rounded-2xl shadow-2xl flex flex-col items-center border border-slate-100 dark:border-slate-700/60">
         <svg class="w-20 h-20 text-blue-500 mb-4 animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 16.5V9.75m0 0l3 3m-3-3l-3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z"></path>
         </svg>
-        <h2 class="text-2xl font-bold text-slate-700 tracking-wide">释放鼠标，立即解析文档</h2>
+        <h2 class="text-2xl font-bold text-slate-700 dark:text-slate-100 tracking-wide">释放鼠标，立即解析文档</h2>
       </div>
     </div>
 
@@ -2061,7 +2130,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
     <aside
       class="app-panel elev-md flex-shrink-0 backdrop-blur-xl flex flex-col overflow-hidden transition-[width,opacity] duration-300 ease-out"
       :style="{ width: showSidebar ? `${sidebarWidth}px` : '0px' }"
-      :class="showSidebar ? 'opacity-100 border-r border-slate-200/60' : 'opacity-0 border-r-0 pointer-events-none'"
+      :class="showSidebar ? 'opacity-100 border-r border-slate-200/60 dark:border-slate-700/70' : 'opacity-0 border-r-0 pointer-events-none'"
     >
       <!-- Logo 鍖哄煙 -->
       <div class="brand-banner h-14 px-4 flex items-center border-b border-slate-200/40">
@@ -2077,7 +2146,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
       </div>
 
       <!-- 鏂囦欢鍒楄〃 -->
-      <div class="flex-grow overflow-y-auto p-3 bg-slate-50/50">
+      <div class="flex-grow overflow-y-auto p-3 bg-slate-50/50 dark:bg-slate-900/20">
         <div class="flex items-center justify-between mb-3 px-2">
           <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider">
             鍘嗗彶鏂囦欢
@@ -2136,7 +2205,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
       </div>
 
       <!-- 搴曢儴鎻愮ず -->
-      <div class="p-3 border-t border-slate-200/60 bg-gradient-to-r from-slate-50 to-blue-50/30">
+      <div class="p-3 border-t border-slate-200/60 dark:border-slate-700/70 bg-gradient-to-r from-slate-50 to-blue-50/30 dark:from-slate-900/40 dark:to-slate-800/30">
         <div class="text-[10px] text-slate-400 text-center">
           Powered by <span class="font-medium text-slate-500">IBM Docling</span> & <span class="font-medium text-slate-500">DeepSeek</span>
         </div>
@@ -2145,7 +2214,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
 
     <div
       v-if="showSidebar"
-      class="w-2 cursor-col-resize bg-slate-200/40 hover:bg-blue-100/70 transition-colors relative flex items-center justify-center"
+      class="w-2 cursor-col-resize bg-slate-200/40 dark:bg-slate-700/30 hover:bg-blue-100/70 dark:hover:bg-blue-900/50 transition-colors relative flex items-center justify-center"
       :class="{ 'bg-blue-100/90': isSidebarResizing }"
       @mousedown="startSidebarResizing"
     >
@@ -2158,12 +2227,12 @@ const runSourceIndexRebuild = async (dryRun = false) => {
     <!-- 涓诲唴瀹瑰尯 -->
     <div class="flex-grow flex flex-col min-w-0">
       <!-- 椤堕儴瀵艰埅鏍?-->
-      <header class="app-toolbar flex-shrink-0 backdrop-blur-xl border-b border-slate-200/40 shadow-sm">
+      <header class="app-toolbar flex-shrink-0 backdrop-blur-xl border-b border-slate-200/40 dark:border-slate-700/60 shadow-sm">
         <div class="h-14 flex items-center justify-between px-4">
           <div class="flex items-center gap-3">
             <button
               @click="showSidebar = !showSidebar"
-              class="p-2 rounded-xl text-slate-500 hover:bg-slate-100/80 hover:text-slate-700 transition-all duration-200"
+              class="p-2 rounded-xl text-slate-500 dark:text-slate-300 hover:bg-slate-100/80 dark:hover:bg-slate-700/60 hover:text-slate-700 dark:hover:text-slate-100 transition-all duration-200"
               :title="showSidebar ? '隐藏侧边栏' : '显示侧边栏'"
             >
               <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2196,14 +2265,14 @@ const runSourceIndexRebuild = async (dryRun = false) => {
           <div class="flex items-center gap-2">
             <span
               v-if="isTabletViewport"
-              class="hidden md:inline-flex text-[11px] px-2 py-1 rounded-full bg-slate-100 text-slate-500"
+              class="hidden md:inline-flex text-[11px] px-2 py-1 rounded-full bg-slate-100 dark:bg-slate-700/70 text-slate-500 dark:text-slate-200"
             >
               骞虫澘瀹藉害宸茶嚜鍔ㄩ殣钘忓師鏂囧尯
             </span>
             <button
               @click="openSettingsPage"
               data-testid="settings-open-btn"
-              class="flex items-center gap-2 px-3 py-2 rounded-xl text-slate-500 hover:text-indigo-600 hover:bg-indigo-50/80 transition-all duration-200 border border-transparent hover:border-indigo-100 font-medium"
+              class="flex items-center gap-2 px-3 py-2 rounded-xl text-slate-500 dark:text-slate-300 hover:text-indigo-600 dark:hover:text-indigo-300 hover:bg-indigo-50/80 dark:hover:bg-slate-700/60 transition-all duration-200 border border-transparent hover:border-indigo-100 dark:hover:border-slate-600 font-medium"
               title="绯荤粺璁剧疆"
             >
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2293,29 +2362,34 @@ const runSourceIndexRebuild = async (dryRun = false) => {
       </header>
 
       <!-- 涓诲唴瀹瑰尯鍩燂紙鍙屾爮鍒嗗壊瀹瑰櫒锛?-->
-      <main class="flex-grow p-6 overflow-hidden bg-slate-100/50 flex">
+      <main class="flex-grow p-6 overflow-hidden bg-slate-100/50 dark:bg-slate-900/30 flex">
         <div
           ref="workspaceLayoutRef"
           class="h-full w-full grid items-stretch overflow-hidden"
           :style="workspaceGridStyle"
         >
           <!-- 宸︿晶锛氭€濈淮瀵煎浘 -->
-          <div class="app-card elev-md min-w-0 h-full flex flex-col rounded-xl border border-slate-200/40 overflow-hidden relative">
-            <div class="absolute top-4 right-4 flex items-center gap-1 z-20 bg-white/70 backdrop-blur-md p-1 rounded-xl shadow-sm border border-slate-200/40">
-              <button @click="triggerExportMd" class="p-2 rounded-lg text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors" title="Export as Markdown">
+          <div class="app-card elev-md min-w-0 h-full flex flex-col rounded-xl border border-slate-200/40 dark:border-slate-700/60 overflow-hidden relative">
+            <div class="absolute top-4 right-4 flex items-center gap-1 z-20 bg-white/70 dark:bg-slate-900/70 backdrop-blur-md p-1 rounded-xl shadow-sm border border-slate-200/40 dark:border-slate-700/70">
+              <button @click="triggerExportMd" class="p-2 rounded-lg text-slate-500 dark:text-slate-200 hover:text-slate-700 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors" title="Export as Markdown">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
               </button>
               <button
                 @click="triggerExportXmind"
                 @mouseenter="prefetchXmindExportAssets"
                 @focus="prefetchXmindExportAssets"
-                class="p-2 rounded-lg text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors"
+                class="p-2 rounded-lg text-slate-500 dark:text-slate-200 hover:text-slate-700 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"
                 title="Export as XMind"
               >
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
               </button>
-              <button @click="triggerToggleTheme" class="p-2 rounded-lg text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors" title="Toggle Theme">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+              <button
+                @click="triggerToggleTheme"
+                class="p-2 rounded-lg text-slate-500 dark:text-slate-200 hover:text-slate-700 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"
+                :title="isDarkTheme ? 'Switch to light theme' : 'Switch to dark theme'"
+              >
+                <svg v-if="!isDarkTheme" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+                <svg v-else class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v2.25m0 13.5V21m6.364-13.364l-1.59 1.59M7.227 16.773l-1.59 1.59m12.727 0l-1.59-1.59M7.227 7.227l-1.59-1.59M21 12h-2.25M5.25 12H3m9 6a6 6 0 100-12 6 6 0 000 12z"></path></svg>
               </button>
             </div>
 
@@ -2373,6 +2447,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                   :file-id="currentFileId || ''"
                   :features="systemFeatures"
                   :flat-nodes="flatNodes"
+                  :dark-mode="isDarkTheme"
                   class="absolute inset-0"
                   @node-click="handleMindmapNodeClick"
                   @feedback="handleMindmapFeedback"
@@ -2381,14 +2456,14 @@ const runSourceIndexRebuild = async (dryRun = false) => {
 
                 <div
                   v-if="showMindmapToolbar"
-                  class="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 bg-white/88 backdrop-blur-md rounded-xl border border-slate-200 shadow-lg px-2 py-1.5"
+                  class="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 bg-white/88 dark:bg-slate-900/88 backdrop-blur-md rounded-xl border border-slate-200 dark:border-slate-700 shadow-lg px-2 py-1.5"
                 >
                   <button @click="triggerCollapseAll" class="toolbar-btn" title="鎶樺彔鍏ㄩ儴">鎶樺彔</button>
                   <button @click="triggerExpandAll" class="toolbar-btn" title="灞曞紑鍏ㄩ儴">灞曞紑</button>
                   <button @click="triggerFitView" class="toolbar-btn" title="灞呬腑瑙嗗浘">灞呬腑</button>
-                  <div class="w-px h-5 bg-slate-200 mx-1"></div>
+                  <div class="w-px h-5 bg-slate-200 dark:bg-slate-600 mx-1"></div>
                   <button @click="triggerZoomOut" class="toolbar-btn toolbar-zoom" title="缂╁皬">-</button>
-                  <span class="text-[11px] text-slate-600 font-medium min-w-12 text-center">{{ mindMapZoomPercent }}%</span>
+                  <span class="text-[11px] text-slate-600 dark:text-slate-200 font-medium min-w-12 text-center">{{ mindMapZoomPercent }}%</span>
                   <button @click="triggerZoomIn" class="toolbar-btn toolbar-zoom" title="鏀惧ぇ">+</button>
                 </div>
               </Transition>
@@ -2398,7 +2473,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
           <!-- 鍒嗛殧鎷栨嫿鏉?-->
           <div
             v-if="showDetailPane"
-            class="group cursor-col-resize flex flex-col justify-center items-center rounded-md bg-slate-200/40 hover:bg-blue-100/70 transition-colors relative"
+            class="group cursor-col-resize flex flex-col justify-center items-center rounded-md bg-slate-200/40 dark:bg-slate-700/30 hover:bg-blue-100/70 dark:hover:bg-blue-900/50 transition-colors relative"
             :class="{ 'bg-blue-100/90': isPdfResizing }"
             @mousedown="startPdfResizing"
           >
@@ -2410,12 +2485,12 @@ const runSourceIndexRebuild = async (dryRun = false) => {
           <!-- 鍙充晶锛氳妭鐐硅鎯?-->
           <aside
             v-if="showDetailPane"
-            class="app-card elev-md h-full flex flex-col rounded-xl border border-slate-200/40 overflow-hidden transition-all duration-300 ease-out"
+            class="app-card elev-md h-full flex flex-col rounded-xl border border-slate-200/40 dark:border-slate-700/60 overflow-hidden transition-all duration-300 ease-out"
             :class="{ 'duration-0': isPdfResizing }"
             :style="{ width: `${pdfPaneWidth}px`, minWidth: '320px' }"
             @mouseenter="prefetchPdfViewerAssets"
           >
-            <div class="p-3 border-b border-slate-200/40 flex-shrink-0 bg-slate-50/60 backdrop-blur-sm z-10 flex items-center justify-between">
+            <div class="p-3 border-b border-slate-200/40 dark:border-slate-700/60 flex-shrink-0 bg-slate-50/60 dark:bg-slate-800/70 backdrop-blur-sm z-10 flex items-center justify-between">
               <div>
                 <h3 class="text-sm font-semibold text-slate-700 flex items-center gap-2">
                   <svg class="w-4 h-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
@@ -2427,7 +2502,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
               </div>
             </div>
 
-            <div class="flex-1 min-h-0 relative bg-slate-100 flex flex-col pointer-events-auto">
+            <div class="flex-1 min-h-0 relative bg-slate-100 dark:bg-slate-900/40 flex flex-col pointer-events-auto">
               <div v-if="!currentFileId" class="absolute inset-0 flex items-center justify-center p-6 bg-slate-50/50">
                 <div class="w-full max-w-sm flex flex-col items-center justify-center p-8 border border-slate-200 rounded-2xl bg-white text-center">
                   <svg class="w-12 h-12 text-slate-300 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2475,7 +2550,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                     PDF P{{ sourceView.pdfPageNo }}
                   </span>
                 </div>
-                <div v-if="showPdfViewer" class="rounded-xl border border-slate-200 bg-white overflow-hidden h-[48vh] min-h-[280px]">
+                <div v-if="showPdfViewer" class="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 overflow-hidden h-[48vh] min-h-[280px]">
                   <VirtualPdfViewer
                     :key="`${currentFileId || 'none'}:${sourceView.pdfPageNo || 0}:${sourceView.pdfYRatio ?? 0}`"
                     :source-url="currentPdfSourceUrl"
@@ -2486,7 +2561,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                     @error="handlePdfViewerError"
                   />
                 </div>
-                <div v-else-if="canUseVirtualPdf && selectedNode" class="rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-500">
+                <div v-else-if="canUseVirtualPdf && selectedNode" class="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-3 text-xs text-slate-500 dark:text-slate-300">
                   褰撳墠鑺傜偣缂哄皯 PDF 瀹氫綅閿氱偣锛屽凡鑷姩鍒囨崲鍒板師鏂囩墖娈垫煡鐪嬨€?                </div>
                 <div v-if="sourceView.pdfLoadError" class="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
                   PDF 娓叉煋澶辫触锛歿{ sourceView.pdfLoadError }}
@@ -2497,7 +2572,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                     <span :class="line.in_range ? 'text-emerald-300' : 'text-slate-400'">{{ line.text || ' ' }}</span>
                   </div>
                 </div>
-                <div v-else class="rounded-xl border border-slate-200 bg-white p-4 text-xs text-slate-500">
+                <div v-else class="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 text-xs text-slate-500 dark:text-slate-300">
                   褰撳墠鑺傜偣鏆傛棤鍘熸枃鐗囨鏁版嵁銆?
                 </div>
               </div>
@@ -3044,6 +3119,26 @@ const runSourceIndexRebuild = async (dryRun = false) => {
 .settings-tab-btn:hover {
   color: #1e293b;
   background: #f1f5f9;
+}
+
+:global(.dark) .toolbar-btn {
+  color: #cbd5e1;
+}
+
+:global(.dark) .toolbar-btn:hover {
+  color: #f8fafc;
+  background: rgba(51, 65, 85, 0.75);
+}
+
+:global(.dark) .settings-tab-btn {
+  color: #cbd5e1;
+  border-color: rgba(71, 85, 105, 0.45);
+}
+
+:global(.dark) .settings-tab-btn.active {
+  background: rgba(30, 58, 138, 0.5);
+  color: #dbeafe;
+  border-color: rgba(96, 165, 250, 0.45);
 }
 
 .skeleton-tree-wrap {

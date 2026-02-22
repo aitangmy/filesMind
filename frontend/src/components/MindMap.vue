@@ -67,6 +67,10 @@ const props = defineProps({
   features: {
     type: Object,
     default: () => ({})
+  },
+  darkMode: {
+    type: Boolean,
+    default: false
   }
 });
 
@@ -79,7 +83,6 @@ let resizeObserver = null;
 let fitTimer = null;
 let highlightTimer = null;
 let updateToken = 0;
-let darkThemeEnabled = false;
 let initPromise = null;
 let lastHighlightedNode = null;
 
@@ -220,7 +223,7 @@ const mindMapData = computed(() => {
 const canUseServerPngExport = computed(() => Boolean(props.features?.FEATURE_SERVER_PNG_EXPORT));
 
 const getThemeConfig = () => {
-  if (darkThemeEnabled) {
+  if (props.darkMode) {
     return {
       backgroundColor: '#0f172a',
       lineColor: '#475569',
@@ -750,11 +753,6 @@ const exportPNG = async () => {
   }
 };
 
-const toggleTheme = () => {
-  darkThemeEnabled = !darkThemeEnabled;
-  applyTheme();
-};
-
 const expandAll = () => {
   if (!mindMapInstance.value) return;
   if (typeof mindMapInstance.value.execCommand === 'function') {
@@ -836,11 +834,14 @@ watch(() => props.markdown, () => {
   }
 });
 
+watch(() => props.darkMode, () => {
+  applyTheme();
+});
+
 defineExpose({
   exportMarkdown,
   exportXMind,
   exportPNG,
-  toggleTheme,
   expandAll,
   collapseAll,
   fitView,
@@ -852,7 +853,7 @@ defineExpose({
 </script>
 
 <template>
-  <div ref="containerRef" class="mindmap-host w-full h-full bg-slate-50"></div>
+  <div ref="containerRef" class="mindmap-host w-full h-full bg-slate-50 dark:bg-slate-900"></div>
 </template>
 
 <style scoped>
