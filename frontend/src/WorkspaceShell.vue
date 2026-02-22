@@ -1034,8 +1034,75 @@ const loadTreeForFile = async (fileId) => {
   }
 };
 
-const buildLocalExcerptFromMarkdown = (lineStart, lineEnd, contextLines = 2, maxLines = 120) => {
-  const lines = String(mindmapData.value || '').split('\n');
+const normalizeTopicForMatch = (value) => String(value || '')
+  .replace(/[`*_~#>\[\]\(\)!]/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim()
+  .toLowerCase();
+
+const stripMarkdownPrefix = (line) => String(line || '')
+  .replace(/^\s{0,3}#{1,6}\s+/, '')
+  .replace(/^\s*[-*+]\s+/, '')
+  .replace(/^\s*\d+\.\s+/, '')
+  .trim();
+
+const toPositiveInt = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  const i = Math.floor(n);
+  return i > 0 ? i : 0;
+};
+
+const clampInt = (value, min, max, fallback) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  const i = Math.floor(n);
+  if (i < min) return min;
+  if (i > max) return max;
+  return i;
+};
+
+const resolveLineRangeByTopic = (lines, topic) => {
+  const normalizedTopic = normalizeTopicForMatch(topic);
+  if (!normalizedTopic) return { start: 0, end: 0 };
+
+  let exactAt = 0;
+  let containsAt = 0;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const lineNo = i + 1;
+    const rawLine = String(lines[i] || '');
+    const normalizedLine = normalizeTopicForMatch(rawLine);
+    const normalizedContent = normalizeTopicForMatch(stripMarkdownPrefix(rawLine));
+    if (!exactAt && (normalizedLine === normalizedTopic || normalizedContent === normalizedTopic)) {
+      exactAt = lineNo;
+      break;
+    }
+    if (!containsAt && (
+      normalizedLine.includes(normalizedTopic) ||
+      normalizedContent.includes(normalizedTopic) ||
+      normalizedTopic.includes(normalizedContent)
+    )) {
+      containsAt = lineNo;
+    }
+  }
+
+  const lineNo = exactAt || containsAt;
+  if (!lineNo) return { start: 0, end: 0 };
+  return { start: lineNo, end: lineNo };
+};
+
+const buildLocalExcerptFromMarkdown = (lineStart, lineEnd, topic = '', contextLines = 2, maxLines = 120) => {
+  const markdown = String(mindmapData.value || '');
+  if (!markdown.trim()) {
+    return {
+      lineStart: 0,
+      lineEnd: 0,
+      excerptLines: []
+    };
+  }
+
+  const lines = markdown.split('\n');
   const total = lines.length;
   if (!total) {
     return {
@@ -1045,13 +1112,43 @@ const buildLocalExcerptFromMarkdown = (lineStart, lineEnd, contextLines = 2, max
     };
   }
 
-  const start = Math.min(total, Math.max(1, Number(lineStart) || 1));
-  const end = Math.min(total, Math.max(start, Number(lineEnd) || start));
-  let excerptStart = Math.max(1, start - contextLines);
-  let excerptEnd = Math.min(total, end + contextLines);
+  const context = clampInt(contextLines, 0, 30, 2);
+  const budget = clampInt(maxLines, 1, 300, 120);
 
-  if (excerptEnd - excerptStart + 1 > maxLines) {
-    excerptEnd = Math.min(total, excerptStart + maxLines - 1);
+  let start = toPositiveInt(lineStart);
+  let end = toPositiveInt(lineEnd);
+
+  if (!start && end) start = end;
+  if (!end && start) end = start;
+
+  const hasDirectRange = start >= 1 && start <= total && end >= 1 && end <= total;
+  if (!hasDirectRange) {
+    const matched = resolveLineRangeByTopic(lines, topic);
+    start = matched.start;
+    end = matched.end;
+  }
+
+  if (!(start >= 1 && start <= total && end >= 1 && end <= total)) {
+    return {
+      lineStart: 0,
+      lineEnd: 0,
+      excerptLines: []
+    };
+  }
+
+  start = Math.max(1, Math.min(total, start));
+  end = Math.max(start, Math.min(total, end));
+
+  let excerptStart = Math.max(1, start - context);
+  let excerptEnd = Math.min(total, end + context);
+
+  if (excerptEnd - excerptStart + 1 > budget) {
+    excerptStart = Math.max(1, Math.min(excerptStart, total - budget + 1));
+    excerptEnd = Math.min(total, excerptStart + budget - 1);
+    if (end > excerptEnd) {
+      excerptEnd = Math.min(total, end);
+      excerptStart = Math.max(1, excerptEnd - budget + 1);
+    }
   }
 
   const excerptLines = [];
@@ -1070,7 +1167,7 @@ const buildLocalExcerptFromMarkdown = (lineStart, lineEnd, contextLines = 2, max
   };
 };
 
-const loadNodeSource = async (nodeId) => {
+const loadNodeSource = async (nodeId, fallbackPayload = null) => {
   if (!currentFileId.value || !nodeId) return;
   const requestToken = ++sourceRequestToken;
   const requestedFileId = currentFileId.value;
@@ -1102,6 +1199,28 @@ const loadNodeSource = async (nodeId) => {
     if (requestToken !== sourceRequestToken || currentFileId.value !== requestedFileId) {
       return;
     }
+    const fallback = buildLocalExcerptFromMarkdown(
+      fallbackPayload?.sourceLineStart,
+      fallbackPayload?.sourceLineEnd,
+      fallbackPayload?.topic,
+      2,
+      120
+    );
+    if (fallback.excerptLines.length) {
+      sourceView.value = {
+        loading: false,
+        error: '',
+        topic: fallbackPayload?.topic || '',
+        lineStart: fallback.lineStart,
+        lineEnd: fallback.lineEnd,
+        excerptLines: fallback.excerptLines,
+        parserBackend: 'local-fallback',
+        pdfPageNo: null,
+        pdfYRatio: null,
+        pdfLoadError: ''
+      };
+      return;
+    }
     sourceView.value.loading = false;
     sourceView.value.error = err.message || '鑺傜偣鍘熸枃鍔犺浇澶辫触';
   }
@@ -1109,7 +1228,13 @@ const loadNodeSource = async (nodeId) => {
 
 const handleMindmapNodeClick = async (payload) => {
   if (!payload?.nodeId) {
-    const fallback = buildLocalExcerptFromMarkdown(payload?.sourceLineStart, payload?.sourceLineEnd);
+    const fallback = buildLocalExcerptFromMarkdown(
+      payload?.sourceLineStart,
+      payload?.sourceLineEnd,
+      payload?.topic,
+      2,
+      120
+    );
     selectedNode.value = payload || null;
     sourceView.value = {
       loading: false,
@@ -1126,7 +1251,7 @@ const handleMindmapNodeClick = async (payload) => {
     return;
   }
   selectedNode.value = payload;
-  await loadNodeSource(payload.nodeId);
+  await loadNodeSource(payload.nodeId, payload);
 };
 
 const handlePdfViewerLoaded = () => {
