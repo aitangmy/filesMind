@@ -142,3 +142,35 @@ public struct ParsePageAssessment: Sendable, Equatable {
         self.qualityScore = qualityScore
     }
 }
+
+public enum ImportJobStatus: String, Sendable, Equatable, Codable {
+    case queued
+    case parsing
+    case indexed
+    case failed
+}
+
+public struct ImportJob: Identifiable, Sendable, Equatable, Codable {
+    public let id: UUID
+    public let fileURL: URL
+    public let createdAt: Date
+    public var status: ImportJobStatus
+    public var progress: Double
+    public var message: String?
+
+    public init(
+        id: UUID = UUID(),
+        fileURL: URL,
+        createdAt: Date = Date(),
+        status: ImportJobStatus,
+        progress: Double,
+        message: String? = nil
+    ) {
+        self.id = id
+        self.fileURL = fileURL
+        self.createdAt = createdAt
+        self.status = status
+        self.progress = progress
+        self.message = message
+    }
+}

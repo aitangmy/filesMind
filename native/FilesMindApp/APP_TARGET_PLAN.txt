@@ -1,12 +1,14 @@
-FilesMindApp target plan (Phase 0)
+FilesMindApp target status
 
-- Create Xcode macOS App target: FilesMindApp
-- Link local package at ../Packages
-- Use AppCore.AppBootstrap as composition root
-- Entry scene should include:
-  1) Workspace picker
+Phase 1 completed in Swift Package executable target:
+- Sources/FilesMindApp contains runnable SwiftUI shell.
+- Composition root uses AppCore.AppBootstrap.
+- Entry scene currently includes:
+  1) Workspace picker + bookmark authorization
   2) Import queue panel
-  3) Mind map canvas host
-  4) Model manager onboarding
+  3) Mind map canvas host (QuadTree viewport filtering)
 
-This file is temporary guidance until the Xcode project is generated in next implementation phase.
+Next phase:
+- Generate dedicated Xcode .xcodeproj app target.
+- Wire real document pipeline + model manager onboarding UI.
+- Integrate DesignSystem components and accessibility audit pass.

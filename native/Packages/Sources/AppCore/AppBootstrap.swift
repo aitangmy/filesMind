@@ -17,6 +17,7 @@ public struct AppContainer: Sendable {
     public let pipelineRouter: PipelineRouter
     public let modelManager: ModelManaging
     public let cognitiveEngine: CognitiveEngine
+    public let importQueue: ImportQueue
 
     public init(
         telemetry: Telemetry,
@@ -25,7 +26,8 @@ public struct AppContainer: Sendable {
         searchService: HybridSearchService,
         pipelineRouter: PipelineRouter,
         modelManager: ModelManaging,
-        cognitiveEngine: CognitiveEngine
+        cognitiveEngine: CognitiveEngine,
+        importQueue: ImportQueue
     ) {
         self.telemetry = telemetry
         self.bookmarkManager = bookmarkManager
@@ -34,6 +36,7 @@ public struct AppContainer: Sendable {
         self.pipelineRouter = pipelineRouter
         self.modelManager = modelManager
         self.cognitiveEngine = cognitiveEngine
+        self.importQueue = importQueue
     }
 }
 
@@ -60,6 +63,7 @@ public enum AppBootstrap {
         )
 
         let engine = StubCognitiveEngine(telemetry: telemetry)
+        let importQueue = ImportQueue(telemetry: telemetry)
 
         return AppContainer(
             telemetry: telemetry,
@@ -68,7 +72,8 @@ public enum AppBootstrap {
             searchService: search,
             pipelineRouter: router,
             modelManager: modelManager,
-            cognitiveEngine: engine
+            cognitiveEngine: engine,
+            importQueue: importQueue
         )
     }
 }

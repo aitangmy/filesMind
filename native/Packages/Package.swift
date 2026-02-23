@@ -8,6 +8,7 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
+        .executable(name: "FilesMindApp", targets: ["FilesMindApp"]),
         .library(name: "Domain", targets: ["Domain"]),
         .library(name: "TelemetryKit", targets: ["TelemetryKit"]),
         .library(name: "SecurityKit", targets: ["SecurityKit"]),
@@ -21,6 +22,15 @@ let package = Package(
         .library(name: "AppCore", targets: ["AppCore"])
     ],
     targets: [
+        .executableTarget(
+            name: "FilesMindApp",
+            dependencies: [
+                "AppCore",
+                "Domain",
+                "GraphEngine",
+                "DesignSystem"
+            ]
+        ),
         .target(name: "Domain"),
         .target(name: "TelemetryKit", dependencies: ["Domain"]),
         .target(name: "SecurityKit", dependencies: ["Domain", "TelemetryKit"]),
@@ -46,6 +56,7 @@ let package = Package(
             ]
         ),
         .testTarget(name: "DomainTests", dependencies: ["Domain"]),
+        .testTarget(name: "AppCoreTests", dependencies: ["AppCore", "Domain"]),
         .testTarget(name: "SecurityKitTests", dependencies: ["SecurityKit", "Domain"]),
         .testTarget(name: "GraphEngineTests", dependencies: ["GraphEngine", "Domain"])
     ]
