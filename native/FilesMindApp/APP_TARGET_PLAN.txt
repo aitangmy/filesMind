@@ -1,0 +1,12 @@
+FilesMindApp target plan (Phase 0)
+
+- Create Xcode macOS App target: FilesMindApp
+- Link local package at ../Packages
+- Use AppCore.AppBootstrap as composition root
+- Entry scene should include:
+  1) Workspace picker
+  2) Import queue panel
+  3) Mind map canvas host
+  4) Model manager onboarding
+
+This file is temporary guidance until the Xcode project is generated in next implementation phase.
