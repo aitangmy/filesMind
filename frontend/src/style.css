@@ -232,6 +232,18 @@ body::before {
         color-mix(in srgb, var(--brand-primary-strong) 90%, #fff) 72%,
         color-mix(in srgb, var(--brand-accent) 62%, #fff) 100%
     );
+    box-shadow: 0 0 10px rgba(79, 111, 174, 0.28);
+}
+
+:root.dark .brand-progress,
+:root[data-theme="dark"] .brand-progress {
+    background: linear-gradient(
+        90deg,
+        #7dd3fc 0%,
+        #60a5fa 56%,
+        #a78bfa 100%
+    );
+    box-shadow: 0 0 12px rgba(96, 165, 250, 0.45);
 }
 
 :root.dark .app-shell .text-slate-900,

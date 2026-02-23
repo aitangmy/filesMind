@@ -6,7 +6,86 @@
     <title>FilesMind - Document to MindMap</title>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app" style="width: 100%; height: 100%;"></div>
+    <script>
+      (function () {
+        var bootErrors = [];
+        var record = function (msg) {
+          if (!msg) return;
+          bootErrors.push(String(msg));
+          if (bootErrors.length > 6) bootErrors.shift();
+        };
+
+        window.addEventListener('error', function (event) {
+          var detail = event && (event.message || (event.error && event.error.message));
+          if (detail) record(detail);
+        });
+
+        window.addEventListener('unhandledrejection', function (event) {
+          var reason = event && event.reason;
+          var detail = (reason && (reason.message || reason.stack)) || String(reason || 'unknown rejection');
+          record(detail);
+        });
+
+        setTimeout(function () {
+          var app = document.getElementById('app');
+          if (!app) return;
+          var hasChildren = Boolean(app.children && app.children.length > 0);
+          var textLen = (app.innerText || '').trim().length;
+          var firstNode = app.firstElementChild;
+          var firstStyle = firstNode ? getComputedStyle(firstNode) : getComputedStyle(app);
+          var badge = document.createElement('div');
+          badge.style.cssText = 'position:fixed;left:10px;bottom:10px;z-index:99998;max-width:70vw;padding:6px 8px;border-radius:8px;background:rgba(2,6,23,.72);border:1px solid rgba(148,163,184,.35);color:#cbd5e1;font:11px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;';
+          var childrenMeta = [];
+          if (firstNode && firstNode.children) {
+            for (var i = 0; i < Math.min(firstNode.children.length, 5); i++) {
+              var n = firstNode.children[i];
+              var ns = getComputedStyle(n);
+              var r = n.getBoundingClientRect();
+              childrenMeta.push(
+                n.tagName.toLowerCase()
+                + '[w=' + Math.round(r.width) + ',h=' + Math.round(r.height) + ']'
+                + '[disp=' + ns.display + ',op=' + ns.opacity + ',vis=' + ns.visibility + ']'
+              );
+            }
+          }
+          badge.textContent = 'diag children=' + (app.children ? app.children.length : 0)
+            + ' textLen=' + textLen
+            + ' first=' + (firstNode ? firstNode.className : '(none)')
+            + ' opacity=' + firstStyle.opacity
+            + ' vis=' + firstStyle.visibility
+            + ' disp=' + firstStyle.display
+            + ' kids=' + childrenMeta.join('|');
+          document.body.appendChild(badge);
+          if (hasChildren && textLen > 0) return;
+          if (hasChildren && textLen === 0) {
+            var tip = document.createElement('div');
+            tip.style.cssText = 'position:fixed;right:10px;bottom:10px;z-index:99999;max-width:min(560px,94vw);padding:10px 12px;border-radius:10px;background:rgba(15,23,42,.92);border:1px solid rgba(148,163,184,.4);color:#e2e8f0;font:12px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;white-space:pre-wrap;word-break:break-word;';
+            tip.textContent = [
+              'FilesMind 调试信息',
+              'children=' + (app.children ? app.children.length : 0) + ', textLen=' + textLen,
+              'firstClass=' + (firstNode ? firstNode.className : '(none)'),
+              'display=' + firstStyle.display + ', visibility=' + firstStyle.visibility + ', opacity=' + firstStyle.opacity,
+              'color=' + firstStyle.color + ', background=' + firstStyle.backgroundColor
+            ].join('\n');
+            document.body.appendChild(tip);
+            return;
+          }
+          var details = bootErrors.length
+            ? bootErrors.join('\n')
+            : '入口脚本未完成渲染，请检查资源加载或浏览器引擎兼容性。';
+          app.innerHTML = ''
+            + '<div style="height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#e2e8f0;padding:16px;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
+            + '  <div style="width:min(720px,96vw);border:1px solid rgba(148,163,184,.35);border-radius:14px;background:rgba(30,41,59,.92);padding:16px 18px;">'
+            + '    <div style="font-size:16px;font-weight:700;">FilesMind 启动失败</div>'
+            + '    <div style="margin-top:8px;font-size:12px;color:#cbd5e1;word-break:break-all;">' + location.href + '</div>'
+            + '    <pre style="margin-top:10px;padding:10px;border-radius:10px;background:#0b1220;color:#fca5a5;white-space:pre-wrap;font-size:12px;line-height:1.5;">' + details + '</pre>'
+            + '    <button onclick="location.reload()" style="margin-top:8px;padding:7px 10px;border-radius:10px;border:1px solid rgba(96,165,250,.6);background:rgba(30,58,138,.55);color:#dbeafe;cursor:pointer;">重新加载</button>'
+            + '  </div>'
+            + '</div>';
+        }, 2500);
+      })();
+    </script>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

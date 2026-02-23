@@ -13,8 +13,6 @@ export default defineConfig({
                 manualChunks(id) {
                     if (!id.includes('node_modules')) return;
                     if (id.includes('simple-mind-map/src/plugins/Export')) return 'export-xmind';
-                    if (id.includes('pdfjs-dist')) return 'pdfjs';
-                    if (id.includes('vue-pdf-embed')) return 'pdf-viewer';
                     if (id.includes('simple-mind-map')) return 'mindmap-vendor';
                     return 'vendor';
                 }

@@ -18,6 +18,7 @@ import inspect
 from copy import deepcopy
 from contextlib import asynccontextmanager
 from concurrent.futures import ProcessPoolExecutor
+from difflib import SequenceMatcher
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -39,14 +40,34 @@ def _env_upload_max_bytes(default: int) -> int:
     return parsed
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    if text:
+        logger.warning(f"{name}={raw!r} invalid, fallback={default}")
+    return default
+
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List, Any, Tuple
 from urllib.parse import urlparse
 import shutil
 from cryptography.fernet import Fernet, InvalidToken
+
+try:
+    import orjson as _orjson  # noqa: F401
+    from fastapi.responses import ORJSONResponse
+except Exception:
+    ORJSONResponse = None
 
 _local_filelock_registry_guard = threading.Lock()
 _local_filelock_registry: Dict[str, threading.RLock] = {}
@@ -157,7 +178,12 @@ except Exception:
 
 # 导入扩展模块
 from parser_service import process_pdf_safely, get_parser_runtime_config, update_parser_runtime_config
+from parse_concurrency import get_parse_limiter, resolve_base_parse_workers
+from refine_policy import should_refine_content
 from cognitive_engine import update_client_config, test_connection, set_model, set_account_type
+from runtime_hint import upsert_runtime_hint
+from runtime_env import load_runtime_env, ensure_runtime_dirs
+from sqlite_store import init_sqlite, sqlite_health
 
 
 # ==================== 辅助函数 ====================
@@ -325,36 +351,65 @@ def fallback_chunking(md_content: str, chunk_size: int = 15000) -> list:
 
 
 _parse_process_pool: Optional[ProcessPoolExecutor] = None
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RUNTIME_ENV = load_runtime_env(BASE_DIR)
+ensure_runtime_dirs(RUNTIME_ENV)
+DATA_DIR = RUNTIME_ENV.data_dir
+LOG_DIR = RUNTIME_ENV.log_dir
+SQLITE_DB_PATH = RUNTIME_ENV.sqlite_db_path
+APP_VERSION = RUNTIME_ENV.app_version
+DESKTOP_AUTH_TOKEN = RUNTIME_ENV.auth_token
+_sqlite_bootstrap_status: Dict[str, Any] = {"ok": False, "schema_version": 0, "error": "not_initialized"}
+_startup_warnings: List[str] = []
 
 
 def _parse_pool_max_workers() -> int:
-    raw = os.getenv("FILESMIND_PARSE_WORKERS")
-    if raw:
-        try:
-            parsed = int(raw)
-            if parsed > 0:
-                return parsed
-        except ValueError:
-            logger.warning(f"FILESMIND_PARSE_WORKERS={raw!r} 非法，将使用默认值")
-    cpu_count = os.cpu_count() or 2
-    return max(1, min(4, cpu_count - 1))
+    return resolve_base_parse_workers()
 
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
-    global _parse_process_pool
+    global _parse_process_pool, _sqlite_bootstrap_status
+    parse_workers = _parse_pool_max_workers()
     try:
-        _parse_process_pool = ProcessPoolExecutor(max_workers=_parse_pool_max_workers())
+        _parse_process_pool = ProcessPoolExecutor(max_workers=parse_workers)
+        limiter = get_parse_limiter(parse_workers)
+        logger.info(
+            f"parse pool initialized: workers={parse_workers}, "
+            f"adaptive_limit={limiter.current_limit}"
+        )
     except Exception as exc:
         _parse_process_pool = None
         logger.warning(f"初始化解析进程池失败，将回退默认执行器: {exc}")
+        _startup_warnings.append(f"parse_pool_init_failed: {exc}")
 
     try:
+        try:
+            bootstrap = init_sqlite(SQLITE_DB_PATH)
+            _sqlite_bootstrap_status = {
+                "ok": True,
+                "schema_version": int(bootstrap.get("schema_version", 0)),
+                "db_path": SQLITE_DB_PATH,
+                "applied_migrations": list(bootstrap.get("applied_migrations", [])),
+            }
+            if bootstrap.get("applied_migrations"):
+                logger.info(f"SQLite migrations applied: {bootstrap.get('applied_migrations')}")
+        except Exception as sqlite_exc:
+            _sqlite_bootstrap_status = {
+                "ok": False,
+                "schema_version": 0,
+                "db_path": SQLITE_DB_PATH,
+                "error": str(sqlite_exc),
+            }
+            logger.error(f"SQLite 初始化失败: {sqlite_exc}")
+            _startup_warnings.append(f"sqlite_init_failed: {sqlite_exc}")
+
         try:
             config_store = _load_config_store()
             _apply_runtime_config(config_store)
         except Exception as e:
             logger.warning(f"启动时加载配置失败：{e}")
+            _startup_warnings.append(f"runtime_config_load_failed: {e}")
         yield
     finally:
         if _parse_process_pool is not None:
@@ -362,7 +417,9 @@ async def app_lifespan(_app: FastAPI):
             _parse_process_pool = None
 
 
-app = FastAPI(lifespan=app_lifespan)
+_FASTAPI_DEFAULT_RESPONSE_CLASS = ORJSONResponse or JSONResponse
+
+app = FastAPI(lifespan=app_lifespan, default_response_class=_FASTAPI_DEFAULT_RESPONSE_CLASS)
 
 
 @app.exception_handler(Exception)
@@ -376,9 +433,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # ==================== 配置管理 ====================
 # 使用绝对路径，确保在任何目录启动都能找到配置
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, "data", "config.json")
-CONFIG_KEY_FILE = os.path.join(BASE_DIR, "data", "config.key")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+CONFIG_KEY_FILE = os.path.join(DATA_DIR, "config.key")
 MASKED_SECRET = "***"
 CONFIG_SCHEMA_VERSION = 3
 ENCRYPTION_PREFIX = "enc:v1:"
@@ -451,6 +507,7 @@ class ParserSettingsPayload(BaseModel):
     hybrid_switch_min_delta: float = 2.0
     hybrid_marker_min_length: int = 200
     marker_prefer_api: bool = False
+    hf_endpoint_region: str = "global"
     task_timeout_seconds: int = 600
 
 
@@ -516,6 +573,17 @@ class SourceIndexRebuildPayload(BaseModel):
     verbose: bool = False
 
 
+class RuntimeHintPayload(BaseModel):
+    platform: Optional[str] = None
+    thermal_level: Optional[str] = None
+    cpu_speed_limit: Optional[int] = None
+    scheduler_limit: Optional[int] = None
+    available_cpus: Optional[int] = None
+    low_power_mode: Optional[bool] = None
+    source: Optional[str] = None
+    timestamp_ms: Optional[int] = None
+
+
 MIN_TASK_TIMEOUT_SECONDS = 60
 MAX_TASK_TIMEOUT_SECONDS = 7200
 DEFAULT_TASK_TIMEOUT_SECONDS = 600
@@ -532,6 +600,8 @@ MAX_ENGINE_MAX_TOKENS = 16000
 DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_UPLOAD_BYTES = _env_upload_max_bytes(DEFAULT_MAX_UPLOAD_BYTES)
 UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+DEFAULT_TASK_STATUS_INCLUDE_RESULT = _env_bool("FILESMIND_TASK_STATUS_INCLUDE_RESULT_DEFAULT", False)
+DEFAULT_UPLOAD_DUPLICATE_INCLUDE_MD = _env_bool("FILESMIND_UPLOAD_DUPLICATE_INCLUDE_MD", False)
 
 
 class UploadSizeExceededError(ValueError):
@@ -595,6 +665,7 @@ def _default_parser_config() -> Dict[str, Any]:
         "hybrid_switch_min_delta": float(runtime.get("hybrid_switch_min_delta", 2.0)),
         "hybrid_marker_min_length": int(runtime.get("hybrid_marker_min_length", 200)),
         "marker_prefer_api": bool(runtime.get("marker_prefer_api", False)),
+        "hf_endpoint_region": str(runtime.get("hf_endpoint_region", "global")).strip().lower() or "global",
         "task_timeout_seconds": int(get_task_timeout_seconds_runtime()),
     }
 
@@ -811,6 +882,13 @@ def _validate_parser_config(parser: Any, field_prefix: str = "parser") -> Dict[s
         marker_prefer_api = marker_prefer_api_raw
     else:
         marker_prefer_api = str(marker_prefer_api_raw).strip().lower() in {"1", "true", "yes", "on"}
+    hf_endpoint_region = str(parser.get("hf_endpoint_region", "global")).strip().lower() or "global"
+    if hf_endpoint_region not in {"global", "cn"}:
+        raise ConfigValidationError(
+            "INVALID_HF_ENDPOINT_REGION",
+            "HF Endpoint 地区仅支持 global / cn",
+            f"{field_prefix}.hf_endpoint_region",
+        )
 
     return {
         "parser_backend": backend,
@@ -819,6 +897,7 @@ def _validate_parser_config(parser: Any, field_prefix: str = "parser") -> Dict[s
         "hybrid_switch_min_delta": _as_float("hybrid_switch_min_delta", 0.0, 50.0, 2.0),
         "hybrid_marker_min_length": _as_int("hybrid_marker_min_length", 0, 1000000, 200),
         "marker_prefer_api": marker_prefer_api,
+        "hf_endpoint_region": hf_endpoint_region,
         "task_timeout_seconds": _as_int(
             "task_timeout_seconds",
             MIN_TASK_TIMEOUT_SECONDS,
@@ -1208,6 +1287,7 @@ def _apply_runtime_config(config_store: Dict[str, Any]):
     logger.info(
         f"配置已应用: profile={profile.get('name')} ({profile.get('provider')}), "
         f"parser_backend={parser_config.get('parser_backend')}, "
+        f"hf_endpoint_region={parser_config.get('hf_endpoint_region')}, "
         f"task_timeout={parser_config.get('task_timeout_seconds')}s, "
         f"engine_concurrency={advanced_config.get('engine_concurrency')}, "
         f"engine_temperature={advanced_config.get('engine_temperature')}"
@@ -1253,17 +1333,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+_OPEN_AUTH_PATH_PREFIXES = ("/health", "/ready", "/version", "/docs", "/openapi.json", "/redoc")
+
+
+def _is_auth_exempt_path(path: str) -> bool:
+    for prefix in _OPEN_AUTH_PATH_PREFIXES:
+        if path == prefix or path.startswith(f"{prefix}/"):
+            return True
+    return False
+
+
+@app.middleware("http")
+async def auth_token_middleware(request: Request, call_next):
+    if not DESKTOP_AUTH_TOKEN or _is_auth_exempt_path(request.url.path):
+        return await call_next(request)
+    token = request.headers.get("X-FilesMind-Token", "").strip()
+    if token != DESKTOP_AUTH_TOKEN:
+        return JSONResponse(
+            status_code=401,
+            content={"success": False, "code": "UNAUTHORIZED", "message": "Missing or invalid desktop auth token"},
+        )
+    return await call_next(request)
+
 from fastapi.staticfiles import StaticFiles
 
 # ==================== 目录定义 ====================
 # 文件存储目录 - 使用绝对路径
-# BASE_DIR 已在配置管理部分定义
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# DATA_DIR 已由 runtime_env 注入，默认 backend/data，可被 FILESMIND_DATA_DIR 覆盖
 PDF_DIR = os.path.join(DATA_DIR, "pdfs")
 MD_DIR = os.path.join(DATA_DIR, "mds")
 IMAGES_DIR = os.path.join(DATA_DIR, "images")  # 新增图片目录
 SOURCE_MD_DIR = os.path.join(DATA_DIR, "source_mds")
 SOURCE_INDEX_DIR = os.path.join(DATA_DIR, "source_indexes")
+SOURCE_LINE_MAP_DIR = os.path.join(DATA_DIR, "source_line_maps")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 
 # 确保目录存在
@@ -1272,6 +1375,7 @@ os.makedirs(MD_DIR, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)
 os.makedirs(SOURCE_MD_DIR, exist_ok=True)
 os.makedirs(SOURCE_INDEX_DIR, exist_ok=True)
+os.makedirs(SOURCE_LINE_MAP_DIR, exist_ok=True)
 
 # 挂载静态图片目录 (Step 2)
 app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
@@ -1507,6 +1611,34 @@ def get_task(task_id: str) -> Optional["Task"]:
     return tasks.get(task_id)
 
 
+def _update_history_task_link(file_id: str, task_id: str):
+    if not file_id:
+        return
+    with _history_lock:
+        with FileLock(_history_lock_file()):
+            history = _load_history_sync_unlocked()
+            updated = False
+            for item in history:
+                if item.get("file_id") != file_id:
+                    continue
+                if item.get("task_id") == task_id:
+                    return
+                item["task_id"] = task_id
+                updated = True
+                break
+            if updated:
+                _save_history_sync(history)
+
+
+def _find_active_task_for_file(file_id: str) -> Optional["Task"]:
+    candidates = [t for t in tasks.values() if t.file_id == file_id]
+    if not candidates:
+        return None
+    non_terminal = [t for t in candidates if t.status not in TERMINAL_TASK_STATUSES]
+    pool = non_terminal or candidates
+    return max(pool, key=lambda t: str(t.started_at or ""))
+
+
 # ==================== 文件 Hash ====================
 
 
@@ -1630,6 +1762,210 @@ def _source_index_path(file_id: str) -> str:
     return os.path.join(SOURCE_INDEX_DIR, f"{file_id}.json")
 
 
+def _source_line_map_path(file_id: str) -> str:
+    return os.path.join(SOURCE_LINE_MAP_DIR, f"{file_id}.json")
+
+
+def _pdf_index_path(file_id: str) -> str:
+    return os.path.join(DATA_DIR, f"{file_id}_pdf_index.json")
+
+
+_ANCHOR_TOPIC_FILTER_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
+
+
+def _normalize_anchor_topic(value: Any) -> str:
+    text = str(value or "")
+    text = html.unescape(text)
+    text = _ANCHOR_TOPIC_FILTER_RE.sub("", text).strip().lower()
+    return text
+
+
+def _safe_pdf_y_ratio(item: Dict[str, Any]) -> Optional[float]:
+    bbox = item.get("bbox")
+    page_height = item.get("page_height")
+    if not isinstance(bbox, dict) or page_height in (None, 0):
+        return None
+    try:
+        page_height_f = float(page_height)
+        if page_height_f <= 0:
+            return None
+        origin = str(bbox.get("coord_origin", "BOTTOMLEFT")).upper().replace("_", "")
+        t_raw = bbox.get("t", bbox.get("top", None))
+        if t_raw is None:
+            return None
+        t_coord = float(t_raw)
+        if origin in {"BOTTOMLEFT", "BOTTOMRIGHT"}:
+            y_ratio = 1.0 - (t_coord / page_height_f)
+        else:
+            y_ratio = t_coord / page_height_f
+        return round(max(0.0, min(1.0, y_ratio)), 4)
+    except Exception:
+        return None
+
+
+def _load_pdf_index_entries(file_id: str) -> List[Dict[str, Any]]:
+    path = _pdf_index_path(file_id)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+    except Exception as exc:
+        logger.debug(f"读取 PDF 索引失败（{file_id}）：{exc}")
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            page_no = int(item.get("page_no", 0))
+        except Exception:
+            continue
+        if page_no <= 0:
+            continue
+        normalized = _normalize_anchor_topic(item.get("text", ""))
+        if not normalized:
+            continue
+        entries.append(
+            {
+                "normalized": normalized,
+                "page_no": page_no,
+                "y_ratio": _safe_pdf_y_ratio(item),
+            }
+        )
+    return entries
+
+
+def _best_pdf_anchor_for_topic(topic: str, entries: List[Dict[str, Any]]) -> Optional[Tuple[int, Optional[float]]]:
+    normalized_topic = _normalize_anchor_topic(topic)
+    if not normalized_topic:
+        return None
+
+    best_score = 0.0
+    best_hit: Optional[Tuple[int, Optional[float]]] = None
+    min_len = max(2, len(normalized_topic) // 2)
+    max_len = max(120, len(normalized_topic) * 4)
+    first_char = normalized_topic[0]
+
+    for item in entries:
+        candidate = item.get("normalized", "")
+        if not candidate:
+            continue
+        if len(candidate) < min_len or len(candidate) > max_len:
+            continue
+
+        score = 0.0
+        if candidate == normalized_topic:
+            score = 1.0
+        elif candidate.startswith(normalized_topic) or normalized_topic.startswith(candidate):
+            overlap = min(len(candidate), len(normalized_topic)) / max(len(candidate), len(normalized_topic))
+            score = 0.95 * overlap
+        elif normalized_topic in candidate or candidate in normalized_topic:
+            overlap = min(len(candidate), len(normalized_topic)) / max(len(candidate), len(normalized_topic))
+            score = 0.82 * overlap
+        elif candidate[0] == first_char:
+            ratio = SequenceMatcher(None, normalized_topic, candidate).ratio()
+            if ratio >= 0.70:
+                score = ratio * 0.80
+
+        if score > best_score:
+            best_score = score
+            best_hit = (int(item["page_no"]), item.get("y_ratio"))
+
+    if best_score < 0.68:
+        return None
+    return best_hit
+
+
+def _enrich_index_with_pdf_anchors(
+    file_id: str, source_index: Dict[str, Any], parser_backend: Optional[str] = None
+) -> Tuple[Dict[str, Any], bool]:
+    if not isinstance(source_index, dict):
+        return source_index, False
+
+    flat_nodes_raw = source_index.get("flat_nodes", [])
+    if not isinstance(flat_nodes_raw, list):
+        return source_index, False
+
+    entries = _load_pdf_index_entries(file_id)
+    if not entries:
+        return source_index, False
+
+    topic_cache: Dict[str, Optional[Tuple[int, Optional[float]]]] = {}
+    assigned: Dict[str, Tuple[int, Optional[float]]] = {}
+    changed = False
+    existing_anchor_count = sum(
+        1 for item in flat_nodes_raw if isinstance(item, dict) and item.get("pdf_page_no") is not None
+    )
+
+    for node in flat_nodes_raw:
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("node_id", "")).strip()
+        if not node_id or node_id == "root":
+            continue
+        if node.get("pdf_page_no") is not None:
+            continue
+
+        topic = str(node.get("topic", "")).strip()
+        if not topic:
+            continue
+
+        if topic not in topic_cache:
+            topic_cache[topic] = _best_pdf_anchor_for_topic(topic, entries)
+        match = topic_cache[topic]
+        if not match:
+            continue
+
+        page_no, y_ratio = match
+        node["pdf_page_no"] = page_no
+        node["pdf_y_ratio"] = y_ratio
+        assigned[node_id] = (page_no, y_ratio)
+        changed = True
+
+    has_any_anchor = existing_anchor_count > 0 or changed
+    if not has_any_anchor:
+        return source_index, False
+
+    tree = source_index.get("tree")
+    if isinstance(tree, dict):
+        stack: List[Dict[str, Any]] = [tree]
+        while stack:
+            node = stack.pop()
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("node_id", "")).strip()
+            if node_id in assigned:
+                page_no, y_ratio = assigned[node_id]
+                node["pdf_page_no"] = page_no
+                node["pdf_y_ratio"] = y_ratio
+            children = node.get("children", [])
+            if isinstance(children, list):
+                for child in children:
+                    if isinstance(child, dict):
+                        stack.append(child)
+
+    source_index["flat_nodes"] = flat_nodes_raw
+    source_index["node_index"] = {
+        str(item.get("node_id", "")): item for item in flat_nodes_raw if isinstance(item, dict) and item.get("node_id")
+    }
+
+    capabilities_raw = source_index.get("capabilities", {})
+    capabilities = capabilities_raw if isinstance(capabilities_raw, dict) else {}
+    old_precise = bool(capabilities.get("has_precise_anchor", False))
+    capabilities["anchor_version"] = str(capabilities.get("anchor_version", "1.1"))
+    capabilities["has_precise_anchor"] = True
+    if parser_backend:
+        capabilities["parser_backend"] = parser_backend
+    else:
+        capabilities["parser_backend"] = str(capabilities.get("parser_backend", "unknown"))
+    source_index["capabilities"] = capabilities
+    return source_index, changed or not old_precise
+
+
 def _serialize_tree_for_ui(root_node) -> Dict[str, Any]:
     return {
         "node_id": root_node.id,
@@ -1667,14 +2003,22 @@ def _flatten_ui_tree(tree: Dict[str, Any]) -> List[Dict[str, Any]]:
     return flattened
 
 
-def _persist_source_index(file_id: str, root_node, source_md_path: str, parser_backend: str = "unknown"):
+def _persist_source_index(
+    file_id: str,
+    root_node,
+    source_md_path: str,
+    parser_backend: str = "unknown",
+    source_line_map_path: Optional[str] = None,
+):
     tree_payload = _serialize_tree_for_ui(root_node)
     flat_nodes = _flatten_ui_tree(tree_payload)
     index_payload = {
-        "version": 1,
+        "version": 2,
         "file_id": file_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_md_path": source_md_path,
+        "source_line_map_path": source_line_map_path,
+        "line_system": "normalized_v1",
         "tree": tree_payload,
         "flat_nodes": flat_nodes,
         "node_index": {item["node_id"]: item for item in flat_nodes},
@@ -1684,6 +2028,7 @@ def _persist_source_index(file_id: str, root_node, source_md_path: str, parser_b
             "parser_backend": parser_backend,
         },
     }
+    index_payload, _ = _enrich_index_with_pdf_anchors(file_id, index_payload, parser_backend=parser_backend)
     index_path = _source_index_path(file_id)
     _atomic_write_json(index_path, index_payload)
     return index_payload
@@ -1693,7 +2038,7 @@ _MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _MD_LIST_RE = re.compile(r"^(?P<indent>\s*)(?P<marker>[-*+]|\d+[.)])\s+(?P<body>\S.*)$")
 _MD_NUMERIC_RE = re.compile(r"^(\d+(?:\.\d+)*)\s*[\.、):：-]\s*(.+)$")
 _MD_TABLE_RULE_RE = re.compile(r"^\s*\|?[\-:\s]{3,}\|[\-:\s|]+\s*$")
-_MD_ANCHOR_RE = re.compile(r"<!--\s*fm_anchor:.*?-->", flags=re.IGNORECASE)
+_MD_ANCHOR_RE = re.compile(r"<!--\s*fm(?:\\)?_anchor:.*?-->|&lt;!--\s*fm(?:\\)?_anchor:.*?--&gt;", flags=re.IGNORECASE)
 _MD_CONFIDENCE_RE = re.compile(r"<!--\s*fm-confidence\s*:\s*[+-]?\d+(?:\.\d+)?\s*-->", flags=re.IGNORECASE)
 _MD_STRONG_RE = re.compile(r"(\*\*|__|`|~~)")
 _MD_LINK_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)|\[([^\]]+)\]\([^)]*\)")
@@ -1709,6 +2054,89 @@ def _build_source_markdown(markdown: str) -> str:
     """
     content = _MD_ANCHOR_RE.sub("", str(markdown or ""))
     return _MD_CONFIDENCE_RE.sub("", content)
+
+
+def _build_source_markdown_bundle(markdown: str) -> Tuple[str, List[int]]:
+    """
+    Build normalized source markdown and line map.
+    Returned line map uses 1-based mapping:
+    normalized_line_no -> original_markdown_line_no
+    """
+    text = str(markdown or "")
+    preprocessed = text
+    norm_to_raw: List[int] = list(range(1, len(text.split("\n")) + 1))
+
+    try:
+        from structure_utils import preprocess_markdown_with_map
+
+        preprocessed, norm_to_raw = preprocess_markdown_with_map(text)
+    except Exception:
+        try:
+            from structure_utils import preprocess_markdown
+
+            preprocessed = preprocess_markdown(text)
+            norm_to_raw = list(range(1, len(preprocessed.split("\n")) + 1))
+        except Exception:
+            preprocessed = text
+            norm_to_raw = list(range(1, len(text.split("\n")) + 1))
+
+    source_md = _build_source_markdown(preprocessed)
+    return source_md, [int(max(1, int(v))) for v in norm_to_raw]
+
+
+def _write_source_line_map(file_id: str, norm_to_raw: List[int]) -> str:
+    path = _source_line_map_path(file_id)
+    payload = {
+        "version": 1,
+        "file_id": file_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "line_system": "normalized_v1",
+        "norm_to_raw": [int(max(1, int(v))) for v in (norm_to_raw or [])],
+    }
+    _atomic_write_json(path, payload)
+    return path
+
+
+def _read_source_line_map(path: str) -> List[int]:
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("norm_to_raw", [])
+        if not isinstance(raw, list):
+            return []
+        normalized: List[int] = []
+        for value in raw:
+            try:
+                normalized.append(max(1, int(value)))
+            except (TypeError, ValueError):
+                normalized.append(1)
+        return normalized
+    except Exception:
+        return []
+
+
+def _line_map_norm_to_raw(source_index: Dict[str, Any], file_id: str, total_norm_lines: int) -> List[int]:
+    path = str(source_index.get("source_line_map_path") or _source_line_map_path(file_id))
+    mapping = _read_source_line_map(path)
+    if not mapping:
+        return [i for i in range(1, max(0, int(total_norm_lines)) + 1)]
+    if len(mapping) < total_norm_lines:
+        mapping.extend(range(len(mapping) + 1, total_norm_lines + 1))
+    elif len(mapping) > total_norm_lines:
+        mapping = mapping[:total_norm_lines]
+    return mapping
+
+
+def _map_norm_line_to_raw(line_no_norm: int, norm_to_raw: List[int]) -> Optional[int]:
+    try:
+        idx = int(line_no_norm) - 1
+    except (TypeError, ValueError):
+        return None
+    if idx < 0 or idx >= len(norm_to_raw):
+        return None
+    return int(norm_to_raw[idx])
 
 
 def _clean_markdown_topic(raw: str) -> str:
@@ -1845,7 +2273,12 @@ def _collect_markdown_structure_entries(file_id: str, markdown: str) -> List[Dic
     return entries
 
 
-def _build_index_from_markdown_headings(file_id: str, markdown: str, source_md_path: str) -> Dict[str, Any]:
+def _build_index_from_markdown_headings(
+    file_id: str,
+    markdown: str,
+    source_md_path: str,
+    source_line_map_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     兼容旧数据：按 Markdown 结构构建索引。
     优先标题；标题不足时补充列表/编号大纲，避免 tree 退化成单节点。
@@ -1896,14 +2329,21 @@ def _build_index_from_markdown_headings(file_id: str, markdown: str, source_md_p
         for item in entries
     ]
     return {
-        "version": 1,
+        "version": 2,
         "file_id": file_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_md_path": source_md_path,
+        "source_line_map_path": source_line_map_path,
+        "line_system": "normalized_v1",
         "tree": root,
         "flat_nodes": flat_nodes,
         "node_index": {item["node_id"]: item for item in flat_nodes},
         "index_mode": "markdown_outline_v2",
+        "capabilities": {
+            "anchor_version": "1.0",
+            "has_precise_anchor": False,
+            "parser_backend": "unknown",
+        },
     }
 
 
@@ -2040,8 +2480,18 @@ def rebuild_source_indexes_batch(
 
             source_md_path = _source_md_path(file_id)
             source_md = _build_source_markdown(markdown)
-            _atomic_write_text(source_md_path, source_md)
-            rebuilt_index = _build_index_from_markdown_headings(file_id, markdown, source_md_path)
+            norm_to_raw = list(range(1, len(source_md.splitlines()) + 1))
+            source_line_map_path = _source_line_map_path(file_id)
+            if not dry_run:
+                _atomic_write_text(source_md_path, source_md)
+                source_line_map_path = _write_source_line_map(file_id, norm_to_raw)
+            rebuilt_index = _build_index_from_markdown_headings(
+                file_id,
+                markdown,
+                source_md_path,
+                source_line_map_path=source_line_map_path,
+            )
+            rebuilt_index, _ = _enrich_index_with_pdf_anchors(file_id, rebuilt_index)
             new_nodes = _count_source_index_nodes(rebuilt_index)
             index_mode = str(rebuilt_index.get("index_mode", "unknown"))
 
@@ -2114,6 +2564,39 @@ def _load_source_index(file_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _source_index_line_system_ready(file_id: str, source_index: Dict[str, Any]) -> bool:
+    if not isinstance(source_index, dict):
+        return False
+    line_system = str(source_index.get("line_system", "")).strip().lower()
+    if line_system != "normalized_v1":
+        return False
+    source_md_path = str(source_index.get("source_md_path") or _source_md_path(file_id)).strip()
+    source_line_map_path = str(source_index.get("source_line_map_path") or _source_line_map_path(file_id)).strip()
+    if not source_md_path or not os.path.exists(source_md_path):
+        return False
+    if not source_line_map_path or not os.path.exists(source_line_map_path):
+        return False
+    return True
+
+
+def _sync_source_artifacts_from_markdown(file_id: str, markdown: str, source_index: Dict[str, Any]) -> Dict[str, Any]:
+    source_md_path = _source_md_path(file_id)
+    source_md, norm_to_raw = _build_source_markdown_bundle(markdown)
+    _atomic_write_text(source_md_path, source_md)
+    source_line_map_path = _write_source_line_map(file_id, norm_to_raw)
+
+    source_index = dict(source_index or {})
+    try:
+        current_version = int(source_index.get("version", 1) or 1)
+    except (TypeError, ValueError):
+        current_version = 1
+    source_index["version"] = max(2, current_version)
+    source_index["source_md_path"] = source_md_path
+    source_index["source_line_map_path"] = source_line_map_path
+    source_index["line_system"] = "normalized_v1"
+    return source_index
+
+
 def _rebuild_source_index_from_markdown(file_id: str, markdown_path: str) -> Dict[str, Any]:
     if not os.path.exists(markdown_path):
         raise FileNotFoundError(f"Markdown 文件不存在: {markdown_path}")
@@ -2123,9 +2606,17 @@ def _rebuild_source_index_from_markdown(file_id: str, markdown_path: str) -> Dic
 
     source_md_path = _source_md_path(file_id)
     source_md = _build_source_markdown(markdown)
+    norm_to_raw = list(range(1, len(source_md.splitlines()) + 1))
     _atomic_write_text(source_md_path, source_md)
+    source_line_map_path = _write_source_line_map(file_id, norm_to_raw)
 
-    rebuilt = _build_index_from_markdown_headings(file_id, markdown, source_md_path)
+    rebuilt = _build_index_from_markdown_headings(
+        file_id,
+        markdown,
+        source_md_path,
+        source_line_map_path=source_line_map_path,
+    )
+    rebuilt, _ = _enrich_index_with_pdf_anchors(file_id, rebuilt)
     index_path = _source_index_path(file_id)
     _atomic_write_json(index_path, rebuilt)
     return rebuilt
@@ -2135,6 +2626,21 @@ def _ensure_source_index(file_id: str, markdown_path: str) -> Dict[str, Any]:
     source_index = _load_source_index(file_id)
     if source_index:
         capabilities = source_index.get("capabilities", {}) if isinstance(source_index, dict) else {}
+        if not bool(capabilities.get("has_precise_anchor", False)):
+            source_index, enriched = _enrich_index_with_pdf_anchors(file_id, source_index)
+            if enriched:
+                _atomic_write_json(_source_index_path(file_id), source_index)
+                capabilities = source_index.get("capabilities", {}) if isinstance(source_index, dict) else {}
+
+        if not _source_index_line_system_ready(file_id, source_index):
+            try:
+                with open(markdown_path, "r", encoding="utf-8") as f:
+                    markdown = f.read()
+                source_index = _sync_source_artifacts_from_markdown(file_id, markdown, source_index)
+                _atomic_write_json(_source_index_path(file_id), source_index)
+            except Exception as exc:
+                logger.warning(f"同步 source 行号体系失败，沿用旧索引: file_id={file_id}, err={exc}")
+
         # 对于带精确锚点的索引，优先保留，避免重建丢失 PDF 精确定位信息。
         if bool(capabilities.get("has_precise_anchor", False)):
             return source_index
@@ -2209,10 +2715,18 @@ async def _process_document_task_legacy(
         # CPU 密集任务优先使用进程池，避免阻塞事件循环
         import functools
 
-        md_content, image_map = await loop.run_in_executor(
-            _parse_process_pool,
-            functools.partial(process_pdf_safely, file_location, output_dir=MD_DIR, file_id=file_id),
-        )
+        parse_limiter = get_parse_limiter(_parse_pool_max_workers())
+        async with parse_limiter.slot() as limiter_state:
+            task.message = (
+                "正在解析 PDF 文档..."
+                if str(limiter_state.get("runtime", {}).get("thermal_level", "unknown")) in {"nominal", "unknown"}
+                else f"正在解析 PDF 文档（{limiter_state.get('runtime', {}).get('thermal_level')} 热状态限流）..."
+            )
+            commit_state()
+            md_content, image_map = await loop.run_in_executor(
+                _parse_process_pool,
+                functools.partial(process_pdf_safely, file_location, output_dir=MD_DIR, file_id=file_id),
+            )
         ensure_task_active()
 
         if not md_content:
@@ -2243,18 +2757,24 @@ async def _process_document_task_legacy(
         settings = get_parser_runtime_config()
         parser_backend = str(settings.get("parser_backend", "docling")).lower()
 
-        # Phase 2 End: strip parser sidecar comments only; never fold blank lines.
+        # Phase 2 End: persist normalized source markdown + line map.
         source_md_path = _source_md_path(file_id)
-        source_md = _build_source_markdown(md_for_tree)
+        source_md, norm_to_raw = _build_source_markdown_bundle(md_for_tree)
         _atomic_write_text(source_md_path, source_md)
+        source_line_map_path = _write_source_line_map(file_id, norm_to_raw)
 
-        _persist_source_index(file_id, root_node, source_md_path, parser_backend)
+        _persist_source_index(
+            file_id,
+            root_node,
+            source_md_path,
+            parser_backend,
+            source_line_map_path=source_line_map_path,
+        )
 
         nodes_to_refine = []
 
         def collect_nodes(node):
-            content_len = len(node.full_content)
-            if content_len > 50:
+            if getattr(node, "level", 0) > 0 and should_refine_content(node.full_content):
                 nodes_to_refine.append(node)
             for child in node.children:
                 collect_nodes(child)
@@ -2658,8 +3178,14 @@ def _get_history_record(file_id: str) -> Optional[Dict[str, Any]]:
     return next((item for item in history if item.get("file_id") == file_id), None)
 
 
-@app.post("/upload", response_model=UploadResponse)
-async def upload_document(file: UploadFile = File(...)):
+def _resolve_duplicate_md_inclusion(include_existing_md: Optional[bool]) -> bool:
+    if include_existing_md is None:
+        return DEFAULT_UPLOAD_DUPLICATE_INCLUDE_MD
+    return bool(include_existing_md)
+
+
+@app.post("/upload", response_model=UploadResponse, response_model_exclude_none=True)
+async def upload_document(file: UploadFile = File(...), include_existing_md: Optional[bool] = None):
     """
     上传文档，创建异步任务
     """
@@ -2714,6 +3240,8 @@ async def upload_document(file: UploadFile = File(...)):
     finally:
         await file.close()
 
+    include_existing_md_flag = _resolve_duplicate_md_inclusion(include_existing_md)
+
     # 计算文件 Hash
     file_hash = get_file_hash(temp_file)
     logger.info(f"文件 Hash: {file_hash}")
@@ -2728,9 +3256,8 @@ async def upload_document(file: UploadFile = File(...)):
             # 删除临时文件
             os.remove(temp_file)
 
-            # 获取已存在的 MD
-            existing_md = ""
-            if os.path.exists(existing["md_path"]):
+            existing_md: Optional[str] = None
+            if include_existing_md_flag and os.path.exists(existing["md_path"]):
                 with open(existing["md_path"], "r", encoding="utf-8") as f:
                     existing_md = f.read()
 
@@ -2850,55 +3377,78 @@ async def upload_document(file: UploadFile = File(...)):
     return UploadResponse(task_id=task_id, file_id=file_id, status="processing", message="任务已创建，正在处理...")
 
 
-@app.get("/task/{task_id}", response_model=TaskResponse)
-async def get_task_status(task_id: str):
+def _resolve_task_result_inclusion(include_result: Optional[bool]) -> bool:
+    if include_result is None:
+        return DEFAULT_TASK_STATUS_INCLUDE_RESULT
+    return bool(include_result)
+
+
+def _normalize_failure_details(value: Any) -> Optional[List[Dict[str, str]]]:
+    if isinstance(value, list) and value:
+        return value
+    return None
+
+
+@app.get("/task/{task_id}", response_model=TaskResponse, response_model_exclude_none=True)
+async def get_task_status(task_id: str, include_result: Optional[bool] = None):
     """
     获取任务状态，支持重启后查询
     """
     task = get_task(task_id)
+    include_result_flag = _resolve_task_result_inclusion(include_result)
 
     if not task:
         snapshot = _load_task_snapshot(task_id)
         if not snapshot:
             logger.warning(f"任务不存在：{task_id}")
             raise HTTPException(status_code=404, detail="任务不存在")
-        return TaskResponse(
-            task_id=str(snapshot.get("task_id", task_id)),
-            file_id=snapshot.get("file_id"),
-            status=str(snapshot.get("status", TaskStatus.PENDING.value)),
-            progress=int(snapshot.get("progress", 0)),
-            message=str(snapshot.get("message", "")),
-            result=snapshot.get("result"),
-            error=snapshot.get("error"),
-            failure_details=snapshot.get("failure_details"),
-        )
+        return _task_response_from_snapshot(task_id, snapshot, include_result=include_result_flag)
 
+    return _task_response_from_runtime(task, include_result=include_result_flag)
+
+
+def _parse_cancel_reason(payload: Any) -> str:
+    reason = "已手动取消"
+    if isinstance(payload, dict):
+        custom = str(payload.get("reason", "")).strip()
+        if custom:
+            reason = custom[:200]
+    return reason
+
+
+def _task_response_from_snapshot(
+    task_id: str,
+    snapshot: Dict[str, Any],
+    file_id: Optional[str] = None,
+    include_result: bool = False,
+) -> TaskResponse:
     return TaskResponse(
-        task_id=task.task_id,
-        file_id=task.file_id,
-        status=_task_status_value(task.status),
-        progress=task.progress,
-        message=task.message,
-        result=task.result,
-        error=task.error,
-        failure_details=task.failure_details,
+        task_id=str(snapshot.get("task_id", task_id)),
+        file_id=file_id or snapshot.get("file_id"),
+        status=str(snapshot.get("status", TaskStatus.PENDING.value)),
+        progress=int(snapshot.get("progress", 0)),
+        message=str(snapshot.get("message", "")),
+        result=snapshot.get("result") if include_result else None,
+        error=snapshot.get("error"),
+        failure_details=_normalize_failure_details(snapshot.get("failure_details")),
     )
 
 
-@app.post("/task/{task_id}/cancel")
-async def cancel_task(task_id: str, request: Request):
-    """取消正在执行的任务。"""
-    task = get_task(task_id)
-    reason = "已手动取消"
-    try:
-        payload = await request.json()
-        if isinstance(payload, dict):
-            custom = str(payload.get("reason", "")).strip()
-            if custom:
-                reason = custom[:200]
-    except Exception:
-        pass
+def _task_response_from_runtime(task: "Task", file_id: Optional[str] = None, include_result: bool = False) -> TaskResponse:
+    return TaskResponse(
+        task_id=task.task_id,
+        file_id=file_id or task.file_id,
+        status=_task_status_value(task.status),
+        progress=int(task.progress or 0),
+        message=str(task.message or ""),
+        result=task.result if include_result else None,
+        error=task.error,
+        failure_details=_normalize_failure_details(task.failure_details),
+    )
 
+
+def _cancel_task_internal(task_id: str, reason: str) -> Dict[str, Any]:
+    task = get_task(task_id)
     if not task:
         snapshot = _load_task_snapshot(task_id)
         if not snapshot:
@@ -2940,6 +3490,113 @@ async def cancel_task(task_id: str, request: Request):
     }
 
 
+@app.get("/documents/{doc_id}/status", response_model=TaskResponse, response_model_exclude_none=True)
+async def get_document_status(doc_id: str, include_result: Optional[bool] = None):
+    record = _get_history_record(doc_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="文件记录不存在")
+
+    include_result_flag = _resolve_task_result_inclusion(include_result)
+    record_task_id = str(record.get("task_id", "") or "").strip()
+    if record_task_id:
+        task = get_task(record_task_id)
+        if task:
+            return _task_response_from_runtime(task, file_id=doc_id, include_result=include_result_flag)
+        snapshot = _load_task_snapshot(record_task_id)
+        if snapshot:
+            return _task_response_from_snapshot(
+                record_task_id,
+                snapshot,
+                file_id=doc_id,
+                include_result=include_result_flag,
+            )
+
+    active_task = _find_active_task_for_file(doc_id)
+    if active_task:
+        _update_history_task_link(doc_id, active_task.task_id)
+        return _task_response_from_runtime(active_task, file_id=doc_id, include_result=include_result_flag)
+
+    status = str(record.get("status", "pending"))
+    if status in READY_FILE_STATUSES:
+        progress = 100
+        message = "处理完成"
+    elif status in {TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}:
+        progress = 100
+        message = "任务已结束"
+    elif status == TaskStatus.PROCESSING.value:
+        progress = 5
+        message = "任务处理中"
+    else:
+        progress = 0
+        message = "任务等待中"
+
+    return TaskResponse(
+        task_id=record_task_id or "",
+        file_id=doc_id,
+        status=status,
+        progress=progress,
+        message=message,
+        failure_details=None,
+    )
+
+
+@app.post("/documents/{doc_id}/cancel")
+async def cancel_document(doc_id: str, request: Request):
+    record = _get_history_record(doc_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="文件记录不存在")
+
+    reason = "已手动取消"
+    try:
+        reason = _parse_cancel_reason(await request.json())
+    except Exception:
+        pass
+
+    candidate_task_ids: List[str] = []
+    record_task_id = str(record.get("task_id", "") or "").strip()
+    if record_task_id:
+        candidate_task_ids.append(record_task_id)
+    active_task = _find_active_task_for_file(doc_id)
+    if active_task and active_task.task_id not in candidate_task_ids:
+        candidate_task_ids.append(active_task.task_id)
+        _update_history_task_link(doc_id, active_task.task_id)
+
+    for task_id in candidate_task_ids:
+        try:
+            return _cancel_task_internal(task_id, reason)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+
+    status = str(record.get("status", "pending"))
+    if status in READY_FILE_STATUSES or status in {TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}:
+        return {
+            "success": True,
+            "task_id": record_task_id,
+            "status": status,
+            "message": "任务已结束，无需取消",
+        }
+
+    update_file_status(doc_id, TaskStatus.CANCELLED.value)
+    return {
+        "success": True,
+        "task_id": record_task_id,
+        "status": TaskStatus.CANCELLED.value,
+        "message": "未找到活动任务，已将文档状态标记为取消",
+    }
+
+
+@app.post("/task/{task_id}/cancel")
+async def cancel_task(task_id: str, request: Request):
+    """取消正在执行的任务。"""
+    reason = "已手动取消"
+    try:
+        reason = _parse_cancel_reason(await request.json())
+    except Exception:
+        pass
+    return _cancel_task_internal(task_id, reason)
+
+
 @app.get("/history", response_model=List[HistoryItem])
 async def get_history():
     """
@@ -2961,7 +3618,7 @@ async def get_history():
 
 
 @app.get("/file/{file_id}")
-async def get_file_content(file_id: str):
+async def get_file_content(file_id: str, format: str = "json"):
     """
     获取文件的 MD 内容
     """
@@ -2977,13 +3634,25 @@ async def get_file_content(file_id: str):
             with open(item["md_path"], "r", encoding="utf-8") as f:
                 content = f.read()
 
+            normalized_format = str(format or "json").strip().lower()
+            if normalized_format in {"raw", "text", "markdown"}:
+                response = PlainTextResponse(content=content, media_type="text/markdown; charset=utf-8")
+                response.headers["X-FilesMind-Filename"] = str(item["filename"])
+                return response
+
             return {"content": content, "filename": item["filename"]}
 
     raise HTTPException(status_code=404, detail="文件记录不存在")
 
 
 @app.get("/file/{file_id}/tree")
-async def get_file_tree(file_id: str):
+async def get_file_tree(
+    file_id: str,
+    include_tree: bool = True,
+    include_flat_nodes: bool = True,
+    flat_offset: int = 0,
+    flat_limit: Optional[int] = None,
+):
     record = _get_history_record(file_id)
     if not record:
         raise HTTPException(status_code=404, detail="文件记录不存在")
@@ -2995,19 +3664,49 @@ async def get_file_tree(file_id: str):
         raise HTTPException(status_code=404, detail="文件内容不存在")
 
     source_index = _ensure_source_index(file_id, md_path)
-    tree = source_index.get("tree", {})
-    flat_nodes = source_index.get("flat_nodes", [])
+    tree = source_index.get("tree", {}) if include_tree else {}
+    flat_nodes_all = source_index.get("flat_nodes", [])
+    if not isinstance(flat_nodes_all, list):
+        flat_nodes_all = []
+
+    offset = max(0, int(flat_offset or 0))
+    limit: Optional[int]
+    if flat_limit is None:
+        limit = None
+    else:
+        try:
+            parsed_limit = int(flat_limit)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="flat_limit 必须为正整数")
+        if parsed_limit <= 0:
+            raise HTTPException(status_code=400, detail="flat_limit 必须为正整数")
+        limit = min(parsed_limit, 5000)
+
+    total_flat_nodes = len(flat_nodes_all)
+    if include_flat_nodes:
+        start = min(offset, total_flat_nodes)
+        end = total_flat_nodes if limit is None else min(total_flat_nodes, start + limit)
+        flat_nodes = flat_nodes_all[start:end]
+        has_more = end < total_flat_nodes
+    else:
+        flat_nodes = []
+        start = min(offset, total_flat_nodes)
+        has_more = False
 
     return {
         "file_id": file_id,
         "filename": record.get("filename", ""),
         "tree": tree,
         "flat_nodes": flat_nodes,
+        "flat_nodes_total": total_flat_nodes,
+        "flat_nodes_offset": start,
+        "flat_nodes_limit": limit,
+        "flat_nodes_has_more": has_more,
     }
 
 
 @app.get("/file/{file_id}/node/{node_id}/source")
-async def get_node_source(file_id: str, node_id: str, context_lines: int = 2, max_lines: int = 120):
+async def get_node_source(file_id: str, node_id: str):
     record = _get_history_record(file_id)
     if not record:
         raise HTTPException(status_code=404, detail="文件记录不存在")
@@ -3024,42 +3723,12 @@ async def get_node_source(file_id: str, node_id: str, context_lines: int = 2, ma
     if not node_meta:
         raise HTTPException(status_code=404, detail="节点不存在")
 
-    source_md_path = source_index.get("source_md_path") or _source_md_path(file_id)
-    if not os.path.exists(source_md_path):
-        source_md_path = md_path
-    if not os.path.exists(source_md_path):
-        raise HTTPException(status_code=404, detail="原文索引不存在")
-
-    try:
-        with open(source_md_path, "r", encoding="utf-8") as f:
-            source_lines = f.read().splitlines()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"读取原文失败: {exc}")
-
-    total_lines = len(source_lines)
-    start = max(1, int(node_meta.get("source_line_start", 1)))
-    end = max(start, int(node_meta.get("source_line_end", start)))
-    if total_lines > 0:
-        start = min(start, total_lines)
-        end = min(end, total_lines)
-
-    context_lines = max(0, min(20, int(context_lines)))
-    max_lines = max(10, min(300, int(max_lines)))
-    excerpt_start = max(1, start - context_lines)
-    excerpt_end = min(total_lines, end + context_lines) if total_lines > 0 else end + context_lines
-    if excerpt_end - excerpt_start + 1 > max_lines:
-        excerpt_end = excerpt_start + max_lines - 1
-
-    excerpt_lines = []
-    for line_no in range(excerpt_start, excerpt_end + 1):
-        if 1 <= line_no <= total_lines:
-            excerpt_lines.append(
-                {
-                    "line_no": line_no,
-                    "text": source_lines[line_no - 1],
-                    "in_range": start <= line_no <= end,
-                }
-            )
+    start_norm = max(1, int(node_meta.get("source_line_start", 1)))
+    end_norm = max(start_norm, int(node_meta.get("source_line_end", start_norm)))
+    total_lines = max(end_norm, start_norm)
+    norm_to_raw = _line_map_norm_to_raw(source_index, file_id, total_lines)
+    start_raw = _map_norm_line_to_raw(start_norm, norm_to_raw)
+    end_raw = _map_norm_line_to_raw(end_norm, norm_to_raw)
 
     # 查找 PDF 物理页码映射
     pdf_page_no = node_meta.get("pdf_page_no")
@@ -3073,11 +3742,14 @@ async def get_node_source(file_id: str, node_id: str, context_lines: int = 2, ma
         "node_id": node_id,
         "topic": node_meta.get("topic", ""),
         "level": int(node_meta.get("level", 0)),
-        "line_start": start,
-        "line_end": end,
-        "total_lines": total_lines,
-        "source_md_path": source_md_path,
-        "excerpt_lines": excerpt_lines,
+        "line_start": start_norm,
+        "line_end": end_norm,
+        "line_start_norm": start_norm,
+        "line_end_norm": end_norm,
+        "line_start_raw": start_raw,
+        "line_end_raw": end_raw,
+        "line_system": source_index.get("line_system", "legacy"),
+        "source_line_map_path": source_index.get("source_line_map_path") or _source_line_map_path(file_id),
         "pdf_page_no": pdf_page_no,
         "pdf_y_ratio": pdf_y_ratio,
         "capabilities": capabilities,
@@ -3122,6 +3794,7 @@ async def delete_file(file_id: str):
         record.get("md_path"),
         _source_md_path(file_id),
         _source_index_path(file_id),
+        _source_line_map_path(file_id),
         os.path.join(DATA_DIR, f"{file_id}_pdf_index.json"),
         os.path.join(DATA_DIR, f"{file_id}_anchor_index.json"),
     ]
@@ -3151,7 +3824,52 @@ async def delete_file(file_id: str):
 @app.get("/health")
 async def health_check():
     """健康检查"""
-    return {"status": "ok"}
+    return {"status": "ok", "version": APP_VERSION}
+
+
+def _probe_directory_writable(path: str) -> Dict[str, Any]:
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe_path = os.path.join(path, f".writable_probe_{uuid.uuid4().hex}.tmp")
+        with open(probe_path, "w", encoding="utf-8") as f:
+            f.write("ok")
+            f.flush()
+            os.fsync(f.fileno())
+        os.remove(probe_path)
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/ready")
+async def readiness_check():
+    dir_state = _probe_directory_writable(DATA_DIR)
+    sqlite_state = sqlite_health(SQLITE_DB_PATH)
+    ready = bool(dir_state.get("ok")) and bool(sqlite_state.get("ok"))
+    payload = {
+        "status": "ready" if ready else "not_ready",
+        "ready": ready,
+        "version": APP_VERSION,
+        "checks": {
+            "data_dir_writable": dir_state,
+            "sqlite": sqlite_state,
+            "startup": _sqlite_bootstrap_status,
+        },
+        "warnings": list(_startup_warnings),
+    }
+    if ready:
+        return payload
+    return JSONResponse(status_code=503, content=payload)
+
+
+@app.get("/version")
+async def version_info():
+    sqlite_state = sqlite_health(SQLITE_DB_PATH)
+    return {
+        "app_version": APP_VERSION,
+        "sqlite_schema_version": int(sqlite_state.get("schema_version", 0)),
+        "data_dir": DATA_DIR,
+    }
 
 
 from hardware_utils import get_hardware_info
@@ -3170,6 +3888,13 @@ async def get_system_features():
     """抛出当前系统的功能特性开关"""
     settings = get_parser_runtime_config()
     return {"FEATURE_VIRTUAL_PDF": bool(settings.get("feature_virtual_pdf", True)), "FEATURE_SIDECAR_ANCHOR": False}
+
+
+@app.post("/runtime/hint")
+async def update_runtime_hint_endpoint(payload: RuntimeHintPayload):
+    data = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+    runtime = upsert_runtime_hint(data)
+    return {"success": True, "runtime": runtime}
 
 
 @app.post("/admin/source-index/rebuild")

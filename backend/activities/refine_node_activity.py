@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from cognitive_engine import refine_node_content
+from refine_policy import should_fail_on_empty_refine_result
 from repo.nodes_repo import NodesRepo
 from workflow_contracts.errors import ErrorCode, NON_RETRYABLE_CODES, RETRYABLE_CODES
 from workflow_contracts.models import NodeExecutionResult, NodeStatus, RefinePayload
@@ -40,7 +41,7 @@ class RefineNodeActivity:
                 content_chunk=payload.content,
                 context_path=payload.breadcrumbs,
             )
-            if not details and len(payload.content) >= 120:
+            if not details and should_fail_on_empty_refine_result(payload.content):
                 raise RuntimeError(ErrorCode.REFINE_EMPTY_RESULT.value)
 
             data = {

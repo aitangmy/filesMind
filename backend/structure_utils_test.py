@@ -97,6 +97,71 @@ class StructureUtilsTests(unittest.TestCase):
         self.assertIn("前言", topics)
         self.assertIn("1. 软件工程概述", topics)
 
+    def test_build_hierarchy_tree_backstop_salvages_all_invalid_long_headings(self):
+        long_stub = "这是一个非常长的章节标题用于模拟OCR误判并且超过严格长度阈值以触发结构回退保护机制并验证树不会退化且仍然保留章节语义"
+        headings = [
+            f"第{i}部分 {long_stub}{i}"
+            for i in range(1, 25)
+        ]
+        md_lines = []
+        for idx, heading in enumerate(headings, start=1):
+            md_lines.append(f"## {heading}")
+            md_lines.append(f"对应内容 {idx}")
+        md = "\n".join(md_lines)
+
+        self.assertFalse(su.is_valid_heading(headings[0]))
+        tree = su.build_hierarchy_tree(md)
+        topics = _flatten_topics(tree)
+
+        self.assertGreaterEqual(len(tree.children), 3)
+        self.assertIn(headings[0], topics)
+        self.assertIn(headings[1], topics)
+
+    def test_build_hierarchy_tree_backstop_forces_anchor_when_relaxed_fails(self):
+        headings = [f"（{i}）这里是长句标题，包含逗号，并且以句号结束。" for i in range(1, 25)]
+        md_lines = []
+        for idx, heading in enumerate(headings, start=1):
+            md_lines.append(f"## {heading}")
+            md_lines.append(f"段落内容 {idx}")
+        md = "\n".join(md_lines)
+
+        self.assertFalse(su.is_valid_heading(headings[0]))
+        tree = su.build_hierarchy_tree(md)
+        topics = _flatten_topics(tree)
+
+        self.assertGreaterEqual(len(tree.children), 1)
+        self.assertIn(headings[0], topics)
+
+    def test_build_hierarchy_tree_handles_escaped_anchor_heading_comment(self):
+        md = (
+            "## 前言 &lt;!-- fm\\_anchor:{\"page_no\": 7, \"bbox\": {\"t\": 1}, \"page_height\": 1000} --&gt;\n"
+            "这是一段正文\n"
+            "## 1. 软件工程概述 &lt;!-- fm\\_anchor:{\"page_no\": 8, \"bbox\": {\"t\": 2}, \"page_height\": 1000} --&gt;"
+        )
+        tree = su.build_hierarchy_tree(md)
+        topics = _flatten_topics(tree)
+
+        self.assertIn("前言", topics)
+        self.assertIn("1. 软件工程概述", topics)
+
+    def test_build_hierarchy_tree_anchor_ratio_supports_bottomleft_variant(self):
+        md = (
+            "## 前言 &lt;!-- fm\\_anchor:{\"page_no\": 7, \"bbox\": {\"t\": 100, \"coord_origin\": \"BOTTOMLEFT\"}, \"page_height\": 1000} --&gt;\n"
+            "正文\n"
+            "## 下一节"
+        )
+        tree = su.build_hierarchy_tree(md)
+
+        target = None
+        for child in tree.children:
+            if child.topic == "前言":
+                target = child
+                break
+
+        self.assertIsNotNone(target)
+        self.assertEqual(target.pdf_page_no, 7)
+        self.assertAlmostEqual(target.pdf_y_ratio, 0.9, places=4)
+
     def test_phase2_noise_filters_watermarks(self):
         self.assertFalse(su.is_valid_heading("CONFIDENTIAL"))
         self.assertFalse(su.is_valid_heading("Draft"))
@@ -269,6 +334,17 @@ class StructureUtilsTests(unittest.TestCase):
         tree = su.build_hierarchy_tree(md)
         topics = _flatten_topics(tree)
         self.assertIn("锁兼容矩阵", topics)
+
+    def test_tree_to_markdown_converts_plain_fallback_content_to_list_items(self):
+        root = su.TreeNode("Root", 0)
+        section = su.TreeNode("章节A", 2)
+        section.content_lines = ["第一段正文", "第二段正文"]
+        root.add_child(section)
+
+        result = su.tree_to_markdown(root)
+        self.assertIn("## 章节A", result)
+        self.assertIn("- 第一段正文", result)
+        self.assertIn("- 第二段正文", result)
 
 
 if __name__ == "__main__":

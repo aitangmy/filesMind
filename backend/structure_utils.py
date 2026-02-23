@@ -37,7 +37,7 @@ _HF_MAX_LINE_LEN = 120  # very long lines are never headers/footers
 _HF_POSITION_ZONE = 0.30  # top/bottom 30% of each page segment = HF zone
 
 _FM_ANCHOR_RE = re.compile(
-    r"<!--\s*fm_anchor:(.*?)\s*-->|(?:\\)?&lt;!--\s*fm_anchor:(.*?)\s*--(?:\\)?&gt;",
+    r"<!--\s*fm(?:\\)?_anchor:(.*?)\s*-->|(?:\\)?&lt;!--\s*fm(?:\\)?_anchor:(.*?)\s*--(?:\\)?&gt;",
     re.IGNORECASE | re.DOTALL,
 )
 _FM_CONFIDENCE_RE = re.compile(
@@ -47,6 +47,10 @@ _FM_CONFIDENCE_RE = re.compile(
 _LOW_CONFIDENCE_SIDE_TAG_THRESHOLD = 0.50
 _LOW_CONFIDENCE_DEMOTE_THRESHOLD = 0.50
 _LOW_CONFIDENCE_HARD_DEMOTE_THRESHOLD = 0.35
+_LOW_VALID_RATIO_BACKSTOP = 0.08
+_LOW_VALID_MIN_HEADINGS = 20
+_RELAXED_HEADING_MAX_LENGTH = 120
+_FORCED_HEADING_FALLBACK_LIMIT = 12
 
 
 def _anchor_payload_from_match(match: re.Match) -> str:
@@ -254,6 +258,9 @@ _WEAK_END_PUNCT_RE = re.compile(r"[。！？；，、：:]$")
 _WEAK_OPERATOR_PHRASE_RE = re.compile(r"\s+[+＝=]\s+")
 _WEAK_SHORT_PAREN_TERM_RE = re.compile(r"^[\u4e00-\u9fffA-Za-z0-9]{1,4}\s*[（(][^）)]{1,12}[）)]$")
 _WEAK_TWO_TOKEN_CN_RE = re.compile(r"^[\u4e00-\u9fff]{1,4}\s+[\u4e00-\u9fff]{2,8}$")
+_MD_STYLE_TOKEN_RE = re.compile(r"(\*\*|__|`|~~)")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_LEADING_DECORATIVE_TOKEN_RE = re.compile(r"^[\s\u2022•·●○■◆★☆\-—–]+")
 
 # ── Phase 2 Enhancement: Additional noise patterns ───────────────────────────
 _WATERMARK_RE = re.compile(
@@ -457,6 +464,186 @@ def _is_weak_unstructured_heading(topic: str) -> bool:
         return True
 
     return False
+
+
+def _normalize_heading_probe(topic: str) -> str:
+    """
+    Build a probe text for validation/numbering checks without mutating the
+    user-facing heading topic.
+    """
+    normalized = _normalize_heading_topic(topic or "")
+    normalized = html.unescape(normalized)
+    normalized = _MD_LINK_RE.sub(lambda m: m.group(1) or "", normalized)
+    normalized = _MD_STYLE_TOKEN_RE.sub("", normalized)
+    normalized = _LEADING_DECORATIVE_TOKEN_RE.sub("", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def _is_hard_noise_heading(topic: str) -> bool:
+    probe = _normalize_heading_probe(topic)
+    if not probe:
+        return True
+    if len(probe) > _RELAXED_HEADING_MAX_LENGTH:
+        return True
+    if _PURE_SYMBOL_RE.match(probe):
+        return True
+    if _PURE_DIGIT_RE.match(probe):
+        return True
+    if len(probe) == 1 and re.match(r"[\u4e00-\u9fffA-Za-z0-9]", probe):
+        return True
+    if _SHORT_GARBAGE_TOKEN_RE.match(probe):
+        return True
+    if _DIAGRAM_LABEL_RE.match(probe):
+        return True
+    if _WATERMARK_RE.match(probe):
+        return True
+    if _PAGE_NUMBER_RE.match(probe):
+        return True
+    if _DECORATIVE_LINE_RE.match(probe):
+        return True
+    if _URL_RE.match(probe):
+        return True
+    if _FILE_PATH_RE.match(probe):
+        return True
+    if _COPYRIGHT_RE.match(probe):
+        return True
+    if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", probe):
+        return True
+    return False
+
+
+def _is_relaxed_heading_candidate(topic: str, markdown_level: int) -> bool:
+    probe = _normalize_heading_probe(topic)
+    if _is_hard_noise_heading(probe):
+        return False
+
+    structured = _has_structured_prefix(probe)
+    punct_count = len(_SENTENCE_PUNCT_RE.findall(probe))
+
+    if _FORMULA_PATTERNS.search(probe) and not structured:
+        return False
+
+    if _LIST_ITEM_RE.match(probe) and not structured:
+        return False
+
+    if _BODY_TEXT_STARTERS.match(probe) and not structured:
+        if len(probe) > 28 or punct_count > 0:
+            return False
+
+    if not structured:
+        if len(probe) > 80 and punct_count >= 1:
+            return False
+        if len(probe) > 50 and punct_count >= 2:
+            return False
+        if len(probe) > 36 and _WEAK_END_PUNCT_RE.search(probe):
+            return False
+
+    if structured:
+        return True
+
+    if markdown_level <= 3 and len(probe) <= 56 and punct_count <= 1:
+        return True
+
+    if len(probe) <= 28 and punct_count == 0:
+        return True
+
+    return len(probe) <= 18
+
+
+def _compute_relaxed_heading_confidence(topic: str, markdown_level: int = 2) -> float:
+    probe = _normalize_heading_probe(topic)
+    if _is_hard_noise_heading(probe):
+        return 0.0
+
+    score = 0.35
+    structured = _has_structured_prefix(probe)
+    punct_count = len(_SENTENCE_PUNCT_RE.findall(probe))
+
+    if structured:
+        score += 0.35
+    if markdown_level <= 3:
+        score += 0.08
+    if len(probe) <= 24:
+        score += 0.12
+    elif len(probe) > 60:
+        score -= 0.10
+
+    if punct_count >= 2:
+        score -= 0.12
+    if _WEAK_END_PUNCT_RE.search(probe):
+        score -= 0.10
+    if _FORMULA_PATTERNS.search(probe) and not structured:
+        score -= 0.20
+
+    return round(max(0.0, min(1.0, score)), 3)
+
+
+def _apply_heading_validity_backstop(heading_meta: list) -> tuple[int, int, bool]:
+    """
+    When strict filtering collapses most headings, promote conservative fallback
+    candidates so the tree does not degenerate into a single root-content node.
+    """
+    total_raw = len(heading_meta)
+    if total_raw < _LOW_VALID_MIN_HEADINGS:
+        return 0, 0, False
+
+    strict_valid = sum(1 for meta in heading_meta if meta.get("valid"))
+    valid_ratio = strict_valid / max(total_raw, 1)
+    if strict_valid > 0 and valid_ratio >= _LOW_VALID_RATIO_BACKSTOP:
+        return 0, 0, False
+
+    relaxed_promoted = 0
+    for meta in heading_meta:
+        if meta.get("valid"):
+            continue
+        topic = meta.get("topic_probe") or meta.get("topic") or ""
+        markdown_level = int(meta.get("level", 2))
+        if not _is_relaxed_heading_candidate(topic, markdown_level):
+            continue
+        meta["valid"] = True
+        meta["numeric"] = _extract_numeric_segments(_normalize_heading_probe(topic))
+        base_conf = _clamp_confidence(meta.get("confidence"), 0.0) or 0.0
+        relaxed_conf = _compute_relaxed_heading_confidence(topic, markdown_level)
+        meta["confidence"] = max(base_conf, relaxed_conf, 0.50)
+        relaxed_promoted += 1
+
+    if any(meta.get("valid") for meta in heading_meta):
+        return relaxed_promoted, 0, True
+
+    # Final safeguard: promote a small set of anchor headings so the parser can
+    # segment content instead of flattening everything under root.
+    forced_promoted = 0
+    min_markdown_level = min(int(meta.get("level", 6)) for meta in heading_meta)
+    candidates = []
+    for meta in heading_meta:
+        topic = meta.get("topic_probe") or meta.get("topic") or ""
+        probe = _normalize_heading_probe(topic)
+        punct_count = len(_SENTENCE_PUNCT_RE.findall(probe))
+        level = int(meta.get("level", min_markdown_level))
+        if _is_hard_noise_heading(probe):
+            continue
+        if level <= (min_markdown_level + 1) and len(probe) <= 90 and punct_count <= 2:
+            candidates.append(meta)
+
+    if not candidates:
+        for meta in heading_meta:
+            topic = meta.get("topic_probe") or meta.get("topic") or ""
+            if _is_hard_noise_heading(topic):
+                continue
+            candidates.append(meta)
+            break
+
+    promote_limit = max(3, min(_FORCED_HEADING_FALLBACK_LIMIT, max(1, total_raw // 25)))
+    for meta in candidates[:promote_limit]:
+        topic = meta.get("topic_probe") or meta.get("topic") or ""
+        meta["valid"] = True
+        meta["numeric"] = _extract_numeric_segments(_normalize_heading_probe(topic))
+        base_conf = _clamp_confidence(meta.get("confidence"), 0.0) or 0.0
+        meta["confidence"] = max(base_conf, 0.50)
+        forced_promoted += 1
+
+    return relaxed_promoted, forced_promoted, True
 
 
 def _should_demote_bridge_heading(heading_meta: list, pos: int) -> bool:
@@ -766,27 +953,55 @@ def infer_level_from_numbering(topic: str, markdown_level: int) -> int:
 # ── Pre-processing pipeline ───────────────────────────────────────────────────
 
 
-def preprocess_markdown(text: str) -> str:
-    """
-    Clean and normalise the raw Markdown produced by Docling.
+def _remove_table_separator_lines_with_map(lines: list, line_map: list[int]) -> tuple[list, list[int], int]:
+    cleaned_lines = []
+    cleaned_map = []
+    removed = 0
 
-    Pass 1 — Header/footer removal (Method B: frequency+position-based)
-    Pass 2 — TOC region skipping
-    Pass 3 — Split-heading merge
+    for idx, raw in enumerate(lines):
+        mapped_no = line_map[idx] if idx < len(line_map) else (idx + 1)
+        stripped = raw.strip()
+        if not stripped:
+            cleaned_lines.append(raw)
+            cleaned_map.append(mapped_no)
+            continue
+
+        if _MD_TABLE_SEPARATOR_RE.match(stripped):
+            removed += 1
+            continue
+
+        if _PURE_DASH_LINE_RE.match(stripped):
+            prev_text = _nearest_non_empty_line(lines, idx, -1)
+            next_text = _nearest_non_empty_line(lines, idx, 1)
+            if _is_table_row_candidate(prev_text) or _is_table_row_candidate(next_text):
+                removed += 1
+                continue
+
+        cleaned_lines.append(raw)
+        cleaned_map.append(mapped_no)
+
+    return cleaned_lines, cleaned_map, removed
+
+
+def preprocess_markdown_with_map(text: str) -> tuple[str, list[int]]:
+    """
+    Clean and normalise raw Markdown, while returning a line map:
+    preprocessed_line_no (1-based) -> original_line_no (1-based).
     """
     lines = text.split("\n")
+    line_map = list(range(1, len(lines) + 1))
 
-    # ── Pass 0: Remove standalone noise lines (page numbers, watermarks,
-    #    decorative dividers) that are NOT headings but pollute content ────────
+    # ── Pass 0: Remove standalone noise lines (physically removed) ───────────
     cleaned_lines = []
+    cleaned_map = []
     noise_removed = 0
-    for line in lines:
+    for i, line in enumerate(lines):
+        mapped_no = line_map[i] if i < len(line_map) else (i + 1)
         stripped = line.strip()
-        # Skip heading lines — they are handled by is_valid_heading later
         if stripped.startswith("#"):
             cleaned_lines.append(line)
+            cleaned_map.append(mapped_no)
             continue
-        # Remove standalone noise
         if stripped and (
             _STANDALONE_NOISE_RE.match(stripped)
             or _WATERMARK_RE.match(stripped)
@@ -796,22 +1011,24 @@ def preprocess_markdown(text: str) -> str:
             noise_removed += 1
             continue
         cleaned_lines.append(line)
+        cleaned_map.append(mapped_no)
     lines = cleaned_lines
+    line_map = cleaned_map
     if noise_removed:
         print(f"[preprocess] Removed {noise_removed} standalone noise lines")
 
-    # ── Pass 0.5: remove markdown table separator noise ──────────────────────
-    lines, table_sep_removed = detect_and_remove_table_separator_lines(lines)
+    # ── Pass 0.5: remove markdown table separator noise (physically removed) ─
+    lines, line_map, table_sep_removed = _remove_table_separator_lines_with_map(lines, line_map)
     if table_sep_removed:
         print(f"[preprocess] Removed {table_sep_removed} table separator line(s)")
 
-    # ── Pass 1: frequency+position-based header/footer removal ───────────────
+    # ── Pass 1: frequency+position-based header/footer removal (blank out) ───
     lines, _hf_fps = detect_and_remove_headers_footers(lines)
 
-    # ── Pass 1.5: remove globally repeated decorative lines ───────────────────
+    # ── Pass 1.5: remove globally repeated decorative lines (blank out) ──────
     lines, _rep_noise = detect_and_remove_repeated_decorative_lines(lines)
 
-    # ── Pass 2: TOC region detection and heading demotion ────────────────────
+    # ── Pass 2: TOC region detection and heading demotion (in-place rewrite) ─
     toc_start, toc_end = _detect_toc_region(lines)
     if toc_start >= 0:
         print(f"[preprocess] TOC detected at lines {toc_start}–{toc_end}")
@@ -820,8 +1037,9 @@ def preprocess_markdown(text: str) -> str:
             if m:
                 lines[i] = m.group(2)
 
-    # ── Pass 3: split-heading merge ───────────────────────────────────────────
+    # ── Pass 3: split-heading merge (physically remove trailing title line) ──
     merged = []
+    merged_map = []
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -829,6 +1047,7 @@ def preprocess_markdown(text: str) -> str:
             hash_match = re.match(r"^\s*(#+)", line)
             if not hash_match:
                 merged.append(line)
+                merged_map.append(line_map[i] if i < len(line_map) else (i + 1))
                 i += 1
                 continue
             hashes = hash_match.group(1)
@@ -843,14 +1062,23 @@ def preprocess_markdown(text: str) -> str:
                 next_text = re.sub(r"^#+\s*", "", next_line).strip()
                 if next_text:
                     merged.append(f"{hashes} {label}{next_text}")
+                    merged_map.append(line_map[i] if i < len(line_map) else (i + 1))
                     i = j + 1
                     continue
 
         merged.append(line)
+        merged_map.append(line_map[i] if i < len(line_map) else (i + 1))
         i += 1
-    lines = merged
 
-    return "\n".join(lines)
+    return "\n".join(merged), merged_map
+
+
+def preprocess_markdown(text: str) -> str:
+    """
+    Backward-compatible wrapper: return preprocessed markdown only.
+    """
+    normalized, _line_map = preprocess_markdown_with_map(text)
+    return normalized
 
 
 # ── Tree data structures ──────────────────────────────────────────────────────
@@ -938,9 +1166,7 @@ def build_hierarchy_tree(markdown_text):
     root.source_line_start = 1
     stack = [root]
 
-    # Pre-scan for numeric inference threshold
-    raw_header_topics = []
-    valid_header_topics = []
+    # Pre-scan headings for validity and numbering hints.
     heading_meta = []
     heading_pos_by_line_index = {}
     for line_index, line in enumerate(lines):
@@ -950,22 +1176,22 @@ def build_hierarchy_tree(markdown_text):
 
         markdown_level = len(m.group(1))
         topic, anchor_data, confidence_hint = _parse_heading_topic_with_sidecars(m.group(2).strip())
+        topic_probe = _normalize_heading_probe(topic)
         valid = is_valid_heading(topic)
-        numeric = _extract_numeric_segments(topic) if valid else None
+        if not valid and topic_probe and topic_probe != topic:
+            valid = is_valid_heading(topic_probe)
+        numeric = _extract_numeric_segments(topic_probe) if valid else None
         confidence = (
             _clamp_confidence(confidence_hint, None)
             if confidence_hint is not None
-            else compute_heading_confidence(topic, markdown_level)
+            else compute_heading_confidence(topic_probe or topic, markdown_level)
         )
-
-        raw_header_topics.append(topic)
-        if valid:
-            valid_header_topics.append(topic)
 
         heading_pos_by_line_index[line_index] = len(heading_meta)
         heading_meta.append(
             {
                 "topic": topic,
+                "topic_probe": topic_probe,
                 "level": markdown_level,
                 "valid": valid,
                 "numeric": numeric,
@@ -974,23 +1200,13 @@ def build_hierarchy_tree(markdown_text):
             }
         )
 
-    numbered_count = sum(
-        1
-        for topic in valid_header_topics
-        if re.match(
-            r"^(?:"
-            r"\d+(?:\.\d+)*\.?\s*(?=[a-zA-Z\u4e00-\u9fff\uff08\u3010\[（【])"
-            r"|\u7b2c[\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\d]+[\u7ae0\u8282\u7bc7\u90e8]"
-            r"|(?:Chapter|Section|Part|Appendix)\s+[\dIVXivx]+"
-            r"|Q\d+\s*[：:。\s]"
-            r")",
-            topic,
-            re.IGNORECASE,
-        )
-    )
+    relaxed_promoted, forced_promoted, backstop_enabled = _apply_heading_validity_backstop(heading_meta)
+
+    valid_header_topics = [meta.get("topic", "") for meta in heading_meta if meta.get("valid")]
+    numbered_count = sum(1 for meta in heading_meta if meta.get("valid") and meta.get("numeric") is not None)
     use_numbering_inference = len(valid_header_topics) > 0 and (numbered_count / len(valid_header_topics)) >= 0.5
 
-    total_raw = len(raw_header_topics)
+    total_raw = len(heading_meta)
     total_valid = len(valid_header_topics)
     demoted = total_raw - total_valid
     low_conf = sum(
@@ -1002,24 +1218,64 @@ def build_hierarchy_tree(markdown_text):
         f"[build_hierarchy_tree] Raw headings: {total_raw}, "
         f"Valid: {total_valid}, Demoted: {demoted}, "
         f"LowConfidence(<{_LOW_CONFIDENCE_DEMOTE_THRESHOLD:.2f}): {low_conf}, "
-        f"Numbered: {numbered_count} → "
+        f"Numbered: {numbered_count}, "
+        f"Backstop: {'ON' if backstop_enabled else 'OFF'}"
+        f"(relaxed={relaxed_promoted}, forced={forced_promoted}) → "
         f"{'Numeric inference ON' if use_numbering_inference else 'Markdown # count mode'}"
     )
+
+    def _anchor_to_y_ratio(anchor: dict):
+        if not isinstance(anchor, dict):
+            return None
+        bbox = anchor.get("bbox")
+        page_height = anchor.get("page_height", 1000)
+        if not isinstance(bbox, dict) or page_height in (None, 0):
+            return None
+        try:
+            page_height_f = float(page_height)
+            if page_height_f <= 0:
+                return None
+            # Docling variants include BOTTOMLEFT/BOTTOM_LEFT/BOTTOM-LEFT.
+            origin = str(bbox.get("coord_origin", "BOTTOMLEFT")).upper().replace("_", "").replace("-", "")
+            t_raw = bbox.get("t", bbox.get("top", None))
+            if t_raw is None:
+                return None
+            t_coord = float(t_raw)
+            y_ratio = (1.0 - (t_coord / page_height_f)) if origin in {"BOTTOMLEFT", "BOTTOMRIGHT"} else (t_coord / page_height_f)
+            return round(max(0.0, min(1.0, float(y_ratio))), 4)
+        except Exception:
+            return None
 
     for line_index, line in enumerate(lines):
         header_match = re.match(r"^(#+)\s+(.*)", line)
 
         if header_match:
             markdown_level = len(header_match.group(1))
-            topic, _anchor_data, _confidence_hint = _parse_heading_topic_with_sidecars(header_match.group(2).strip())
+            heading_pos = heading_pos_by_line_index.get(line_index)
+            if heading_pos is not None:
+                meta = heading_meta[heading_pos]
+                topic = meta.get("topic", "")
+                topic_probe = meta.get("topic_probe") or topic
+                markdown_level = int(meta.get("level", markdown_level))
+            else:
+                topic, _anchor_data, _confidence_hint = _parse_heading_topic_with_sidecars(header_match.group(2).strip())
+                topic_probe = _normalize_heading_probe(topic)
+                meta = {
+                    "topic": topic,
+                    "topic_probe": topic_probe,
+                    "level": markdown_level,
+                    "valid": is_valid_heading(topic) or (topic_probe and is_valid_heading(topic_probe)),
+                    "numeric": _extract_numeric_segments(topic_probe),
+                    "confidence": compute_heading_confidence(topic_probe or topic, markdown_level),
+                    "anchor_data": None,
+                }
 
-            if not is_valid_heading(topic):
+            if not meta.get("valid"):
                 if topic:
                     stack[-1].content_lines.append(topic)
                     stack[-1].source_line_end = max(stack[-1].source_line_end, line_index + 1)
                 continue
 
-            heading_pos = heading_pos_by_line_index.get(line_index)
             if heading_pos is not None and (
                 _should_demote_bridge_heading(heading_meta, heading_pos)
                 or _should_demote_low_confidence_heading(heading_meta, heading_pos)
@@ -1029,13 +1285,12 @@ def build_hierarchy_tree(markdown_text):
                 continue
 
             if use_numbering_inference:
-                level = infer_level_from_numbering(topic, markdown_level)
+                level = infer_level_from_numbering(topic_probe, markdown_level)
             else:
                 level = markdown_level
 
             new_node = TreeNode(topic, level)
-            if heading_pos is not None:
-                new_node.heading_confidence = _clamp_confidence(heading_meta[heading_pos].get("confidence"), None)
+            new_node.heading_confidence = _clamp_confidence(meta.get("confidence"), None)
             new_node.source_line_start = line_index + 1
             new_node.source_line_end = line_index + 1
 
@@ -1044,23 +1299,12 @@ def build_hierarchy_tree(markdown_text):
                 finished.source_line_end = max(finished.source_line_end, line_index)
 
             # Assign anchor to new node if available
-            heading_pos = heading_pos_by_line_index.get(line_index)
-            if heading_pos is not None:
-                meta = heading_meta[heading_pos]
-                if meta.get("anchor_data"):
-                    anchor = meta["anchor_data"]
-                    new_node.pdf_page_no = anchor.get("page_no")
-                    bbox = anchor.get("bbox")
-                    page_height = anchor.get("page_height", 1000)
-                    if bbox and page_height:
-                        origin = str(bbox.get("coord_origin", "BOTTOM_LEFT")).upper()
-                        t_coord = float(bbox.get("t", bbox.get("top", 0)))
-                        y_ratio = (
-                            (1.0 - (t_coord / float(page_height)))
-                            if origin == "BOTTOM_LEFT"
-                            else (t_coord / float(page_height))
-                        )
-                        new_node.pdf_y_ratio = round(max(0.0, min(1.0, float(y_ratio))), 4)
+            if meta.get("anchor_data"):
+                anchor = meta["anchor_data"]
+                new_node.pdf_page_no = anchor.get("page_no")
+                y_ratio = _anchor_to_y_ratio(anchor)
+                if y_ratio is not None:
+                    new_node.pdf_y_ratio = y_ratio
 
             stack[-1].add_child(new_node)
             stack.append(new_node)
@@ -1074,17 +1318,9 @@ def build_hierarchy_tree(markdown_text):
                     try:
                         anchor = json.loads(_anchor_payload_from_match(anchor_match))
                         stack[-1].pdf_page_no = anchor.get("page_no")
-                        bbox = anchor.get("bbox")
-                        page_height = anchor.get("page_height", 1000)
-                        if bbox and page_height:
-                            origin = str(bbox.get("coord_origin", "BOTTOM_LEFT")).upper()
-                            t_coord = float(bbox.get("t", bbox.get("top", 0)))
-                            y_ratio = (
-                                (1.0 - (t_coord / float(page_height)))
-                                if origin == "BOTTOM_LEFT"
-                                else (t_coord / float(page_height))
-                            )
-                            stack[-1].pdf_y_ratio = round(max(0.0, min(1.0, float(y_ratio))), 4)
+                        y_ratio = _anchor_to_y_ratio(anchor)
+                        if y_ratio is not None:
+                            stack[-1].pdf_y_ratio = y_ratio
                     except Exception:
                         pass
 
@@ -1152,10 +1388,15 @@ def tree_to_markdown(node, depth=0):
             for det in item.get("details", []):
                 lines.append(f"  - {det}")
     elif node.content_lines:
-        # 修复：如果没有 AI 细节（处理失败或节点不需要处理），保留原始正文
-        content = node.full_content
-        if content:
-            lines.append(content)
+        # Keep fallback body visible in mind-map parsers that only consume headings/lists.
+        fallback_lines = []
+        for raw in node.content_lines:
+            text = str(raw or "").strip()
+            if text:
+                fallback_lines.append(text)
+        if fallback_lines:
+            for text in fallback_lines:
+                lines.append(f"- {text}")
 
     if node.children:
         lines.append("")

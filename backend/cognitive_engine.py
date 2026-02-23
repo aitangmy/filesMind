@@ -314,6 +314,10 @@ class RefineNodeRequestError(RuntimeError):
     """Raised when refinement request exhausts retries for a node."""
 
 
+class RefineNodeParseError(ValueError):
+    """Raised when model output cannot be parsed into expected JSON payload."""
+
+
 # 全局限流器和信号量
 class DynamicConcurrencyLimiter:
     """
@@ -325,27 +329,60 @@ class DynamicConcurrencyLimiter:
         self._limit = max(1, int(limit))
         self._in_flight = 0
         self._state_lock = threading.Lock()
+        self._condition = asyncio.Condition()
+        self._loop = None
+
+    def _capture_loop(self):
+        if self._loop is not None:
+            return
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
+
+    async def _notify_waiters(self):
+        async with self._condition:
+            self._condition.notify_all()
+
+    def _wake_waiters(self):
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+
+        def _schedule_notify():
+            asyncio.create_task(self._notify_waiters())
+
+        try:
+            loop.call_soon_threadsafe(_schedule_notify)
+        except RuntimeError:
+            # Event loop may be shutting down.
+            pass
 
     def set_limit(self, limit: int):
         with self._state_lock:
             self._limit = max(1, int(limit))
+        self._wake_waiters()
 
     def get_limit(self) -> int:
         with self._state_lock:
             return self._limit
 
     async def __aenter__(self):
-        while True:
-            with self._state_lock:
-                if self._in_flight < self._limit:
-                    self._in_flight += 1
-                    return self
-            await asyncio.sleep(0.01)
+        self._capture_loop()
+        async with self._condition:
+            while True:
+                with self._state_lock:
+                    current_limit = self._limit
+                    if self._in_flight < current_limit:
+                        self._in_flight += 1
+                        return self
+                await self._condition.wait()
 
     async def __aexit__(self, exc_type, exc, tb):
-        with self._state_lock:
+        async with self._condition:
             if self._in_flight > 0:
                 self._in_flight -= 1
+            self._condition.notify_all()
         return False
 
 
@@ -1185,9 +1222,12 @@ def _parse_refine_response(content: str, node_title: str) -> list:
 
     try:
         data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        print(f"JSON Parse Error for node {node_title}: {cleaned[:100]}...")
-        return []
+    except json.JSONDecodeError as e:
+        preview = cleaned[:160].replace("\n", " ")
+        print(f"JSON Parse Error for node {node_title}: {preview}...")
+        raise RefineNodeParseError(
+            f"Invalid refine JSON for node={node_title}: {e.msg} (pos={e.pos})"
+        ) from e
 
     if isinstance(data, list):
         return _sanitize_refine_items(data)

@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict
 
+from parse_concurrency import get_parse_limiter
 from parser_service import process_pdf_safely
 
 
@@ -22,12 +23,14 @@ class ParsePdfOutput:
 
 class ParsePdfActivity:
     async def run(self, payload: ParsePdfInput) -> ParsePdfOutput:
-        md_content, image_map = await asyncio.to_thread(
-            process_pdf_safely,
-            payload.file_path,
-            payload.output_dir,
-            payload.doc_id,
-        )
+        parse_limiter = get_parse_limiter()
+        async with parse_limiter.slot():
+            md_content, image_map = await asyncio.to_thread(
+                process_pdf_safely,
+                payload.file_path,
+                payload.output_dir,
+                payload.doc_id,
+            )
         if not md_content or not str(md_content).strip():
             raise RuntimeError("PDF parsing produced empty markdown")
         return ParsePdfOutput(markdown=md_content, image_map=image_map or {})
