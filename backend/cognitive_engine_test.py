@@ -72,6 +72,29 @@ class RefineNodeTests(unittest.TestCase):
         self.assertNotIn("response_format", second_call)
         self.assertEqual(data[0]["topic"], "子点")
 
+    def test_refine_invalid_json_payload_retries_until_exhausted(self):
+        fake_client = _FakeClient(
+            "https://api.minimaxi.com/v1",
+            [
+                _make_response("```json\nNOT_JSON\n```"),
+                _make_response("```json\nNOT_JSON\n```"),
+                _make_response("```json\nNOT_JSON\n```"),
+                _make_response("```json\nNOT_JSON\n```"),
+            ],
+        )
+
+        async def _no_sleep(_seconds):
+            return None
+
+        with patch.object(ce, "get_client", return_value=fake_client):
+            with patch.object(ce, "get_model", return_value="MiniMax-M2.5"):
+                with patch.object(ce.random, "uniform", return_value=0.0):
+                    with patch.object(ce.asyncio, "sleep", side_effect=_no_sleep):
+                        with self.assertRaises(ce.RefineNodeRequestError):
+                            asyncio.run(ce.refine_node_content("标题", "正文", "路径"))
+
+        self.assertEqual(len(fake_client.chat.completions.calls), 4)
+
     def test_refine_response_sanitizes_noise_items(self):
         payload = """{
           "items": [

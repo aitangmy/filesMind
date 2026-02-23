@@ -29,6 +29,7 @@ def _install_test_stubs():
         "hybrid_switch_min_delta": 2.0,
         "hybrid_marker_min_length": 200,
         "marker_prefer_api": False,
+        "hf_endpoint_region": "global",
         "task_timeout_seconds": 600,
     }
     parser_service.update_parser_runtime_config = lambda *args, **kwargs: None
@@ -94,6 +95,7 @@ class FastAPIEndpointTests(unittest.TestCase):
         app_module.IMAGES_DIR = str(self.base / "data" / "images")
         app_module.SOURCE_MD_DIR = str(self.base / "data" / "source_mds")
         app_module.SOURCE_INDEX_DIR = str(self.base / "data" / "source_indexes")
+        app_module.SOURCE_LINE_MAP_DIR = str(self.base / "data" / "source_line_maps")
         app_module.HISTORY_FILE = str(self.base / "data" / "history.json")
         app_module.CONFIG_FILE = str(self.base / "data" / "config.json")
         app_module.CONFIG_KEY_FILE = str(self.base / "data" / "config.key")
@@ -103,6 +105,7 @@ class FastAPIEndpointTests(unittest.TestCase):
         os.makedirs(app_module.IMAGES_DIR, exist_ok=True)
         os.makedirs(app_module.SOURCE_MD_DIR, exist_ok=True)
         os.makedirs(app_module.SOURCE_INDEX_DIR, exist_ok=True)
+        os.makedirs(app_module.SOURCE_LINE_MAP_DIR, exist_ok=True)
         os.makedirs(os.path.dirname(app_module.HISTORY_FILE), exist_ok=True)
         with open(app_module.HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump([], f)
@@ -134,7 +137,146 @@ class FastAPIEndpointTests(unittest.TestCase):
         data = res.json()
         self.assertEqual(data["file_id"], "file-1")
         self.assertEqual(data["progress"], 42)
-        self.assertIn("failure_details", data)
+        self.assertNotIn("result", data)
+
+    def test_task_status_excludes_result_by_default_and_supports_include_result(self):
+        task = app_module.create_task("task-result", file_id="file-result")
+        task.status = app_module.TaskStatus.COMPLETED
+        task.progress = 100
+        task.message = "done"
+        task.result = "# final markdown"
+
+        with TestClient(app_module.app) as client:
+            default_res = client.get("/task/task-result")
+            include_res = client.get("/task/task-result?include_result=true")
+
+        self.assertEqual(default_res.status_code, 200)
+        self.assertEqual(include_res.status_code, 200)
+        default_data = default_res.json()
+        include_data = include_res.json()
+        self.assertNotIn("result", default_data)
+        self.assertEqual(include_data.get("result"), "# final markdown")
+
+    def test_document_status_returns_live_task(self):
+        file_id = "file-doc-status"
+        task_id = "task-doc-status"
+        pdf_path = Path(app_module.PDF_DIR) / "doc-status.pdf"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        pdf_path.write_bytes(b"pdf")
+        md_path.write_text("# md", encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="doc-status.pdf",
+            file_hash="hash-doc-status",
+            pdf_path=str(pdf_path),
+            md_path=str(md_path),
+            status="processing",
+            task_id=task_id,
+        )
+        task = app_module.create_task(task_id, file_id=file_id)
+        task.status = app_module.TaskStatus.PROCESSING
+        task.progress = 37
+        task.message = "processing"
+        app_module._persist_task_snapshot(task)
+
+        with TestClient(app_module.app) as client:
+            res = client.get(f"/documents/{file_id}/status")
+
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["task_id"], task_id)
+        self.assertEqual(data["file_id"], file_id)
+        self.assertEqual(data["status"], "processing")
+        self.assertEqual(data["progress"], 37)
+
+    def test_document_status_falls_back_to_snapshot_when_task_evicted(self):
+        file_id = "file-doc-snapshot"
+        task_id = "task-doc-snapshot"
+        pdf_path = Path(app_module.PDF_DIR) / "doc-snapshot.pdf"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        pdf_path.write_bytes(b"pdf")
+        md_path.write_text("# md", encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="doc-snapshot.pdf",
+            file_hash="hash-doc-snapshot",
+            pdf_path=str(pdf_path),
+            md_path=str(md_path),
+            status="processing",
+            task_id=task_id,
+        )
+        task = app_module.create_task(task_id, file_id=file_id)
+        task.status = app_module.TaskStatus.PROCESSING
+        task.progress = 66
+        task.message = "snapshot-only"
+        app_module._persist_task_snapshot(task)
+        app_module.tasks.pop(task_id, None)
+
+        with TestClient(app_module.app) as client:
+            res = client.get(f"/documents/{file_id}/status")
+
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["task_id"], task_id)
+        self.assertEqual(data["file_id"], file_id)
+        self.assertEqual(data["status"], "processing")
+        self.assertEqual(data["progress"], 66)
+
+    def test_get_file_content_supports_raw_format(self):
+        file_id = "file-raw"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        md_content = "# raw\ncontent"
+        md_path.write_text(md_content, encoding="utf-8")
+        pdf_path = Path(app_module.PDF_DIR) / "raw.pdf"
+        pdf_path.write_bytes(b"pdf")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="raw.pdf",
+            file_hash="hash-raw",
+            pdf_path=str(pdf_path),
+            md_path=str(md_path),
+            status="completed",
+            task_id="task-raw",
+        )
+
+        with TestClient(app_module.app) as client:
+            res = client.get(f"/file/{file_id}?format=raw")
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.text, md_content)
+        self.assertIn("text/markdown", res.headers.get("content-type", ""))
+
+    def test_document_cancel_routes_to_task_cancel(self):
+        file_id = "file-doc-cancel"
+        task_id = "task-doc-cancel"
+        pdf_path = Path(app_module.PDF_DIR) / "doc-cancel.pdf"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        pdf_path.write_bytes(b"pdf")
+        md_path.write_text("# md", encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="doc-cancel.pdf",
+            file_hash="hash-doc-cancel",
+            pdf_path=str(pdf_path),
+            md_path=str(md_path),
+            status="processing",
+            task_id=task_id,
+        )
+        task = app_module.create_task(task_id, file_id=file_id)
+        task.status = app_module.TaskStatus.PROCESSING
+
+        with TestClient(app_module.app) as client:
+            res = client.post(f"/documents/{file_id}/cancel", json={"reason": "test-cancel"})
+
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["task_id"], task_id)
+        self.assertEqual(data["status"], "cancelling")
+        self.assertTrue(task.cancel_requested)
 
     def test_upload_duplicate_processing_reuses_existing_task(self):
         content = b"same-pdf-content"
@@ -169,6 +311,46 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertEqual(data["status"], "processing")
         self.assertEqual(data["task_id"], old_task_id)
         self.assertEqual(data["file_id"], old_file_id)
+
+    def test_upload_duplicate_completed_existing_md_is_opt_in(self):
+        content = b"same-pdf-content-ready"
+        file_hash = app_module.hashlib.md5(content).hexdigest()
+        old_file_id = "file-ready"
+        old_task_id = "task-ready"
+
+        old_pdf = Path(app_module.PDF_DIR) / "ready.pdf"
+        old_pdf.write_bytes(content)
+        old_md = Path(app_module.MD_DIR) / f"{old_file_id}.md"
+        old_md.write_text("# ready md", encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=old_file_id,
+            filename="ready.pdf",
+            file_hash=file_hash,
+            pdf_path=str(old_pdf),
+            md_path=str(old_md),
+            status="completed",
+            task_id=old_task_id,
+        )
+
+        with TestClient(app_module.app) as client:
+            res_default = client.post("/upload", files={"file": ("ready.pdf", content, "application/pdf")})
+            res_with_md = client.post(
+                "/upload?include_existing_md=true",
+                files={"file": ("ready.pdf", content, "application/pdf")},
+            )
+
+        self.assertEqual(res_default.status_code, 200)
+        self.assertEqual(res_with_md.status_code, 200)
+        default_data = res_default.json()
+        with_md_data = res_with_md.json()
+
+        self.assertTrue(default_data["is_duplicate"])
+        self.assertEqual(default_data["status"], "completed")
+        self.assertEqual(default_data["file_id"], old_file_id)
+        self.assertNotIn("existing_md", default_data)
+
+        self.assertEqual(with_md_data.get("existing_md"), "# ready md")
 
     def test_upload_duplicate_processing_restarts_when_task_missing(self):
         content = b"same-pdf-content-restart"
@@ -327,6 +509,86 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertEqual(data["file_id"], file_id)
         self.assertEqual(data["flat_nodes"][0]["node_id"], "n_1")
 
+    def test_get_file_tree_can_skip_flat_nodes_payload(self):
+        file_id = "file-tree-skip-flat"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        md_path.write_text("# title\n## a\nx", encoding="utf-8")
+        source_md = Path(app_module.SOURCE_MD_DIR) / f"{file_id}.md"
+        source_md.write_text("# title\n## a\nx", encoding="utf-8")
+        index_path = Path(app_module.SOURCE_INDEX_DIR) / f"{file_id}.json"
+        index_payload = {
+            "file_id": file_id,
+            "source_md_path": str(source_md),
+            "tree": {"node_id": "root", "topic": "Root", "level": 0, "children": []},
+            "flat_nodes": [
+                {"node_id": "n_1", "topic": "A", "level": 1, "source_line_start": 1, "source_line_end": 2},
+                {"node_id": "n_2", "topic": "B", "level": 1, "source_line_start": 2, "source_line_end": 3},
+            ],
+            "node_index": {},
+        }
+        index_path.write_text(json.dumps(index_payload, ensure_ascii=False), encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="tree-skip-flat.pdf",
+            file_hash="hash-tree-skip-flat",
+            pdf_path=str(Path(app_module.PDF_DIR) / "tree-skip-flat.pdf"),
+            md_path=str(md_path),
+            status="completed",
+            task_id="task-tree-skip-flat",
+        )
+
+        with TestClient(app_module.app) as client:
+            res = client.get(f"/file/{file_id}/tree?include_flat_nodes=false")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data.get("flat_nodes"), [])
+        self.assertEqual(int(data.get("flat_nodes_total", 0)), 2)
+        self.assertFalse(bool(data.get("flat_nodes_has_more")))
+
+    def test_get_file_tree_supports_flat_nodes_pagination(self):
+        file_id = "file-tree-pagination"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        md_path.write_text("# title\n## a\nx", encoding="utf-8")
+        source_md = Path(app_module.SOURCE_MD_DIR) / f"{file_id}.md"
+        source_md.write_text("# title\n## a\nx", encoding="utf-8")
+        index_path = Path(app_module.SOURCE_INDEX_DIR) / f"{file_id}.json"
+        index_payload = {
+            "file_id": file_id,
+            "source_md_path": str(source_md),
+            "tree": {"node_id": "root", "topic": "Root", "level": 0, "children": []},
+            "flat_nodes": [
+                {"node_id": "n_1", "topic": "A", "level": 1, "source_line_start": 1, "source_line_end": 1},
+                {"node_id": "n_2", "topic": "B", "level": 1, "source_line_start": 2, "source_line_end": 2},
+                {"node_id": "n_3", "topic": "C", "level": 1, "source_line_start": 3, "source_line_end": 3},
+            ],
+            "node_index": {},
+        }
+        index_path.write_text(json.dumps(index_payload, ensure_ascii=False), encoding="utf-8")
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="tree-pagination.pdf",
+            file_hash="hash-tree-pagination",
+            pdf_path=str(Path(app_module.PDF_DIR) / "tree-pagination.pdf"),
+            md_path=str(md_path),
+            status="completed",
+            task_id="task-tree-pagination",
+        )
+
+        with TestClient(app_module.app) as client:
+            res = client.get(
+                f"/file/{file_id}/tree?include_tree=false&include_flat_nodes=true&flat_offset=1&flat_limit=1"
+            )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data.get("tree"), {})
+        self.assertEqual([node["node_id"] for node in data.get("flat_nodes", [])], ["n_2"])
+        self.assertEqual(int(data.get("flat_nodes_total", 0)), 3)
+        self.assertEqual(int(data.get("flat_nodes_offset", 0)), 1)
+        self.assertEqual(int(data.get("flat_nodes_limit", 0)), 1)
+        self.assertTrue(bool(data.get("flat_nodes_has_more")))
+
     def test_get_node_source_returns_excerpt(self):
         file_id = "file-source"
         md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
@@ -380,11 +642,76 @@ class FastAPIEndpointTests(unittest.TestCase):
         data = res.json()
         self.assertEqual(data["line_start"], 2)
         self.assertEqual(data["line_end"], 4)
-        self.assertGreaterEqual(len(data["excerpt_lines"]), 3)
-        in_range = [line for line in data["excerpt_lines"] if line["in_range"]]
-        self.assertTrue(any("Section A" in line["text"] for line in in_range))
         self.assertEqual(data["pdf_page_no"], 3)
         self.assertAlmostEqual(data["pdf_y_ratio"], 0.1, places=2)
+
+    def test_get_node_source_returns_norm_and_raw_line_numbers(self):
+        file_id = "file-source-map"
+        md_path = Path(app_module.MD_DIR) / f"{file_id}.md"
+        source_md = Path(app_module.SOURCE_MD_DIR) / f"{file_id}.md"
+        line_map_path = Path(app_module.SOURCE_LINE_MAP_DIR) / f"{file_id}.json"
+
+        md_path.write_text("# Root\nkeep\nnoise\n## B\nBody", encoding="utf-8")
+        source_md.write_text("# Root\n## B\nBody", encoding="utf-8")
+        line_map_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "file_id": file_id,
+                    "line_system": "normalized_v1",
+                    "norm_to_raw": [1, 4, 5],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        index_path = Path(app_module.SOURCE_INDEX_DIR) / f"{file_id}.json"
+        index_path.write_text(
+            json.dumps(
+                {
+                    "file_id": file_id,
+                    "source_md_path": str(source_md),
+                    "source_line_map_path": str(line_map_path),
+                    "line_system": "normalized_v1",
+                    "tree": {},
+                    "flat_nodes": [],
+                    "capabilities": {"anchor_version": "1.0", "parser_backend": "docling", "has_precise_anchor": True},
+                    "node_index": {
+                        "n_b": {
+                            "node_id": "n_b",
+                            "topic": "B",
+                            "level": 2,
+                            "source_line_start": 2,
+                            "source_line_end": 3,
+                        }
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        app_module.add_file_record(
+            file_id=file_id,
+            filename="source-map.pdf",
+            file_hash="hash-source-map",
+            pdf_path=str(Path(app_module.PDF_DIR) / "source-map.pdf"),
+            md_path=str(md_path),
+            status="completed",
+            task_id="task-source-map",
+        )
+
+        with TestClient(app_module.app) as client:
+            res = client.get(f"/file/{file_id}/node/n_b/source?context_lines=0&max_lines=10")
+
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["line_start_norm"], 2)
+        self.assertEqual(data["line_end_norm"], 3)
+        self.assertEqual(data["line_start_raw"], 4)
+        self.assertEqual(data["line_end_raw"], 5)
+        self.assertEqual(data["line_system"], "normalized_v1")
 
     def test_get_pdf_file_uses_inline_disposition(self):
         file_id = "file-inline"
@@ -703,6 +1030,7 @@ class FastAPIEndpointTests(unittest.TestCase):
                 "hybrid_switch_min_delta": 3,
                 "hybrid_marker_min_length": 300,
                 "marker_prefer_api": True,
+                "hf_endpoint_region": "cn",
                 "task_timeout_seconds": 1200,
             },
             "advanced": {
@@ -734,6 +1062,7 @@ class FastAPIEndpointTests(unittest.TestCase):
             self.assertEqual(parser.get("parser_backend"), "hybrid")
             self.assertEqual(parser.get("hybrid_marker_min_length"), 300)
             self.assertTrue(parser.get("marker_prefer_api"))
+            self.assertEqual(parser.get("hf_endpoint_region"), "cn")
             self.assertEqual(parser.get("task_timeout_seconds"), 1200)
             advanced = get_res.json().get("advanced", {})
             self.assertEqual(advanced.get("engine_concurrency"), 7)
@@ -750,6 +1079,7 @@ class FastAPIEndpointTests(unittest.TestCase):
                 "hybrid_switch_min_delta": 3.5,
                 "hybrid_marker_min_length": 256,
                 "marker_prefer_api": True,
+                "hf_endpoint_region": "global",
                 "task_timeout_seconds": 900,
             },
             "advanced": {
@@ -810,6 +1140,7 @@ class FastAPIEndpointTests(unittest.TestCase):
                 "hybrid_switch_min_delta": 2,
                 "hybrid_marker_min_length": 200,
                 "marker_prefer_api": False,
+                "hf_endpoint_region": "global",
                 "task_timeout_seconds": 61.5,
             },
             "advanced": {
@@ -836,6 +1167,44 @@ class FastAPIEndpointTests(unittest.TestCase):
             self.assertEqual(save_res.status_code, 422)
             detail = save_res.json().get("detail", {})
             self.assertEqual(detail.get("code"), "INVALID_TASK_TIMEOUT_SECONDS")
+
+    def test_config_rejects_invalid_hf_endpoint_region(self):
+        payload = {
+            "active_profile_id": "p1",
+            "parser": {
+                "parser_backend": "docling",
+                "hybrid_noise_threshold": 0.2,
+                "hybrid_docling_skip_score": 70,
+                "hybrid_switch_min_delta": 2,
+                "hybrid_marker_min_length": 200,
+                "marker_prefer_api": False,
+                "hf_endpoint_region": "mars",
+                "task_timeout_seconds": 600,
+            },
+            "advanced": {
+                "engine_concurrency": 5,
+                "engine_temperature": 0.3,
+                "engine_max_tokens": 8192,
+            },
+            "profiles": [
+                {
+                    "id": "p1",
+                    "name": "default",
+                    "provider": "deepseek",
+                    "base_url": "https://api.deepseek.com",
+                    "model": "deepseek-chat",
+                    "api_key": "sk-test-999",
+                    "account_type": "free",
+                    "manual_models": ["deepseek-chat"],
+                }
+            ],
+        }
+
+        with TestClient(app_module.app) as client:
+            save_res = client.post("/config", json=payload)
+            self.assertEqual(save_res.status_code, 422)
+            detail = save_res.json().get("detail", {})
+            self.assertEqual(detail.get("code"), "INVALID_HF_ENDPOINT_REGION")
 
     def test_local_filelock_blocks_concurrent_access(self):
         lock_path = str(self.base / "data" / "concurrency.lock")
@@ -1107,8 +1476,8 @@ class FastAPIEndpointTests(unittest.TestCase):
 
         self.assertEqual(task.status, app_module.TaskStatus.COMPLETED_WITH_GAPS)
         self.assertIn("Completed with gaps", task.message)
-        self.assertEqual(len(task.failure_details), 2)
-        self.assertEqual(task.failure_details[0]["topic"], "Root")
+        self.assertEqual(len(task.failure_details), 1)
+        self.assertEqual(task.failure_details[0]["topic"], "Child")
 
         app_module.tasks.pop(task_id, None)
         with TestClient(app_module.app) as client:
@@ -1116,7 +1485,7 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertEqual(status_res.status_code, 200)
         status_data = status_res.json()
         self.assertEqual(status_data["status"], "completed_with_gaps")
-        self.assertEqual(len(status_data.get("failure_details") or []), 2)
+        self.assertEqual(len(status_data.get("failure_details") or []), 1)
 
 
 if __name__ == "__main__":

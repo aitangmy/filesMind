@@ -15,8 +15,49 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from pathlib import Path
 from typing import Any, Dict
 
-# 配置 HuggingFace 镜像（解决国内网络访问问题）
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# HuggingFace Endpoint 按地区切换:
+# - global: 官方地址
+# - cn: 社区镜像
+HF_ENDPOINT_GLOBAL = "https://huggingface.co"
+HF_ENDPOINT_CN = "https://hf-mirror.com"
+_HF_ENDPOINT_BY_REGION = {
+    "global": HF_ENDPOINT_GLOBAL,
+    "cn": HF_ENDPOINT_CN,
+}
+
+
+def _normalize_hf_endpoint_region(value: Any, default: str = "global") -> str:
+    normalized_default = "cn" if str(default).strip().lower() == "cn" else "global"
+    if value is None:
+        return normalized_default
+    lowered = str(value).strip().lower()
+    if lowered in {"cn", "china", "mainland", "hf-mirror", "hf-mirror.com"}:
+        return "cn"
+    if lowered in {"global", "intl", "international", "overseas", "huggingface", "huggingface.co"}:
+        return "global"
+    return normalized_default
+
+
+def _default_hf_endpoint_region() -> str:
+    region_from_env = os.getenv("HF_ENDPOINT_REGION")
+    if region_from_env:
+        return _normalize_hf_endpoint_region(region_from_env, "global")
+    endpoint = str(os.getenv("HF_ENDPOINT", "")).strip().lower()
+    if "hf-mirror.com" in endpoint:
+        return "cn"
+    return "global"
+
+
+def _apply_hf_endpoint_region(region: Any) -> str:
+    normalized = _normalize_hf_endpoint_region(region, "global")
+    endpoint = _HF_ENDPOINT_BY_REGION.get(normalized, HF_ENDPOINT_GLOBAL)
+    os.environ["HF_ENDPOINT"] = endpoint
+    os.environ["HF_ENDPOINT_REGION"] = normalized
+    return normalized
+
+
+HF_ENDPOINT_REGION = _default_hf_endpoint_region()
+HF_ENDPOINT_REGION = _apply_hf_endpoint_region(HF_ENDPOINT_REGION)
 os.environ["HF_HOME"] = os.path.expanduser("~/.cache/huggingface")
 # os.environ["TRANSFORMERS_CACHE"] = os.path.expanduser("~/.cache/huggingface/transformers") # Deprecated
 os.environ["HF_HUB_OFFLINE"] = "0"
@@ -291,6 +332,7 @@ _parser_runtime_config: Dict[str, Any] = {
     "hybrid_switch_min_delta": HYBRID_SWITCH_MIN_DELTA,
     "hybrid_marker_min_length": HYBRID_MARKER_MIN_LENGTH,
     "marker_prefer_api": MARKER_PREFER_API,
+    "hf_endpoint_region": HF_ENDPOINT_REGION,
 }
 
 
@@ -724,15 +766,20 @@ def update_parser_runtime_config(config: Dict[str, Any]):
         config.get("marker_prefer_api", _parser_runtime_config["marker_prefer_api"]),
         MARKER_PREFER_API,
     )
+    _parser_runtime_config["hf_endpoint_region"] = _apply_hf_endpoint_region(
+        config.get("hf_endpoint_region", _parser_runtime_config.get("hf_endpoint_region", HF_ENDPOINT_REGION))
+    )
 
     logger.info(
-        "Parser runtime config updated: backend=%s, noise=%.2f, skip=%.1f, delta=%.1f, min_len=%d, marker_prefer_api=%s",
+        "Parser runtime config updated: backend=%s, noise=%.2f, skip=%.1f, delta=%.1f, min_len=%d, marker_prefer_api=%s, hf_endpoint_region=%s, hf_endpoint=%s",
         _parser_runtime_config["parser_backend"],
         _parser_runtime_config["hybrid_noise_threshold"],
         _parser_runtime_config["hybrid_docling_skip_score"],
         _parser_runtime_config["hybrid_switch_min_delta"],
         _parser_runtime_config["hybrid_marker_min_length"],
         _parser_runtime_config["marker_prefer_api"],
+        _parser_runtime_config["hf_endpoint_region"],
+        os.getenv("HF_ENDPOINT", ""),
     )
 
 
@@ -1263,9 +1310,9 @@ def get_optimized_converter(do_ocr: bool = True):
         logger.info(f"配置 CUDA 加速: 启用公式识别, 线程数={num_threads}")
         pipeline_opts.do_formula_enrichment = True
     elif device == AcceleratorDevice.MPS:
-        # Apple Silicon: 关闭公式识别以启用 MPS 加速（目前 MPS 对部分算子支持不全）
-        logger.info(f"配置 MPS 加速: 禁用公式识别以确保存定性, 线程数={num_threads}")
-        pipeline_opts.do_formula_enrichment = False
+        # Apple Silicon: 开启 MPS Fallback 后，现已可以安全启用公式识别与全功能硬件加速
+        logger.info(f"配置 MPS 加速: 启用全功能硬件加速由于 Fallback 已激活, 线程数={num_threads}")
+        pipeline_opts.do_formula_enrichment = True
     else:
         # CPU 模式
         logger.info(f"配置 CPU 模式: 禁用公式识别以提升速度, 线程数={num_threads}")

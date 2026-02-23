@@ -54,6 +54,7 @@ def _runtime_config(**overrides):
         "hybrid_switch_min_delta": 2.0,
         "hybrid_marker_min_length": 200,
         "marker_prefer_api": False,
+        "hf_endpoint_region": "global",
     }
     base.update(overrides)
     return base
@@ -205,6 +206,7 @@ class ParserMarkerFallbackTests(unittest.TestCase):
                 "hybrid_switch_min_delta": 4,
                 "hybrid_marker_min_length": 321,
                 "marker_prefer_api": True,
+                "hf_endpoint_region": "cn",
             }
         )
         cfg = ps.get_parser_runtime_config()
@@ -214,9 +216,11 @@ class ParserMarkerFallbackTests(unittest.TestCase):
         self.assertAlmostEqual(cfg["hybrid_switch_min_delta"], 4.0, places=2)
         self.assertEqual(cfg["hybrid_marker_min_length"], 321)
         self.assertTrue(cfg["marker_prefer_api"])
+        self.assertEqual(cfg["hf_endpoint_region"], "cn")
+        self.assertEqual(os.environ.get("HF_ENDPOINT"), ps.HF_ENDPOINT_CN)
 
         # restore default for test isolation
-        ps.update_parser_runtime_config(_runtime_config(parser_backend="docling"))
+        ps.update_parser_runtime_config(_runtime_config(parser_backend="docling", hf_endpoint_region="global"))
 
 
 class FixMarkdownHierarchyTests(unittest.TestCase):

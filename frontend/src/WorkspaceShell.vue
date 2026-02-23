@@ -1,6 +1,8 @@
 ﻿<script setup>
 import { ref, nextTick, onMounted, onUnmounted, computed, defineAsyncComponent, watch, defineComponent, h } from 'vue';
 import { useRouter } from 'vue-router';
+import { apiFetch, buildApiUrl, getApiAuthToken } from './services/apiClient';
+import { canUseDesktopPerfBridge, fetchMacosRuntimeState, perfBegin, perfEnd } from './services/macosRuntime';
 
 const props = defineProps({
   routeMode: {
@@ -53,10 +55,7 @@ let pdfPrefetchPromise = null;
 const prefetchPdfViewerAssets = () => {
   if (pdfPrefetchPromise) return pdfPrefetchPromise;
   pdfPrefetchPromise = Promise.all([
-    loadVirtualPdfViewerComponent(),
-    import('pdfjs-dist'),
-    import('vue-pdf-embed'),
-    import('vue-pdf-embed/dist/styles/annotationLayer.css')
+    loadVirtualPdfViewerComponent()
   ]).catch((err) => {
     console.warn('PDF assets prefetch failed', err);
   });
@@ -91,6 +90,10 @@ const parserBackendOptions = [
   { value: 'marker', label: 'Marker（版面鲁棒）' },
   { value: 'hybrid', label: 'Hybrid（自动择优）' }
 ];
+const hfEndpointRegionOptions = [
+  { value: 'global', label: '海外 / 国际网络（huggingface.co）' },
+  { value: 'cn', label: '中国大陆（hf-mirror.com）' }
+];
 
 const defaultParserConfig = () => ({
   parser_backend: 'docling',
@@ -99,6 +102,7 @@ const defaultParserConfig = () => ({
   hybrid_switch_min_delta: 2,
   hybrid_marker_min_length: 200,
   marker_prefer_api: false,
+  hf_endpoint_region: 'global',
   task_timeout_seconds: 600
 });
 
@@ -559,6 +563,10 @@ const fieldErrors = computed(() => {
   if (!['docling', 'marker', 'hybrid'].includes(parserBackend)) {
     errors.parser_backend = '解析后端仅支持 docling / marker / hybrid';
   }
+  const hfEndpointRegion = String(parserConfig.value.hf_endpoint_region || '').trim().toLowerCase();
+  if (!['global', 'cn'].includes(hfEndpointRegion)) {
+    errors.hf_endpoint_region = 'HF Endpoint 地区仅支持 global / cn';
+  }
 
   const noiseThreshold = Number(parserConfig.value.hybrid_noise_threshold);
   if (!Number.isFinite(noiseThreshold) || noiseThreshold < 0 || noiseThreshold > 1) {
@@ -607,6 +615,7 @@ const hasValidationErrors = computed(() => Object.keys(fieldErrors.value).length
 const canTestConfig = computed(() => Boolean(config.value.base_url?.trim() && config.value.model?.trim()) && !Boolean(fieldErrors.value.base_url || fieldErrors.value.model || fieldErrors.value.api_key));
 const parserErrorKeys = [
   'parser_backend',
+  'hf_endpoint_region',
   'task_timeout_seconds',
   'hybrid_noise_threshold',
   'hybrid_docling_skip_score',
@@ -683,6 +692,9 @@ const buildConfigStorePayload = ({ persistCurrentProfile = true } = {}) => {
   }
   const parser = {
     parser_backend: String(parserConfig.value.parser_backend || 'docling').trim().toLowerCase(),
+    hf_endpoint_region: ['global', 'cn'].includes(String(parserConfig.value.hf_endpoint_region || '').trim().toLowerCase())
+      ? String(parserConfig.value.hf_endpoint_region).trim().toLowerCase()
+      : 'global',
     hybrid_noise_threshold: Number(parserConfig.value.hybrid_noise_threshold ?? 0.2),
     hybrid_docling_skip_score: Number(parserConfig.value.hybrid_docling_skip_score ?? 70),
     hybrid_switch_min_delta: Number(parserConfig.value.hybrid_switch_min_delta ?? 2),
@@ -767,7 +779,7 @@ const normalizeBackendError = async (response, fallbackMessage) => {
 const exportConfig = async () => {
   persistEditorProfile();
   try {
-    const response = await fetch('/api/config/export');
+    const response = await apiFetch('/api/config/export');
     if (!response.ok) {
       const err = await normalizeBackendError(response, '导出配置失败');
       notify('error', `${getErrorHint(err.code, err.message)} (${err.code})`);
@@ -809,7 +821,7 @@ const importConfigFromFile = async (event) => {
       parser: parsed?.parser || defaultParserConfig(),
       advanced: parsed?.advanced || defaultAdvancedConfig()
     };
-    const response = await fetch('/api/config/import', {
+    const response = await apiFetch('/api/config/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -868,6 +880,9 @@ const normalizeConfigStore = (raw) => {
     parser_backend: ['docling', 'marker', 'hybrid'].includes(String(parserRaw.parser_backend || '').toLowerCase())
       ? String(parserRaw.parser_backend).toLowerCase()
       : 'docling',
+    hf_endpoint_region: ['global', 'cn'].includes(String(parserRaw.hf_endpoint_region || '').toLowerCase())
+      ? String(parserRaw.hf_endpoint_region).toLowerCase()
+      : 'global',
     hybrid_noise_threshold: Number.isFinite(Number(parserRaw.hybrid_noise_threshold))
       ? Number(parserRaw.hybrid_noise_threshold)
       : 0.2,
@@ -917,7 +932,14 @@ const sourceIndexRebuildItems = computed(() => {
   return Array.isArray(items) ? items : [];
 });
 
+const FLAT_NODE_PAGE_SIZE = 1200;
 const flatNodes = ref([]);
+const flatNodesFileId = ref('');
+const flatNodesTotal = ref(0);
+const flatNodesNextOffset = ref(0);
+const flatNodesHasMore = ref(false);
+let flatNodesPageInFlight = null;
+let flatNodesPageInFlightFileId = '';
 const selectedNode = ref(null);
 const sourceView = ref({
   loading: false,
@@ -925,20 +947,303 @@ const sourceView = ref({
   topic: '',
   lineStart: 0,
   lineEnd: 0,
-  excerptLines: [],
   parserBackend: 'unknown',
   pdfPageNo: null,
   pdfYRatio: null,
   pdfLoadError: ''
 });
+const pdfNavigateToken = ref(0);
 let sourceRequestToken = 0;
 
-const POLL_INTERVAL = 1500;
+const RUNTIME_MONITOR_ACTIVE_INTERVAL_MS = 5000;
+const RUNTIME_MONITOR_IDLE_INTERVAL_MS = 20000;
+const RUNTIME_MONITOR_IDLE_LOW_POWER_INTERVAL_MS = 30000;
+let runtimeMonitorTimer = null;
+let runtimeMonitorEnabled = false;
+const runtimeState = ref({
+  platform: 'unknown',
+  thermalLevel: 'unknown',
+  cpuSpeedLimit: null,
+  schedulerLimit: null,
+  availableCpus: null,
+  lowPowerMode: false,
+  timestampMs: 0
+});
+const runtimeHintState = ref({
+  signature: '',
+  syncedAtMs: 0
+});
+const desktopPerfSessionToken = ref(0);
+let pollInFlight = false;
+let runtimeHintInFlight = false;
+const thermalPollingProfile = {
+  nominal: 1400,
+  fair: 1800,
+  serious: 2400,
+  critical: 3200,
+  unknown: 1700
+};
+const thermalPdfProfile = {
+  nominal: { preloadMaxPages: 1500, preloadConcurrency: 2 },
+  fair: { preloadMaxPages: 900, preloadConcurrency: 2 },
+  serious: { preloadMaxPages: 420, preloadConcurrency: 1 },
+  critical: { preloadMaxPages: 180, preloadConcurrency: 1 },
+  unknown: { preloadMaxPages: 800, preloadConcurrency: 2 }
+};
+const thermalPdfWindowProfile = {
+  nominal: { maxMountedPages: 8, bufferPages: 2 },
+  fair: { maxMountedPages: 7, bufferPages: 2 },
+  serious: { maxMountedPages: 5, bufferPages: 1 },
+  critical: { maxMountedPages: 4, bufferPages: 1 },
+  unknown: { maxMountedPages: 6, bufferPages: 1 }
+};
+const pollCadenceState = ref({
+  stagnantTicks: 0,
+  lastProgress: -1,
+  lastStatus: ''
+});
+
+const normalizeThermalLevel = (value) => {
+  const level = String(value || '').trim().toLowerCase();
+  if (level === 'nominal' || level === 'fair' || level === 'serious' || level === 'critical') {
+    return level;
+  }
+  return 'unknown';
+};
+
+const applyRuntimeSnapshot = (snapshot) => {
+  if (!snapshot || typeof snapshot !== 'object') return;
+  const thermalRaw = snapshot.thermalLevel ?? snapshot.thermal_level;
+  const thermalLevel = thermalRaw ? normalizeThermalLevel(thermalRaw) : runtimeState.value.thermalLevel;
+  const lowPowerRaw = snapshot.lowPowerMode ?? snapshot.low_power_mode;
+  runtimeState.value = {
+    platform: String(snapshot.platform || runtimeState.value.platform || 'unknown'),
+    thermalLevel,
+    cpuSpeedLimit: Number.isFinite(Number(snapshot.cpuSpeedLimit ?? snapshot.cpu_speed_limit))
+      ? Number(snapshot.cpuSpeedLimit ?? snapshot.cpu_speed_limit)
+      : runtimeState.value.cpuSpeedLimit,
+    schedulerLimit: Number.isFinite(Number(snapshot.schedulerLimit ?? snapshot.scheduler_limit))
+      ? Number(snapshot.schedulerLimit ?? snapshot.scheduler_limit)
+      : runtimeState.value.schedulerLimit,
+    availableCpus: Number.isFinite(Number(snapshot.availableCpus ?? snapshot.available_cpus))
+      ? Number(snapshot.availableCpus ?? snapshot.available_cpus)
+      : runtimeState.value.availableCpus,
+    lowPowerMode: lowPowerRaw === undefined ? runtimeState.value.lowPowerMode : Boolean(lowPowerRaw),
+    timestampMs: Number(snapshot.timestampMs ?? snapshot.timestamp_ms) || Date.now()
+  };
+};
+
+const toIntOrNull = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.trunc(parsed);
+};
+
+const buildRuntimeHintPayload = () => ({
+  platform: String(runtimeState.value.platform || 'unknown').trim().toLowerCase() || 'unknown',
+  thermal_level: normalizeThermalLevel(runtimeState.value.thermalLevel),
+  cpu_speed_limit: toIntOrNull(runtimeState.value.cpuSpeedLimit),
+  scheduler_limit: toIntOrNull(runtimeState.value.schedulerLimit),
+  available_cpus: toIntOrNull(runtimeState.value.availableCpus),
+  low_power_mode: Boolean(runtimeState.value.lowPowerMode),
+  source: 'tauri_runtime_bridge',
+  timestamp_ms: toIntOrNull(runtimeState.value.timestampMs) || Date.now()
+});
+
+const runtimeHintSignature = (payload) => JSON.stringify([
+  payload.platform,
+  payload.thermal_level,
+  payload.cpu_speed_limit,
+  payload.scheduler_limit,
+  payload.available_cpus,
+  payload.low_power_mode
+]);
+
+const syncRuntimeHintToBackend = async ({ force = false } = {}) => {
+  if (!canUseDesktopPerfBridge()) return;
+  const payload = buildRuntimeHintPayload();
+  const signature = runtimeHintSignature(payload);
+  if (!force && signature === runtimeHintState.value.signature) {
+    return;
+  }
+  if (runtimeHintInFlight) return;
+
+  runtimeHintInFlight = true;
+  try {
+    const response = await apiFetch('/api/runtime/hint', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (response.ok) {
+      runtimeHintState.value = {
+        signature,
+        syncedAtMs: Date.now()
+      };
+    } else {
+      console.warn('runtime hint sync failed:', response.status);
+    }
+  } catch (error) {
+    console.warn('runtime hint sync error:', error);
+  } finally {
+    runtimeHintInFlight = false;
+  }
+};
+
+const refreshRuntimeState = async () => {
+  if (!canUseDesktopPerfBridge()) return;
+  const snapshot = await fetchMacosRuntimeState();
+  applyRuntimeSnapshot(snapshot);
+  await syncRuntimeHintToBackend();
+};
+
+const scheduleRuntimeMonitor = () => {
+  if (!runtimeMonitorEnabled) return;
+  if (runtimeMonitorTimer) {
+    clearTimeout(runtimeMonitorTimer);
+    runtimeMonitorTimer = null;
+  }
+  runtimeMonitorTimer = setTimeout(async () => {
+    runtimeMonitorTimer = null;
+    if (!runtimeMonitorEnabled) return;
+    await refreshRuntimeState();
+    scheduleRuntimeMonitor();
+  }, runtimeMonitorIntervalMs.value);
+};
+
+const beginDesktopPerfSession = async (reason = 'document-processing') => {
+  if (!canUseDesktopPerfBridge()) return;
+  if (Number(desktopPerfSessionToken.value) > 0) return;
+  const payload = await perfBegin(reason);
+  const token = Number(payload?.token || 0);
+  if (payload?.active && Number.isFinite(token) && token > 0) {
+    desktopPerfSessionToken.value = token;
+  }
+  applyRuntimeSnapshot(payload);
+  await refreshRuntimeState();
+};
+
+const endDesktopPerfSession = async () => {
+  if (!canUseDesktopPerfBridge()) return;
+  const token = Number(desktopPerfSessionToken.value || 0);
+  if (!Number.isFinite(token) || token <= 0) return;
+  desktopPerfSessionToken.value = 0;
+  const payload = await perfEnd(token);
+  applyRuntimeSnapshot(payload);
+  await refreshRuntimeState();
+};
+
+watch(isLoading, (loading) => {
+  if (loading) {
+    void beginDesktopPerfSession('document-processing');
+    return;
+  }
+  void endDesktopPerfSession();
+});
+
+const taskPollIntervalMs = computed(() => {
+  const level = normalizeThermalLevel(runtimeState.value.thermalLevel);
+  let interval = thermalPollingProfile[level] || thermalPollingProfile.unknown;
+  if (runtimeState.value.lowPowerMode) {
+    interval = Math.round(interval * 1.25);
+  }
+  return Math.max(900, Math.min(4500, interval));
+});
+
+const pdfRuntimeProfile = computed(() => {
+  const level = normalizeThermalLevel(runtimeState.value.thermalLevel);
+  const profile = thermalPdfProfile[level] || thermalPdfProfile.unknown;
+  let preloadMaxPages = profile.preloadMaxPages;
+  let preloadConcurrency = profile.preloadConcurrency;
+  if (runtimeState.value.lowPowerMode) {
+    preloadMaxPages = Math.max(120, Math.round(preloadMaxPages * 0.7));
+    preloadConcurrency = Math.max(1, preloadConcurrency - 1);
+  }
+  return { preloadMaxPages, preloadConcurrency };
+});
+const pdfPreloadMaxPages = computed(() => pdfRuntimeProfile.value.preloadMaxPages);
+const pdfPreloadConcurrency = computed(() => pdfRuntimeProfile.value.preloadConcurrency);
+const pdfWindowRuntimeProfile = computed(() => {
+  const level = normalizeThermalLevel(runtimeState.value.thermalLevel);
+  const profile = thermalPdfWindowProfile[level] || thermalPdfWindowProfile.unknown;
+  let maxMountedPages = profile.maxMountedPages;
+  const bufferPages = profile.bufferPages;
+  if (runtimeState.value.lowPowerMode) {
+    maxMountedPages = Math.max(3, maxMountedPages - 1);
+  }
+  return { maxMountedPages, bufferPages };
+});
+const pdfMaxMountedPages = computed(() => pdfWindowRuntimeProfile.value.maxMountedPages);
+const pdfBufferPages = computed(() => pdfWindowRuntimeProfile.value.bufferPages);
+
+const resetPollCadence = () => {
+  pollCadenceState.value = {
+    stagnantTicks: 0,
+    lastProgress: -1,
+    lastStatus: ''
+  };
+};
+
+const updatePollCadence = (statusValue, progressValue, forceStagnant = false) => {
+  const normalizedStatus = String(statusValue || '').trim().toLowerCase();
+  const parsedProgress = Number(progressValue);
+  const nextProgress = Number.isFinite(parsedProgress)
+    ? Math.max(0, Math.min(100, parsedProgress))
+    : pollCadenceState.value.lastProgress;
+  const previous = pollCadenceState.value;
+  const activeStatuses = ['pending', 'processing', 'uploading'];
+
+  if (!activeStatuses.includes(normalizedStatus)) {
+    resetPollCadence();
+    return;
+  }
+
+  const statusChanged = normalizedStatus !== previous.lastStatus;
+  const progressAdvanced = Number.isFinite(nextProgress) && nextProgress > (previous.lastProgress + 0.15);
+  const shouldResetStagnation = statusChanged || progressAdvanced;
+
+  let stagnantTicks = shouldResetStagnation ? 0 : previous.stagnantTicks;
+  if (!shouldResetStagnation && (forceStagnant || normalizedStatus === 'processing')) {
+    stagnantTicks = Math.min(12, previous.stagnantTicks + 1);
+  }
+
+  pollCadenceState.value = {
+    stagnantTicks,
+    lastProgress: nextProgress,
+    lastStatus: normalizedStatus
+  };
+};
+
+const resolveAdaptivePollDelayMs = () => {
+  const base = taskPollIntervalMs.value;
+  const status = String(taskStatus.value || '').trim().toLowerCase();
+  if (isUploadStage.value || status === 'uploading') {
+    return Math.max(900, Math.min(1600, base));
+  }
+  if (!status || !['pending', 'processing'].includes(status)) {
+    return base;
+  }
+
+  const stagnantBoost = 1 + Math.min(6, pollCadenceState.value.stagnantTicks) * 0.18;
+  const lowPowerBoost = runtimeState.value.lowPowerMode ? 1.15 : 1;
+  const raw = base * stagnantBoost * lowPowerBoost;
+  return Math.max(900, Math.min(6500, Math.round(raw)));
+};
+
 let pollStartTime = 0;
 const isUploadStage = computed(() => {
   if (!isLoading.value) return false;
   if (currentTaskId.value) return false;
   return ['pending', 'uploading'].includes(String(taskStatus.value || '').toLowerCase());
+});
+const runtimeMonitorIntervalMs = computed(() => {
+  if (isLoading.value || currentTaskId.value) {
+    return RUNTIME_MONITOR_ACTIVE_INTERVAL_MS;
+  }
+  if (runtimeState.value.lowPowerMode) {
+    return RUNTIME_MONITOR_IDLE_LOW_POWER_INTERVAL_MS;
+  }
+  return RUNTIME_MONITOR_IDLE_INTERVAL_MS;
 });
 
 const chunkProgress = computed(() => {
@@ -996,14 +1301,10 @@ const showMindmapCanvas = computed(() => Boolean(currentFileId.value) && isMindm
 const showMindmapToolbar = computed(() => showMindmapCanvas.value && !isLoading.value);
 const currentPdfSourceUrl = computed(() => {
   if (!currentFileId.value) return '';
-  return `/api/file/${currentFileId.value}/pdf`;
+  return buildApiUrl(`/api/file/${currentFileId.value}/pdf`);
 });
 const canUseVirtualPdf = computed(() => Boolean(systemFeatures.value?.FEATURE_VIRTUAL_PDF));
-const hasPdfAnchor = computed(() => {
-  const pageNo = Number(sourceView.value.pdfPageNo);
-  return Number.isInteger(pageNo) && pageNo > 0;
-});
-const showPdfViewer = computed(() => canUseVirtualPdf.value && hasPdfAnchor.value && Boolean(currentPdfSourceUrl.value));
+const showPdfViewer = computed(() => canUseVirtualPdf.value && Boolean(currentPdfSourceUrl.value));
 const workspaceGridStyle = computed(() => {
   if (!showDetailPane.value) {
     return { gridTemplateColumns: 'minmax(0, 1fr)' };
@@ -1041,7 +1342,7 @@ watch(showPdfViewer, (visible) => {
 // 加载历史记录
 const loadHistory = async () => {
   try {
-    const response = await fetch('/api/history');
+    const response = await apiFetch('/api/history');
     if (response.ok) {
       history.value = await response.json();
     }
@@ -1052,6 +1353,7 @@ const loadHistory = async () => {
 
 const resetSourceView = () => {
   sourceRequestToken += 1;
+  pdfNavigateToken.value = 0;
   selectedNode.value = null;
   sourceView.value = {
     loading: false,
@@ -1059,7 +1361,6 @@ const resetSourceView = () => {
     topic: '',
     lineStart: 0,
     lineEnd: 0,
-    excerptLines: [],
     parserBackend: 'unknown',
     pdfPageNo: null,
     pdfYRatio: null,
@@ -1067,161 +1368,163 @@ const resetSourceView = () => {
   };
 };
 
-const loadTreeForFile = async (fileId) => {
-  if (!fileId) {
+const resetFlatNodesCache = (fileId = '') => {
+  flatNodes.value = [];
+  flatNodesFileId.value = String(fileId || '').trim();
+  flatNodesTotal.value = 0;
+  flatNodesNextOffset.value = 0;
+  flatNodesHasMore.value = false;
+};
+
+const buildTreeRequestPath = (
+  fileId,
+  {
+    includeTree = true,
+    includeFlatNodes = false,
+    flatOffset = 0,
+    flatLimit = null
+  } = {}
+) => {
+  const params = new URLSearchParams();
+  params.set('include_tree', includeTree ? 'true' : 'false');
+  params.set('include_flat_nodes', includeFlatNodes ? 'true' : 'false');
+  params.set('flat_offset', String(Math.max(0, Number(flatOffset) || 0)));
+  const parsedLimit = Number(flatLimit);
+  if (includeFlatNodes && Number.isFinite(parsedLimit) && parsedLimit > 0) {
+    params.set('flat_limit', String(Math.trunc(parsedLimit)));
+  }
+  return `/api/file/${fileId}/tree?${params.toString()}`;
+};
+
+const mergeFlatNodePage = (incomingNodes, { replace = false } = {}) => {
+  const source = Array.isArray(incomingNodes) ? incomingNodes : [];
+  if (replace) {
+    flatNodes.value = source;
+    return;
+  }
+  if (!source.length) return;
+  const existing = Array.isArray(flatNodes.value) ? flatNodes.value : [];
+  const seenIds = new Set(
+    existing
+      .map((node) => String(node?.node_id || '').trim())
+      .filter(Boolean)
+  );
+  const merged = [...existing];
+  for (const node of source) {
+    if (!node || typeof node !== 'object') continue;
+    const nodeId = String(node.node_id || '').trim();
+    if (nodeId && seenIds.has(nodeId)) continue;
+    if (nodeId) seenIds.add(nodeId);
+    merged.push(node);
+  }
+  flatNodes.value = merged;
+};
+
+const loadTreeForFile = async (fileId, { includeFlatNodes = false } = {}) => {
+  const normalizedFileId = String(fileId || '').trim();
+  if (!normalizedFileId) {
     treeData.value = null;
-    flatNodes.value = [];
+    resetFlatNodesCache('');
     return;
   }
   try {
-    const response = await fetch(`/api/file/${fileId}/tree`);
+    const response = await apiFetch(
+      buildTreeRequestPath(normalizedFileId, {
+        includeTree: true,
+        includeFlatNodes,
+        flatOffset: 0,
+        flatLimit: includeFlatNodes ? FLAT_NODE_PAGE_SIZE : null
+      })
+    );
     if (!response.ok) {
       throw new Error('无法加载节点索引');
     }
     const data = await response.json();
     treeData.value = data.tree || null;
-    flatNodes.value = Array.isArray(data.flat_nodes) ? data.flat_nodes : [];
+
+    const total = Math.max(0, Number(data.flat_nodes_total) || 0);
+    flatNodesFileId.value = normalizedFileId;
+    flatNodesTotal.value = total;
+
+    if (includeFlatNodes) {
+      const pageNodes = Array.isArray(data.flat_nodes) ? data.flat_nodes : [];
+      mergeFlatNodePage(pageNodes, { replace: true });
+      const responseOffset = Math.max(0, Number(data.flat_nodes_offset) || 0);
+      flatNodesNextOffset.value = responseOffset + pageNodes.length;
+      flatNodesHasMore.value = Boolean(data.flat_nodes_has_more);
+    } else {
+      flatNodes.value = [];
+      flatNodesNextOffset.value = 0;
+      flatNodesHasMore.value = total > 0;
+    }
   } catch (err) {
     treeData.value = null;
-    flatNodes.value = [];
+    resetFlatNodesCache(normalizedFileId);
     console.error('加载节点树失败:', err);
   }
 };
 
-const normalizeTopicForMatch = (value) => String(value || '')
-  .replace(/[`*_~#>\[\]\(\)!]/g, ' ')
-  .replace(/\s+/g, ' ')
-  .trim()
-  .toLowerCase();
+const loadNextFlatNodesPage = async (fileId) => {
+  const normalizedFileId = String(fileId || '').trim();
+  if (!normalizedFileId) return [];
 
-const stripMarkdownPrefix = (line) => String(line || '')
-  .replace(/^\s{0,3}#{1,6}\s+/, '')
-  .replace(/^\s*[-*+]\s+/, '')
-  .replace(/^\s*\d+\.\s+/, '')
-  .trim();
+  if (flatNodesFileId.value !== normalizedFileId) {
+    resetFlatNodesCache(normalizedFileId);
+    flatNodesHasMore.value = true;
+  }
 
-const toPositiveInt = (value) => {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return 0;
-  const i = Math.floor(n);
-  return i > 0 ? i : 0;
-};
+  if (!flatNodesHasMore.value && flatNodes.value.length >= flatNodesTotal.value) {
+    return [];
+  }
 
-const clampInt = (value, min, max, fallback) => {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  const i = Math.floor(n);
-  if (i < min) return min;
-  if (i > max) return max;
-  return i;
-};
-
-const resolveLineRangeByTopic = (lines, topic) => {
-  const normalizedTopic = normalizeTopicForMatch(topic);
-  if (!normalizedTopic) return { start: 0, end: 0 };
-
-  let exactAt = 0;
-  let containsAt = 0;
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const lineNo = i + 1;
-    const rawLine = String(lines[i] || '');
-    const normalizedLine = normalizeTopicForMatch(rawLine);
-    const normalizedContent = normalizeTopicForMatch(stripMarkdownPrefix(rawLine));
-    if (!exactAt && (normalizedLine === normalizedTopic || normalizedContent === normalizedTopic)) {
-      exactAt = lineNo;
-      break;
-    }
-    if (!containsAt && (
-      normalizedLine.includes(normalizedTopic) ||
-      normalizedContent.includes(normalizedTopic) ||
-      normalizedTopic.includes(normalizedContent)
-    )) {
-      containsAt = lineNo;
+  if (flatNodesPageInFlight && flatNodesPageInFlightFileId !== normalizedFileId) {
+    try {
+      await flatNodesPageInFlight;
+    } catch (_err) {
+      // Swallow previous file's paging error and continue with current file.
     }
   }
 
-  const lineNo = exactAt || containsAt;
-  if (!lineNo) return { start: 0, end: 0 };
-  return { start: lineNo, end: lineNo };
-};
-
-const buildLocalExcerptFromMarkdown = (lineStart, lineEnd, topic = '', contextLines = 2, maxLines = 120) => {
-  const markdown = String(mindmapData.value || '');
-  if (!markdown.trim()) {
-    return {
-      lineStart: 0,
-      lineEnd: 0,
-      excerptLines: []
-    };
+  if (flatNodesPageInFlight && flatNodesPageInFlightFileId === normalizedFileId) {
+    return flatNodesPageInFlight;
   }
 
-  const lines = markdown.split('\n');
-  const total = lines.length;
-  if (!total) {
-    return {
-      lineStart: 0,
-      lineEnd: 0,
-      excerptLines: []
-    };
-  }
+  flatNodesPageInFlightFileId = normalizedFileId;
+  flatNodesPageInFlight = (async () => {
+    const offset = Math.max(0, Number(flatNodesNextOffset.value) || 0);
+    const response = await apiFetch(
+      buildTreeRequestPath(normalizedFileId, {
+        includeTree: false,
+        includeFlatNodes: true,
+        flatOffset: offset,
+        flatLimit: FLAT_NODE_PAGE_SIZE
+      })
+    );
+    if (!response.ok) {
+      throw new Error('无法加载节点索引分页数据');
+    }
+    const data = await response.json();
+    const pageNodes = Array.isArray(data.flat_nodes) ? data.flat_nodes : [];
+    const responseOffset = Math.max(0, Number(data.flat_nodes_offset) || offset);
+    flatNodesFileId.value = normalizedFileId;
+    flatNodesTotal.value = Math.max(0, Number(data.flat_nodes_total) || 0);
+    flatNodesNextOffset.value = responseOffset + pageNodes.length;
+    flatNodesHasMore.value = Boolean(data.flat_nodes_has_more);
+    mergeFlatNodePage(pageNodes, { replace: responseOffset === 0 && offset === 0 });
+    return pageNodes;
+  })();
 
-  const context = clampInt(contextLines, 0, 30, 2);
-  const budget = clampInt(maxLines, 1, 300, 120);
-
-  let start = toPositiveInt(lineStart);
-  let end = toPositiveInt(lineEnd);
-
-  if (!start && end) start = end;
-  if (!end && start) end = start;
-
-  const hasDirectRange = start >= 1 && start <= total && end >= 1 && end <= total;
-  if (!hasDirectRange) {
-    const matched = resolveLineRangeByTopic(lines, topic);
-    start = matched.start;
-    end = matched.end;
-  }
-
-  if (!(start >= 1 && start <= total && end >= 1 && end <= total)) {
-    return {
-      lineStart: 0,
-      lineEnd: 0,
-      excerptLines: []
-    };
-  }
-
-  start = Math.max(1, Math.min(total, start));
-  end = Math.max(start, Math.min(total, end));
-
-  let excerptStart = Math.max(1, start - context);
-  let excerptEnd = Math.min(total, end + context);
-
-  if (excerptEnd - excerptStart + 1 > budget) {
-    excerptStart = Math.max(1, Math.min(excerptStart, total - budget + 1));
-    excerptEnd = Math.min(total, excerptStart + budget - 1);
-    if (end > excerptEnd) {
-      excerptEnd = Math.min(total, end);
-      excerptStart = Math.max(1, excerptEnd - budget + 1);
+  try {
+    return await flatNodesPageInFlight;
+  } finally {
+    if (flatNodesPageInFlightFileId === normalizedFileId) {
+      flatNodesPageInFlight = null;
+      flatNodesPageInFlightFileId = '';
     }
   }
-
-  const excerptLines = [];
-  for (let i = excerptStart; i <= excerptEnd; i += 1) {
-    excerptLines.push({
-      line_no: i,
-      text: lines[i - 1] ?? '',
-      in_range: i >= start && i <= end
-    });
-  }
-
-  return {
-    lineStart: start,
-    lineEnd: end,
-    excerptLines
-  };
 };
 
-const loadNodeSource = async (nodeId, fallbackPayload = null) => {
+const loadNodeSource = async (nodeId) => {
   if (!currentFileId.value || !nodeId) return;
   const requestToken = ++sourceRequestToken;
   const requestedFileId = currentFileId.value;
@@ -1229,7 +1532,7 @@ const loadNodeSource = async (nodeId, fallbackPayload = null) => {
   sourceView.value.error = '';
   sourceView.value.pdfLoadError = '';
   try {
-    const response = await fetch(`/api/file/${requestedFileId}/node/${nodeId}/source?context_lines=2&max_lines=120`);
+    const response = await apiFetch(`/api/file/${requestedFileId}/node/${nodeId}/source`);
     if (!response.ok) {
       throw new Error('节点原文加载失败');
     }
@@ -1243,36 +1546,14 @@ const loadNodeSource = async (nodeId, fallbackPayload = null) => {
       topic: data.topic || '',
       lineStart: data.line_start || 0,
       lineEnd: data.line_end || 0,
-      excerptLines: Array.isArray(data.excerpt_lines) ? data.excerpt_lines : [],
       parserBackend: data.capabilities?.parser_backend ?? 'unknown',
       pdfPageNo: Number.isInteger(Number(data.pdf_page_no)) ? Number(data.pdf_page_no) : null,
       pdfYRatio: Number.isFinite(Number(data.pdf_y_ratio)) ? Number(data.pdf_y_ratio) : null,
       pdfLoadError: ''
     };
+    pdfNavigateToken.value += 1;
   } catch (err) {
     if (requestToken !== sourceRequestToken || currentFileId.value !== requestedFileId) {
-      return;
-    }
-    const fallback = buildLocalExcerptFromMarkdown(
-      fallbackPayload?.sourceLineStart,
-      fallbackPayload?.sourceLineEnd,
-      fallbackPayload?.topic,
-      2,
-      120
-    );
-    if (fallback.excerptLines.length) {
-      sourceView.value = {
-        loading: false,
-        error: '',
-        topic: fallbackPayload?.topic || '',
-        lineStart: fallback.lineStart,
-        lineEnd: fallback.lineEnd,
-        excerptLines: fallback.excerptLines,
-        parserBackend: 'local-fallback',
-        pdfPageNo: null,
-        pdfYRatio: null,
-        pdfLoadError: ''
-      };
       return;
     }
     sourceView.value.loading = false;
@@ -1282,22 +1563,15 @@ const loadNodeSource = async (nodeId, fallbackPayload = null) => {
 
 const handleMindmapNodeClick = async (payload) => {
   if (!payload?.nodeId) {
-    const fallback = buildLocalExcerptFromMarkdown(
-      payload?.sourceLineStart,
-      payload?.sourceLineEnd,
-      payload?.topic,
-      2,
-      120
-    );
+    pdfNavigateToken.value = 0;
     selectedNode.value = payload || null;
     sourceView.value = {
       loading: false,
-      error: fallback.excerptLines.length ? '' : 'No traceable index for this node. Please select a structured node.',
+      error: '',
       topic: payload?.topic || '',
-      lineStart: fallback.lineStart,
-      lineEnd: fallback.lineEnd,
-      excerptLines: fallback.excerptLines,
-      parserBackend: fallback.excerptLines.length ? 'local-fallback' : (sourceView.value.parserBackend || 'unknown'),
+      lineStart: Number(payload?.sourceLineStart || 0),
+      lineEnd: Number(payload?.sourceLineEnd || payload?.sourceLineStart || 0),
+      parserBackend: sourceView.value.parserBackend || 'unknown',
       pdfPageNo: null,
       pdfYRatio: null,
       pdfLoadError: ''
@@ -1305,7 +1579,7 @@ const handleMindmapNodeClick = async (payload) => {
     return;
   }
   selectedNode.value = payload;
-  await loadNodeSource(payload.nodeId, payload);
+  await loadNodeSource(payload.nodeId);
 };
 
 const handlePdfViewerLoaded = () => {
@@ -1338,21 +1612,44 @@ const clearTaskErrorNotice = () => {
   showAllFailureDetails.value = false;
 };
 
+const matchFailedNodeFromCandidates = (candidates, item) => {
+  const list = Array.isArray(candidates) ? candidates : [];
+  if (!list.length) return null;
+
+  const targetNodeId = String(item?.nodeId || '').trim();
+  if (targetNodeId) {
+    const byId = list.find((node) => String(node?.node_id || '').trim() === targetNodeId);
+    if (byId) return byId;
+  }
+
+  const targetTopic = String(item?.topic || '').trim().toLowerCase();
+  if (!targetTopic) return null;
+  return (
+    list.find((node) => String(node?.topic || '').trim().toLowerCase() === targetTopic) ||
+    null
+  );
+};
+
 const locateFailedNode = async (item) => {
-  const candidates = Array.isArray(flatNodes.value) ? flatNodes.value : [];
-  if (!candidates.length) {
-    notify('warning', 'Current mind map index is not ready yet');
+  const fileId = String(currentFileId.value || '').trim();
+  if (!fileId) {
+    notify('warning', 'Current file context is missing');
     return;
   }
 
-  let matched = null;
-  if (item?.nodeId) {
-    matched = candidates.find((node) => String(node?.node_id || '') === String(item.nodeId));
-  }
-
-  if (!matched && item?.topic) {
-    const topic = String(item.topic).trim().toLowerCase();
-    matched = candidates.find((node) => String(node?.topic || '').trim().toLowerCase() === topic);
+  let matched = matchFailedNodeFromCandidates(flatNodes.value, item);
+  while (!matched && (flatNodesHasMore.value || flatNodesFileId.value !== fileId)) {
+    try {
+      const page = await loadNextFlatNodesPage(fileId);
+      if (!Array.isArray(page) || !page.length) {
+        break;
+      }
+      matched = matchFailedNodeFromCandidates(page, item) || matchFailedNodeFromCandidates(flatNodes.value, item);
+    } catch (err) {
+      console.error('加载节点索引分页失败:', err);
+      notify('warning', 'Failed to load node index page');
+      return;
+    }
   }
 
   if (!matched) {
@@ -1386,12 +1683,17 @@ const loadFile = async (fileId) => {
     resetSourceView();
     taskFailureDetails.value = [];
     showAllFailureDetails.value = false;
-    const response = await fetch(`/api/file/${fileId}`);
+    const response = await apiFetch(`/api/file/${fileId}?format=raw`);
     if (!response.ok) {
       throw new Error('文件加载失败');
     }
-    const data = await response.json();
-    mindmapData.value = data.content;
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('application/json')) {
+      const data = await response.json();
+      mindmapData.value = data.content || '';
+    } else {
+      mindmapData.value = await response.text();
+    }
     isMindmapReady.value = true;
     currentFileId.value = fileId;
     await loadTreeForFile(fileId);
@@ -1409,7 +1711,7 @@ const deleteFile = async (fileId, event) => {
   if (!confirm('Are you sure you want to delete this file?')) return;
   
   try {
-    const response = await fetch(`/api/file/${fileId}`, {
+    const response = await apiFetch(`/api/file/${fileId}`, {
       method: 'DELETE'
     });
     if (response.ok) {
@@ -1419,7 +1721,7 @@ const deleteFile = async (fileId, event) => {
         isMindmapReady.value = false;
         currentFileId.value = null;
         treeData.value = null;
-        flatNodes.value = [];
+        resetFlatNodesCache('');
         resetSourceView();
       }
     }
@@ -1431,15 +1733,85 @@ const deleteFile = async (fileId, event) => {
 // 清理轮询
 const cleanupPoll = () => {
   if (pollTimer.value) {
-    clearInterval(pollTimer.value);
+    clearTimeout(pollTimer.value);
     pollTimer.value = null;
   }
+  pollInFlight = false;
   currentTaskId.value = null;
   pollStartTime = 0;
+  resetPollCadence();
 };
+
+const scheduleNextPoll = (delayMs = resolveAdaptivePollDelayMs()) => {
+  if (!currentTaskId.value) return;
+  if (pollTimer.value) {
+    clearTimeout(pollTimer.value);
+    pollTimer.value = null;
+  }
+  const resolvedDelay = Math.max(600, Number(delayMs) || 0);
+  pollTimer.value = setTimeout(() => {
+    pollTimer.value = null;
+    void runPollTick();
+  }, resolvedDelay);
+};
+
+const runPollTick = async () => {
+  if (!currentTaskId.value) return;
+  if (pollInFlight) {
+    scheduleNextPoll(resolveAdaptivePollDelayMs());
+    return;
+  }
+  pollInFlight = true;
+  try {
+    await checkPollTimeout();
+    if (currentTaskId.value) {
+      await pollTaskStatus(currentFileId.value, currentTaskId.value);
+    }
+  } finally {
+    pollInFlight = false;
+    if (currentTaskId.value) {
+      scheduleNextPoll(resolveAdaptivePollDelayMs());
+    }
+  }
+};
+
+const startTaskPolling = (docId, taskId, message = '') => {
+  if (!taskId) return;
+  if (pollTimer.value) {
+    clearTimeout(pollTimer.value);
+    pollTimer.value = null;
+  }
+  currentTaskId.value = taskId;
+  if (docId) {
+    currentFileId.value = docId;
+  }
+  pollStartTime = Date.now();
+  resetPollCadence();
+  updatePollCadence('processing', 0, false);
+  if (message) {
+    taskMessage.value = message;
+  }
+  void runPollTick();
+};
+
+watch(taskPollIntervalMs, () => {
+  if (!currentTaskId.value || pollInFlight) return;
+  scheduleNextPoll(Math.min(resolveAdaptivePollDelayMs(), 900));
+});
+
+watch(runtimeMonitorIntervalMs, () => {
+  if (!runtimeMonitorEnabled) return;
+  scheduleRuntimeMonitor();
+});
 
 onUnmounted(() => {
   cleanupPoll();
+  runtimeMonitorEnabled = false;
+  if (runtimeMonitorTimer) {
+    clearTimeout(runtimeMonitorTimer);
+    runtimeMonitorTimer = null;
+  }
+  void endDesktopPerfSession();
   if (advancedAutoSaveTimer) {
     clearTimeout(advancedAutoSaveTimer);
     advancedAutoSaveTimer = null;
@@ -1464,8 +1836,8 @@ const pollTaskStatus = async (docId, taskId = '') => {
   if (!docId && !taskId) return;
   try {
     const response = docId
-      ? await fetch(`/api/documents/${docId}/status`)
-      : await fetch(`/api/task/${taskId}`);
+      ? await apiFetch(`/api/documents/${docId}/status`)
+      : await apiFetch(`/api/task/${taskId}`);
 
     if (response.status === 404) {
       cleanupPoll();
@@ -1485,15 +1857,15 @@ const pollTaskStatus = async (docId, taskId = '') => {
     taskProgress.value = data.progress;
     taskMessage.value = data.message;
     taskFailureDetails.value = normalizeFailureDetails(data.failure_details);
+    updatePollCadence(data.status, data.progress);
 
     if (data.status === 'completed' || data.status === 'completed_with_gaps') {
       cleanupPoll();
       taskFailureDetails.value = [];
       showAllFailureDetails.value = false;
-      const resolvedFileId = data.doc_id || data.file_id || docId;
+      const resolvedFileId = data.doc_id || data.file_id || docId || currentFileId.value;
       if (resolvedFileId) {
         currentFileId.value = resolvedFileId;
-        await loadTreeForFile(resolvedFileId);
         await loadFile(resolvedFileId);
       } else if (data.result) {
         mindmapData.value = data.result;
@@ -1524,6 +1896,7 @@ const pollTaskStatus = async (docId, taskId = '') => {
     }
 
   } catch (err) {
+    updatePollCadence(taskStatus.value || 'processing', taskProgress.value || 0, true);
     console.error('Poll error:', err);
   }
 };
@@ -1532,7 +1905,7 @@ const requestTaskCancel = async (taskId, reason = 'manual cancel', docId = null)
   if (!taskId && !docId) return;
   try {
     const endpoint = docId ? `/api/documents/${docId}/cancel` : `/api/task/${taskId}/cancel`;
-    const response = await fetch(endpoint, {
+    const response = await apiFetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reason })
@@ -1562,7 +1935,11 @@ const uploadPdfFile = (file) => new Promise((resolve, reject) => {
   formData.append('file', file);
 
   const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/upload');
+  xhr.open('POST', buildApiUrl('/api/upload'));
+  const desktopToken = getApiAuthToken();
+  if (desktopToken) {
+    xhr.setRequestHeader('X-FilesMind-Token', desktopToken);
+  }
   xhr.responseType = 'json';
 
   xhr.upload.onprogress = (event) => {
@@ -1636,6 +2013,10 @@ const handleSelectedFile = async (file, clearInput) => {
   taskMessage.value = '正在上传文件...';
 
   try {
+    if (canUseDesktopPerfBridge()) {
+      await refreshRuntimeState();
+      await syncRuntimeHintToBackend({ force: true });
+    }
     const data = await uploadPdfFile(file);
     
     if (data.error) {
@@ -1644,11 +2025,20 @@ const handleSelectedFile = async (file, clearInput) => {
 
     if (data.is_duplicate) {
       if (data.status === 'completed') {
-        mindmapData.value = data.existing_md;
-        isMindmapReady.value = true;
-        currentFileId.value = data.doc_id || data.file_id;
-        await loadTreeForFile(data.file_id);
-        isLoading.value = false;
+        const resolvedFileId = data.doc_id || data.file_id;
+        if (!resolvedFileId) {
+          throw new Error('未获取到历史文件ID');
+        }
+        currentFileId.value = resolvedFileId;
+        if (typeof data.existing_md === 'string' && data.existing_md.length > 0) {
+          mindmapData.value = data.existing_md;
+          isMindmapReady.value = true;
+          await loadTreeForFile(resolvedFileId);
+          await syncMindMapZoom();
+          isLoading.value = false;
+        } else {
+          await loadFile(resolvedFileId);
+        }
         uploadProgress.value = 0;
         notify('info', '该文件已存在，已直接加载历史结果');
         if (typeof clearInput === 'function') clearInput();
@@ -1658,19 +2048,12 @@ const handleSelectedFile = async (file, clearInput) => {
       if (data.status === 'processing' && data.task_id) {
         uploadProgress.value = 0;
         isMindmapReady.value = false;
-        currentTaskId.value = data.task_id;
-        currentFileId.value = data.file_id;
-        pollStartTime = Date.now();
         taskStatus.value = 'processing';
-        taskMessage.value = data.message || '检测到相同文件正在处理中，已连接到现有任务';
-
-        pollTimer.value = setInterval(() => {
-          void checkPollTimeout();
-          if (currentTaskId.value) {
-            void pollTaskStatus(currentFileId.value, currentTaskId.value);
-          }
-        }, POLL_INTERVAL);
-        void pollTaskStatus(currentFileId.value, data.task_id);
+        startTaskPolling(
+          data.file_id,
+          data.task_id,
+          data.message || '检测到相同文件正在处理中，已连接到现有任务'
+        );
         await loadHistory();
         return;
       }
@@ -1682,19 +2065,9 @@ const handleSelectedFile = async (file, clearInput) => {
 
     uploadProgress.value = 0;
     isMindmapReady.value = false;
-    currentTaskId.value = data.task_id;
-    currentFileId.value = data.doc_id || data.file_id;
-    pollStartTime = Date.now();
     taskStatus.value = 'processing';
-    
-    pollTimer.value = setInterval(() => {
-      void checkPollTimeout();
-      if (currentTaskId.value) {
-        void pollTaskStatus(currentFileId.value, currentTaskId.value);
-      }
-    }, POLL_INTERVAL);
-    
-    void pollTaskStatus(currentFileId.value, data.task_id);
+
+    startTaskPolling(data.doc_id || data.file_id, data.task_id);
     await loadHistory();
     
   } catch (err) {
@@ -1785,6 +2158,11 @@ onMounted(() => {
   }
   updateViewport();
   window.addEventListener('resize', updateViewport);
+  if (canUseDesktopPerfBridge()) {
+    runtimeMonitorEnabled = true;
+    void refreshRuntimeState();
+    scheduleRuntimeMonitor();
+  }
   loadHistory();
   loadConfig();
   checkHardware();
@@ -1794,7 +2172,7 @@ onMounted(() => {
 // 获取系统功能开关
 const loadFeatures = async () => {
   try {
-    const response = await fetch('/api/system/features');
+    const response = await apiFetch('/api/system/features');
     if (response.ok) {
       const data = await response.json();
       systemFeatures.value = { ...systemFeatures.value, ...data };
@@ -1807,7 +2185,7 @@ const loadFeatures = async () => {
 // 检查硬件状态
 const checkHardware = async () => {
     try {
-        const response = await fetch('/api/system/hardware');
+        const response = await apiFetch('/api/system/hardware');
         if (response.ok) {
             const data = await response.json();
             hardwareType.value = data.device_type;
@@ -1821,7 +2199,7 @@ const checkHardware = async () => {
 // 加载配置
 const loadConfig = async () => {
   try {
-    const response = await fetch('/api/config');
+    const response = await apiFetch('/api/config');
     if (response.ok) {
       const data = await response.json();
       const normalized = normalizeConfigStore(data);
@@ -1879,7 +2257,7 @@ const saveConfig = async (scope = 'all', options = {}) => {
     const payload = buildConfigStorePayload({
       persistCurrentProfile: scope === 'all' || scope === 'llm'
     });
-    const response = await fetch('/api/config', {
+    const response = await apiFetch('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -1947,7 +2325,7 @@ const testConfig = async () => {
   configLoading.value = true;
   configTestResult.value = null;
   try {
-    const response = await fetch('/api/config/test', {
+    const response = await apiFetch('/api/config/test', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(buildSingleProfilePayload())
@@ -1987,7 +2365,7 @@ const loadModels = async () => {
   modelLoading.value = true;
   modelFetchResult.value = null;
   try {
-    const response = await fetch('/api/config/models', {
+    const response = await apiFetch('/api/config/models', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(buildSingleProfilePayload())
@@ -2038,7 +2416,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
   if (sourceIndexRebuildRunning.value) return;
   sourceIndexRebuildRunning.value = true;
   try {
-    const response = await fetch('/api/admin/source-index/rebuild', {
+    const response = await apiFetch('/api/admin/source-index/rebuild', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2088,7 +2466,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
 <template>
   <div
     ref="appShellRef"
-    class="app-shell h-screen flex font-sans overflow-hidden relative text-slate-700 dark:text-slate-200"
+    class="app-shell w-full h-screen flex transform-gpu font-sans overflow-hidden relative text-slate-700 dark:text-slate-200"
     @dragover.prevent="onDragOver"
     @dragleave.prevent="onDragLeave"
     @drop.prevent="onDrop"
@@ -2146,7 +2524,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
       </div>
 
       <!-- 文件列表 -->
-      <div class="flex-grow overflow-y-auto p-3 bg-slate-50/50 dark:bg-slate-900/20">
+      <div class="flex-1 overflow-y-auto p-3 bg-slate-50/50 dark:bg-slate-900/20">
         <div class="flex items-center justify-between mb-3 px-2">
           <div class="text-xs font-semibold text-slate-500 uppercase tracking-wider">
             历史文件
@@ -2172,7 +2550,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
               : 'bg-white/60 border-transparent hover:bg-white hover:border-slate-200/40 hover:shadow-soft'"
           >
             <div class="flex items-start justify-between gap-2">
-              <div class="flex-grow min-w-0">
+              <div class="flex-1 min-w-0">
                 <div class="font-medium text-slate-700 truncate text-sm">{{ item.filename }}</div>
                 <div class="flex items-center gap-2 mt-1.5">
                   <span
@@ -2225,7 +2603,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
     </div>
 
     <!-- 主内容区 -->
-    <div class="flex-grow flex flex-col min-w-0">
+    <div class="flex-1 flex flex-col min-w-0">
       <!-- 椤堕儴瀵艰埅鏍?-->
       <header class="app-toolbar flex-shrink-0 backdrop-blur-xl border-b border-slate-200/40 dark:border-slate-700/60 shadow-sm">
         <div class="h-14 flex items-center justify-between px-4">
@@ -2280,7 +2658,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
             <button
               @click="openSettingsPage"
               data-testid="settings-open-btn"
-              class="flex items-center gap-2 px-3 py-2 rounded-xl text-slate-500 dark:text-slate-300 hover:text-indigo-600 dark:hover:text-indigo-300 hover:bg-indigo-50/80 dark:hover:bg-slate-700/60 transition-all duration-200 border border-transparent hover:border-indigo-100 dark:hover:border-slate-600 font-medium"
+              class="settings-open-btn flex items-center gap-2 px-3 py-2 rounded-xl text-slate-600 dark:text-slate-100 transition-all duration-200 border font-semibold"
               title="系统设置"
             >
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2295,9 +2673,9 @@ const runSourceIndexRebuild = async (dryRun = false) => {
         <div v-if="topNoticeVisible" class="px-4 pb-3 space-y-2">
           <div
             v-if="isLoading"
-            class="rounded-xl border border-blue-200/70 bg-gradient-to-r from-blue-50 to-indigo-50 px-3 py-2 flex items-center gap-2"
+            class="rounded-xl border border-blue-200/70 dark:border-blue-500/40 bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-slate-800/90 dark:to-slate-700/80 px-3 py-2 flex items-center gap-2"
           >
-            <div class="flex-1 h-2 bg-white/70 rounded-full overflow-hidden">
+            <div class="flex-1 h-2 bg-white/80 dark:bg-slate-900/90 rounded-full overflow-hidden border border-white/40 dark:border-slate-600/80">
               <div
                 class="brand-progress h-full rounded-full transition-all duration-300 relative overflow-hidden"
                 :class="{ 'animate-pulse': isUploadStage }"
@@ -2306,9 +2684,9 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                 <div class="absolute inset-0 bg-white/20 animate-pulse"></div>
               </div>
             </div>
-            <span class="text-[11px] font-semibold text-slate-700 w-11 text-right">{{ Math.round(effectiveTaskProgress) }}%</span>
-            <span class="text-[11px] text-slate-500 max-w-[240px] truncate">{{ taskMessage }}</span>
-            <button @click="cancelTask" class="p-1 rounded-md text-slate-400 hover:text-rose-500 hover:bg-rose-50 transition-all duration-200">
+            <span class="text-[11px] font-semibold text-slate-700 dark:text-slate-100 w-11 text-right">{{ Math.round(effectiveTaskProgress) }}%</span>
+            <span class="text-[11px] text-slate-500 dark:text-slate-300 max-w-[240px] truncate">{{ taskMessage }}</span>
+            <button @click="cancelTask" class="p-1 rounded-md text-slate-400 dark:text-slate-300 hover:text-rose-500 dark:hover:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-500/20 transition-all duration-200">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
               </svg>
@@ -2370,7 +2748,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
       </header>
 
       <!-- 主内容区（双栏分割容器） -->
-      <main class="flex-grow p-6 overflow-hidden bg-slate-100/50 dark:bg-slate-900/30 flex">
+      <main class="flex-1 p-6 overflow-hidden bg-slate-100/50 dark:bg-slate-900/30 flex">
         <div
           ref="workspaceLayoutRef"
           class="h-full w-full grid items-stretch overflow-hidden"
@@ -2398,18 +2776,18 @@ const runSourceIndexRebuild = async (dryRun = false) => {
 
             <div class="flex-1 min-h-0 w-full relative">
               <Transition name="fade" mode="out-in">
-                <div v-if="!showMindmapCanvas" key="hero-upload" class="absolute inset-0 p-6 md:p-10 bg-gradient-to-b from-slate-50 to-white flex items-center justify-center">
+                <div v-if="!showMindmapCanvas" key="hero-upload" class="absolute inset-0 p-6 md:p-10 bg-gradient-to-b from-slate-50 to-white dark:from-slate-900 dark:to-slate-950 flex items-center justify-center">
                   <div
                     @click="triggerFileInput"
-                    class="group w-full max-w-3xl min-h-[340px] rounded-3xl border-2 border-dashed border-slate-300 hover:border-orange-400 hover:bg-orange-50/60 transition-all duration-300 ease-out cursor-pointer bg-white/90 shadow-sm flex flex-col items-center justify-center px-8 py-10"
-                    :class="{ 'border-orange-400 bg-orange-50/70 shadow-md': isDraggingFile }"
+                    class="group w-full max-w-3xl min-h-[340px] rounded-3xl border-2 border-dashed border-slate-300 dark:border-slate-600 hover:border-orange-400 dark:hover:border-orange-300 hover:bg-orange-50/60 dark:hover:bg-orange-500/10 transition-all duration-300 ease-out cursor-pointer bg-white/90 dark:bg-slate-800/85 shadow-sm flex flex-col items-center justify-center px-8 py-10"
+                    :class="{ 'border-orange-400 dark:border-orange-300 bg-orange-50/70 dark:bg-orange-500/15 shadow-md': isDraggingFile }"
                   >
-                    <svg class="w-20 h-20 mb-5 text-slate-400 group-hover:text-blue-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg class="w-20 h-20 mb-5 text-slate-400 dark:text-slate-500 group-hover:text-blue-500 dark:group-hover:text-blue-300 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 16.5V9.75m0 0l3 3m-3-3l-3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z"></path>
                     </svg>
-                    <h2 class="text-xl md:text-2xl font-semibold text-slate-700 tracking-wide text-center">点击或拖拽 PDF 文件至此</h2>
-                    <p class="text-sm text-slate-500 mt-3 text-center">解析完成后自动生成思维导图，并在右侧联动展示节点详情与原文片段</p>
-                    <p class="text-xs text-slate-400 mt-4">支持 PDF 格式，最大 50MB</p>
+                    <h2 class="text-xl md:text-2xl font-semibold text-slate-700 dark:text-slate-100 tracking-wide text-center">点击或拖拽 PDF 文件至此</h2>
+                    <p class="text-sm text-slate-500 dark:text-slate-300 mt-3 text-center">解析完成后自动生成思维导图，并在右侧联动展示节点详情与 PDF 原文</p>
+                    <p class="text-xs text-slate-400 dark:text-slate-400 mt-4">支持 PDF 格式，最大 50MB</p>
 
                     <div v-if="isLoading" class="w-full max-w-xl mt-8 space-y-4">
                       <div class="skeleton-tree-wrap">
@@ -2424,7 +2802,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                         </div>
                       </div>
 
-                      <div class="w-full h-3 bg-slate-200 rounded-full overflow-hidden">
+                      <div class="w-full h-3 bg-slate-200 dark:bg-slate-700 rounded-full overflow-hidden border border-slate-200/60 dark:border-slate-600/70">
                         <div
                           class="brand-progress h-full rounded-full transition-all duration-300 relative"
                           :class="{ 'animate-pulse': isUploadStage }"
@@ -2434,8 +2812,8 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                         </div>
                       </div>
                       <div class="mt-2 flex items-center justify-between text-xs">
-                        <span class="text-slate-500 truncate pr-3">{{ taskMessage }}</span>
-                        <span class="text-slate-600 font-medium">{{ Math.round(effectiveTaskProgress) }}%</span>
+                        <span class="text-slate-500 dark:text-slate-300 truncate pr-3">{{ taskMessage }}</span>
+                        <span class="text-slate-600 dark:text-slate-100 font-medium">{{ Math.round(effectiveTaskProgress) }}%</span>
                       </div>
                     </div>
                   </div>
@@ -2499,7 +2877,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                   节点详情
                 </h3>
                 <p class="text-[11px] text-slate-500 mt-0.5 truncate max-w-[240px]" :title="sourceView.topic || '选择节点以查看'">
-                  {{ sourceView.topic ? sourceView.topic : '选择左侧节点以查看详情与原文片段' }}
+                  {{ sourceView.topic ? sourceView.topic : '选择左侧节点以查看详情与 PDF 原文' }}
                 </p>
               </div>
             </div>
@@ -2511,7 +2889,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5A3.375 3.375 0 0010.125 2.25H6.75A2.25 2.25 0 004.5 4.5v15A2.25 2.25 0 006.75 21.75h10.5a2.25 2.25 0 002.25-2.25v-5.25z"></path>
                   </svg>
                   <h4 class="text-sm font-semibold text-slate-700">详情面板</h4>
-                  <p class="text-xs text-slate-500 mt-1 leading-relaxed">上传并生成导图后，点击左侧节点可在这里查看结构化摘要和原文片段。</p>
+                  <p class="text-xs text-slate-500 mt-1 leading-relaxed">上传并生成导图后，点击左侧节点可在这里查看结构化摘要和 PDF 原文。</p>
                 </div>
               </div>
               <div v-else-if="!selectedNode" class="absolute inset-0 flex items-center justify-center p-6 bg-slate-50/50">
@@ -2520,7 +2898,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13.5 4.5L21 12l-7.5 7.5M3 12h18"></path>
                   </svg>
                   <h4 class="text-sm font-semibold text-slate-700">请选择导图节点</h4>
-                  <p class="text-xs text-slate-500 mt-1 leading-relaxed">点击左侧任意节点后，这里会展示行号范围和对应原文片段。</p>
+                  <p class="text-xs text-slate-500 mt-1 leading-relaxed">点击左侧任意节点后，这里会展示行号范围并定位 PDF 原文。</p>
                 </div>
               </div>
               <div v-else-if="sourceView.loading" class="absolute inset-x-0 top-0 z-20 flex justify-center p-2">
@@ -2537,8 +2915,8 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                   {{ sourceView.error }}
                 </div>
               </div>
-              <div v-else class="w-full h-full overflow-y-auto p-4 space-y-3">
-                <div class="flex flex-wrap gap-2">
+              <div v-else class="w-full h-full p-4 flex flex-col gap-3 min-h-0">
+                <div class="flex flex-wrap gap-2 flex-shrink-0">
                   <span class="px-2 py-1 rounded-lg bg-blue-50 text-blue-700 border border-blue-200 text-xs font-medium">
                     {{ sourceView.topic || selectedNode.topic || '未命名节点' }}
                   </span>
@@ -2552,31 +2930,24 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                     PDF P{{ sourceView.pdfPageNo }}
                   </span>
                 </div>
-                <div v-if="showPdfViewer" class="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 overflow-hidden h-[48vh] min-h-[280px]">
+                <div v-if="showPdfViewer" class="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 overflow-hidden flex-1 min-h-[320px]">
                   <VirtualPdfViewer
-                    :key="`${currentFileId || 'none'}:${sourceView.pdfPageNo || 0}:${sourceView.pdfYRatio ?? 0}`"
+                    :key="currentFileId || 'none'"
                     :source-url="currentPdfSourceUrl"
                     :page-no="sourceView.pdfPageNo"
                     :y-ratio="sourceView.pdfYRatio"
+                    :navigate-key="pdfNavigateToken"
                     :scale="1.05"
+                    :max-mounted-pages="pdfMaxMountedPages"
+                    :buffer-pages="pdfBufferPages"
+                    :preload-max-pages="pdfPreloadMaxPages"
+                    :preload-concurrency="pdfPreloadConcurrency"
                     @loaded="handlePdfViewerLoaded"
                     @error="handlePdfViewerError"
                   />
                 </div>
-                <div v-else-if="canUseVirtualPdf && selectedNode" class="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-3 text-xs text-slate-500 dark:text-slate-300">
-                  当前节点缺少 PDF 定位锚点，已自动切换到原文片段查看。
-                </div>
-                <div v-if="sourceView.pdfLoadError" class="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700">
+                <div v-if="sourceView.pdfLoadError" class="rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700 flex-shrink-0">
                   PDF 渲染失败：{{ sourceView.pdfLoadError }}
-                </div>
-                <div v-if="sourceView.excerptLines.length" class="bg-slate-900 rounded-xl p-3 text-[11px] leading-relaxed text-slate-200 font-mono overflow-x-auto border border-slate-700/60">
-                  <div v-for="line in sourceView.excerptLines" :key="line.line_no" class="flex gap-2">
-                    <span class="w-8 text-right select-none text-slate-500">{{ line.line_no }}</span>
-                    <span :class="line.in_range ? 'text-emerald-300' : 'text-slate-400'">{{ line.text || ' ' }}</span>
-                  </div>
-                </div>
-                <div v-else class="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4 text-xs text-slate-500 dark:text-slate-300">
-                  当前节点暂无原文片段数据。
                 </div>
               </div>
             </div>
@@ -2594,8 +2965,8 @@ const runSourceIndexRebuild = async (dryRun = false) => {
       class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center z-50 p-4"
       @click.self="closeSettings"
     >
-      <div class="app-card elev-lg rounded-2xl w-full max-w-2xl mx-4 overflow-hidden flex flex-col h-[min(90vh,820px)] transition-all duration-300 ease-out border border-slate-200/40">
-        <div class="flex items-center justify-between px-6 py-4 border-b border-slate-200/40 bg-gradient-to-r from-slate-50/80 to-blue-50/20 flex-shrink-0">
+      <div class="settings-modal-panel app-card elev-lg rounded-2xl w-full max-w-2xl mx-4 overflow-hidden flex flex-col h-[min(90vh,820px)] transition-all duration-300 ease-out border border-slate-200/40">
+        <div class="settings-modal-header flex items-center justify-between px-6 py-4 border-b border-slate-200/40 bg-gradient-to-r from-slate-50/80 to-blue-50/20 flex-shrink-0">
           <div class="flex items-center gap-3">
             <div class="p-2 bg-blue-100 rounded-xl">
               <svg class="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2610,12 +2981,12 @@ const runSourceIndexRebuild = async (dryRun = false) => {
               </p>
             </div>
           </div>
-          <button @click="closeSettings" class="p-2 rounded-xl text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-all duration-200">
+          <button @click="closeSettings" class="settings-modal-close-btn p-2 rounded-xl text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-all duration-200">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
           </button>
         </div>
 
-        <div class="px-6 pt-3 pb-1 border-b border-slate-200/40 bg-slate-50/70 flex items-center gap-2">
+        <div class="settings-modal-tabs px-6 pt-3 pb-1 border-b border-slate-200/40 bg-slate-50/70 flex items-center gap-2">
           <button
             data-testid="settings-tab-model"
             class="settings-tab-btn"
@@ -2653,7 +3024,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
           @change="importConfigFromFile"
         />
 
-        <div class="p-6 flex-1 min-h-0 overflow-y-auto">
+        <div class="settings-modal-body p-6 flex-1 min-h-0 overflow-y-auto">
           <div v-if="activeSettingsTab === 'model'" data-testid="settings-model-panel" class="space-y-5">
             <div class="flex items-center justify-between gap-2 p-3 bg-blue-50/60 border border-blue-100 rounded-xl">
               <p class="text-xs text-slate-600">支持导出当前配置（不含明文密钥），并在本机或其他环境导入。</p>
@@ -2811,6 +3182,21 @@ const runSourceIndexRebuild = async (dryRun = false) => {
                 </option>
               </select>
               <p v-if="fieldErrors.parser_backend" class="text-xs text-rose-600">{{ fieldErrors.parser_backend }}</p>
+
+              <div>
+                <label class="text-xs text-slate-600">HuggingFace 访问区域</label>
+                <select
+                  v-model="parserConfig.hf_endpoint_region"
+                  :data-error="Boolean(fieldErrors.hf_endpoint_region)"
+                  class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+                >
+                  <option v-for="opt in hfEndpointRegionOptions" :key="opt.value" :value="opt.value">
+                    {{ opt.label }}
+                  </option>
+                </select>
+                <p class="text-[11px] text-slate-500 mt-1">用于控制 `HF_ENDPOINT`，建议按所在网络环境选择。</p>
+                <p v-if="fieldErrors.hf_endpoint_region" class="text-xs text-rose-600 mt-1">{{ fieldErrors.hf_endpoint_region }}</p>
+              </div>
 
               <div>
                 <label class="text-xs text-slate-600">任务超时（秒）</label>
@@ -3055,7 +3441,7 @@ const runSourceIndexRebuild = async (dryRun = false) => {
           </div>
         </div>
 
-        <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-slate-200/60 bg-slate-50 flex-shrink-0">
+        <div class="settings-modal-footer flex items-center justify-end gap-3 px-6 py-4 border-t border-slate-200/60 bg-slate-50 flex-shrink-0">
           <button
             v-if="activeSettingsTab === 'model'"
             @click="testConfig"
@@ -3103,6 +3489,20 @@ const runSourceIndexRebuild = async (dryRun = false) => {
   font-weight: 600;
 }
 
+.settings-open-btn {
+  position: relative;
+  border-color: rgba(148, 163, 184, 0.35);
+  background: rgba(255, 255, 255, 0.78);
+  color: #334155;
+  box-shadow: 0 1px 1px rgba(15, 23, 42, 0.04);
+}
+
+.settings-open-btn:hover {
+  color: #3730a3;
+  border-color: rgba(129, 140, 248, 0.45);
+  background: rgba(238, 242, 255, 0.95);
+}
+
 .settings-tab-btn {
   padding: 0.375rem 0.75rem;
   font-size: 0.75rem;
@@ -3122,26 +3522,6 @@ const runSourceIndexRebuild = async (dryRun = false) => {
 .settings-tab-btn:hover {
   color: #1e293b;
   background: #f1f5f9;
-}
-
-:global(.dark) .toolbar-btn {
-  color: #cbd5e1;
-}
-
-:global(.dark) .toolbar-btn:hover {
-  color: #f8fafc;
-  background: rgba(51, 65, 85, 0.75);
-}
-
-:global(.dark) .settings-tab-btn {
-  color: #cbd5e1;
-  border-color: rgba(71, 85, 105, 0.45);
-}
-
-:global(.dark) .settings-tab-btn.active {
-  background: rgba(30, 58, 138, 0.5);
-  color: #dbeafe;
-  border-color: rgba(96, 165, 250, 0.45);
 }
 
 .skeleton-tree-wrap {
@@ -3213,6 +3593,19 @@ const runSourceIndexRebuild = async (dryRun = false) => {
   opacity: 1;
   box-shadow: 0 0 16px rgba(59, 130, 246, 0.35);
   animation: skeleton-breath 1.4s ease-in-out infinite;
+}
+
+:global(.dark) .skeleton-tree-wrap {
+  border-color: rgba(100, 116, 139, 0.7);
+  background: linear-gradient(180deg, rgba(51, 65, 85, 0.7) 0%, rgba(30, 41, 59, 0.82) 100%);
+}
+
+:global(.dark) .skeleton-trunk {
+  background: linear-gradient(180deg, #64748b 0%, #475569 100%);
+}
+
+:global(.dark) .skeleton-branch {
+  background: rgba(148, 163, 184, 0.4);
 }
 
 @keyframes skeleton-breath {

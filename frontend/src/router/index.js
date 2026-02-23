@@ -1,12 +1,19 @@
-import { createRouter, createWebHistory } from 'vue-router';
+import { createRouter, createWebHashHistory, createWebHistory } from 'vue-router';
+import WorkspaceShell from '../WorkspaceShell.vue';
 
-const WorkspaceShell = () => import('../WorkspaceShell.vue');
+// Use hash history in production bundles to avoid blank screens at /index.html
+// under desktop webviews (e.g. tauri.localhost).
+const useHashHistory = !import.meta.env.DEV;
 
 const router = createRouter({
-  history: createWebHistory(),
+  history: useHashHistory ? createWebHashHistory() : createWebHistory(),
   routes: [
     {
       path: '/',
+      redirect: '/workspace'
+    },
+    {
+      path: '/index.html',
       redirect: '/workspace'
     },
     {
@@ -20,6 +27,12 @@ const router = createRouter({
       name: 'settings',
       component: WorkspaceShell,
       props: { routeMode: 'settings' }
+    },
+    {
+      path: '/:pathMatch(.*)*',
+      name: 'fallback-workspace',
+      component: WorkspaceShell,
+      props: { routeMode: 'workspace' }
     }
   ]
 });

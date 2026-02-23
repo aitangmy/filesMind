@@ -1,5 +1,6 @@
 <script setup>
 import { ref, shallowRef, watch, nextTick, onMounted, onUnmounted, computed } from 'vue';
+import { apiFetch } from '../services/apiClient';
 
 let mindMapCoreCtor = null;
 let mindMapCoreLoader = null;
@@ -129,6 +130,61 @@ const hasStructuredTree = (tree) => {
   return Boolean(tree && Array.isArray(tree.children) && tree.children.length > 0);
 };
 
+const hasIndexedNodeInTree = (treeRoot) => {
+  if (!treeRoot || typeof treeRoot !== 'object') return false;
+  const stack = [treeRoot];
+  let scanned = 0;
+  const MAX_SCAN_NODES = 12000;
+  while (stack.length && scanned < MAX_SCAN_NODES) {
+    const current = stack.pop();
+    scanned += 1;
+    const nodeId = String(current?.node_id || '').trim();
+    if (nodeId) return true;
+    const children = Array.isArray(current?.children) ? current.children : [];
+    for (const child of children) {
+      if (child && typeof child === 'object') {
+        stack.push(child);
+      }
+    }
+  }
+  return false;
+};
+
+const hasUsableIndexedNodes = computed(() => {
+  if (Array.isArray(props.flatNodes) && props.flatNodes.some((node) => {
+    if (!node || typeof node !== 'object') return false;
+    return String(node.node_id || '').trim() !== '';
+  })) {
+    return true;
+  }
+  return hasIndexedNodeInTree(props.tree);
+});
+
+const countTreeNodes = (node) => {
+  if (!node || !Array.isArray(node.children)) return 0;
+  let total = 1;
+  for (const child of node.children) {
+    total += countTreeNodes(child);
+  }
+  return total;
+};
+
+const estimateMarkdownRichness = (markdown) => {
+  if (!markdown) return 0;
+  const lines = String(markdown).split('\n');
+  let count = 0;
+  for (const line of lines) {
+    if (/^(#{1,6})\s+.+$/.test(line)) {
+      count += 1;
+      continue;
+    }
+    if (/^(\s*)([-*+]|\d+[.)])\s+\S.+$/.test(line)) {
+      count += 1;
+    }
+  }
+  return count;
+};
+
 const buildMindMapNodeFromTree = (node, depth = 0) => {
   const topic = normalizeText(node?.topic || '');
   const children = Array.isArray(node?.children)
@@ -149,6 +205,7 @@ const buildMindMapNodeFromTree = (node, depth = 0) => {
 };
 
 const buildMindMapNodeFromMarkdown = (markdown) => {
+  const MAX_MARKDOWN_RENDER_NODES = 1800;
   const root = {
     data: {
       text: '文档导图',
@@ -164,14 +221,69 @@ const buildMindMapNodeFromMarkdown = (markdown) => {
   if (!markdown) return root;
 
   const lines = String(markdown).split('\n');
-  const stack = [{ level: 0, node: root }];
+  const stack = [{ level: 0, node: root, kind: 'root' }];
+  let nodeCount = 0;
+
+  const appendNode = (node, level, kind) => {
+    while (stack.length > 1 && stack[stack.length - 1].level >= level) {
+      stack.pop();
+    }
+    stack[stack.length - 1].node.children.push(node);
+    stack.push({ level, node, kind });
+    nodeCount += 1;
+  };
+
+  const extractListTopic = (body) => {
+    const normalized = normalizeText(body || '');
+    if (!normalized) return '';
+    return normalizeText(
+      normalized
+        .replace(/\*\*(.*?)\*\*/g, '$1')
+        .replace(/__(.*?)__/g, '$1')
+        .replace(/`([^`]+)`/g, '$1')
+    );
+  };
+
+  const nearestHeadingLevel = () => {
+    for (let i = stack.length - 1; i >= 0; i -= 1) {
+      if (stack[i].kind === 'heading') return stack[i].level;
+    }
+    return 1;
+  };
+
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    const match = line.match(/^(#{1,6})\s+(.+)$/);
-    if (!match) continue;
+    const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
+    const listMatch = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.+)$/);
 
-    const level = match[1].length;
-    const topic = normalizeText(match[2]);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const topic = normalizeText(headingMatch[2]);
+      if (!topic) continue;
+
+      const node = {
+        data: {
+          text: smartWrapText(topic, 40),
+          topic,
+          nodeId: '',
+          level,
+          sourceLineStart: i + 1,
+          sourceLineEnd: i + 1
+        },
+        children: []
+      };
+      appendNode(node, level, 'heading');
+      continue;
+    }
+
+    if (!listMatch) continue;
+    if (nodeCount >= MAX_MARKDOWN_RENDER_NODES) continue;
+
+    const indentText = (listMatch[1] || '').replace(/\t/g, '    ');
+    const listDepth = Math.floor(indentText.length / 2) + 1;
+    const baseLevel = nearestHeadingLevel();
+    const level = Math.min(12, Math.max(2, baseLevel + listDepth));
+    const topic = extractListTopic(listMatch[3]);
     if (!topic) continue;
 
     const node = {
@@ -185,13 +297,7 @@ const buildMindMapNodeFromMarkdown = (markdown) => {
       },
       children: []
     };
-
-    while (stack.length > 1 && stack[stack.length - 1].level >= level) {
-      stack.pop();
-    }
-
-    stack[stack.length - 1].node.children.push(node);
-    stack.push({ level, node });
+    appendNode(node, level, 'list');
   }
 
   if (!root.children.length) {
@@ -213,8 +319,23 @@ const buildMindMapNodeFromMarkdown = (markdown) => {
   return root;
 };
 
+const shouldPreferMarkdown = computed(() => {
+  if (!props.markdown) return false;
+  const markdownRichness = estimateMarkdownRichness(props.markdown);
+  if (!hasStructuredTree(props.tree)) {
+    return markdownRichness > 0;
+  }
+  const treeRichness = countTreeNodes(props.tree);
+  // When we already have a usable indexed tree, keep it to preserve stable nodeId-based interactions.
+  if (hasUsableIndexedNodes.value && treeRichness > 2) {
+    return false;
+  }
+  if (treeRichness <= 0) return markdownRichness > 0;
+  return markdownRichness >= Math.max(treeRichness * 1.8, treeRichness + 40);
+});
+
 const mindMapData = computed(() => {
-  if (hasStructuredTree(props.tree)) {
+  if (hasStructuredTree(props.tree) && !shouldPreferMarkdown.value) {
     return buildMindMapNodeFromTree(props.tree, 0);
   }
   return buildMindMapNodeFromMarkdown(props.markdown);
@@ -321,14 +442,15 @@ const emitZoomChange = () => {
   });
 };
 
-const scheduleFit = (delay = 120, token = updateToken) => {
+const scheduleViewportSync = (delay = 120, token = updateToken, options = {}) => {
+  const shouldFit = options.fit !== false;
   if (fitTimer) clearTimeout(fitTimer);
   fitTimer = setTimeout(() => {
     if (!mindMapInstance.value || token !== updateToken) return;
     if (typeof mindMapInstance.value.resize === 'function') {
       mindMapInstance.value.resize();
     }
-    if (mindMapInstance.value.view && typeof mindMapInstance.value.view.fit === 'function') {
+    if (shouldFit && mindMapInstance.value.view && typeof mindMapInstance.value.view.fit === 'function') {
       mindMapInstance.value.view.fit();
     }
     emitZoomChange();
@@ -464,7 +586,7 @@ const initMindMap = async () => {
     instance.on('scale', handleScaleChange);
     mindMapInstance.value = instance;
     applyTheme();
-    scheduleFit(140, updateToken);
+    scheduleViewportSync(140, updateToken, { fit: true });
     emitZoomChange();
   })();
   try {
@@ -482,7 +604,7 @@ const refreshMindMap = async () => {
   }
   mindMapInstance.value.setData(mindMapData.value);
   applyTheme();
-  scheduleFit(120, token);
+  scheduleViewportSync(120, token, { fit: true });
 };
 
 const exportMarkdown = () => {
@@ -646,7 +768,7 @@ const downloadBlobAsFile = (blob, filename) => {
 };
 
 const exportPngViaServer = async ({ svg, width, height, padding = 20 }) => {
-  const response = await fetch('/api/export/png', {
+  const response = await apiFetch('/api/export/png', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -758,7 +880,7 @@ const expandAll = () => {
   if (typeof mindMapInstance.value.execCommand === 'function') {
     mindMapInstance.value.execCommand('EXPAND_ALL');
   }
-  scheduleFit(100, updateToken);
+  scheduleViewportSync(100, updateToken, { fit: true });
 };
 
 const collapseAll = () => {
@@ -766,7 +888,7 @@ const collapseAll = () => {
   if (typeof mindMapInstance.value.execCommand === 'function') {
     mindMapInstance.value.execCommand('UNEXPAND_ALL', false);
   }
-  scheduleFit(100, updateToken);
+  scheduleViewportSync(100, updateToken, { fit: true });
 };
 
 const fitView = () => {
@@ -792,7 +914,7 @@ onMounted(async () => {
   if (containerRef.value && typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(() => {
       if (!mindMapInstance.value) return;
-      scheduleFit(100, updateToken);
+      scheduleViewportSync(100, updateToken, { fit: false });
     });
     resizeObserver.observe(containerRef.value);
   }
