@@ -43,6 +43,13 @@ struct MindMapCanvasPane: View {
                 .padding(.vertical, DesignSpacing.x2)
                 .background(.regularMaterial, in: Capsule())
                 .padding(DesignSpacing.x4)
+
+                if model.importedDocuments.isEmpty {
+                    OnboardingCard()
+                        .padding(.top, 98)
+                        .padding(.leading, DesignSpacing.x4)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                }
             }
         }
         .overlay(alignment: .bottomTrailing) {
@@ -112,6 +119,7 @@ struct MindMapCanvasPane: View {
     }
 
     private func drawNodes(context: inout GraphicsContext, nodes: [GraphNode]) {
+        let isOnboardingState = model.importedDocuments.isEmpty
         for node in nodes {
             let rect = CGRect(
                 x: node.rect.x * zoom + pan.width,
@@ -125,18 +133,80 @@ struct MindMapCanvasPane: View {
             let isFocused = node.id == model.focusedGraphNodeID
             context.fill(
                 path,
-                with: .color(isFocused ? Color.accentColor.opacity(0.18) : Color.white.opacity(0.9))
+                with: .color(fillColor(isFocused: isFocused, isOnboardingState: isOnboardingState))
             )
             context.stroke(
                 path,
-                with: .color(isFocused ? Color.accentColor.opacity(0.9) : Color.black.opacity(0.12)),
+                with: .color(strokeColor(isFocused: isFocused, isOnboardingState: isOnboardingState)),
                 lineWidth: isFocused ? 2.2 : 1
             )
 
             let title = Text(node.title)
                 .font(.system(size: max(11, DesignTypography.body * zoom * 0.8), weight: .medium))
-                .foregroundStyle(isFocused ? Color.accentColor : Color.primary)
+                .foregroundStyle(titleColor(isFocused: isFocused, isOnboardingState: isOnboardingState))
             context.draw(title, at: CGPoint(x: rect.midX, y: rect.midY), anchor: .center)
+        }
+    }
+
+    private func fillColor(isFocused: Bool, isOnboardingState: Bool) -> Color {
+        if isFocused {
+            return Color.accentColor.opacity(0.18)
+        }
+        return isOnboardingState ? Color.white.opacity(0.82) : Color.white.opacity(0.92)
+    }
+
+    private func strokeColor(isFocused: Bool, isOnboardingState: Bool) -> Color {
+        if isFocused {
+            return Color.accentColor.opacity(0.9)
+        }
+        return isOnboardingState ? Color.black.opacity(0.2) : Color.black.opacity(0.12)
+    }
+
+    private func titleColor(isFocused: Bool, isOnboardingState: Bool) -> Color {
+        if isFocused {
+            return .accentColor
+        }
+        return isOnboardingState ? .secondary : .primary
+    }
+}
+
+private struct OnboardingCard: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: DesignSpacing.x3) {
+            Text("Welcome to filesMind")
+                .font(.system(size: DesignTypography.title, weight: .semibold))
+            Text("This is the initial workspace canvas. Start from the left sidebar and the graph will be built automatically.")
+                .font(.system(size: DesignTypography.body))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: DesignSpacing.x2) {
+                stepBadge(index: 1, title: "Choose Workspace")
+                stepBadge(index: 2, title: "Import Markdown/PDF")
+                stepBadge(index: 3, title: "Search and focus graph nodes")
+            }
+        }
+        .padding(DesignSpacing.x4)
+        .frame(maxWidth: 360, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: DesignCornerRadius.large)
+                .fill(.thinMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DesignCornerRadius.large)
+                .strokeBorder(Color.white.opacity(0.14), lineWidth: 1)
+        )
+    }
+
+    private func stepBadge(index: Int, title: String) -> some View {
+        HStack(spacing: DesignSpacing.x2) {
+            Text("\(index)")
+                .font(.system(size: DesignTypography.caption, weight: .semibold, design: .rounded))
+                .frame(width: 18, height: 18)
+                .background(Color.accentColor.opacity(0.18), in: Circle())
+                .foregroundStyle(Color.accentColor)
+            Text(title)
+                .font(.system(size: DesignTypography.body, weight: .medium))
         }
     }
 }

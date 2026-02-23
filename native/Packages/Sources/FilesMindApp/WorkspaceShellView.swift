@@ -60,6 +60,13 @@ private struct SidebarPane: View {
                 model.chooseAndEnqueueImports()
             }
             .buttonStyle(.bordered)
+            .disabled(model.workspaceURL == nil)
+
+            if model.workspaceURL == nil {
+                Text("Select a workspace first to enable document import.")
+                    .font(.system(size: DesignTypography.caption))
+                    .foregroundStyle(.secondary)
+            }
 
             Divider()
 

@@ -41,6 +41,7 @@ final class AppModel {
 
     private var queueObservationTask: Task<Void, Never>?
     private var reparseObservationTask: Task<Void, Never>?
+    private var scopedWorkspaceHandle: WorkspaceAccessHandle?
     private var started = false
     private var unfilteredSearchResults: [RankedChunk] = []
 
@@ -134,6 +135,7 @@ final class AppModel {
         }
 
         Task {
+            await self.restoreWorkspaceIfAvailable()
             await self.reloadImportedDocuments()
         }
     }
@@ -157,8 +159,11 @@ final class AppModel {
             do {
                 let useCase = SelectWorkspaceUseCase(bookmarkManager: container.bookmarkManager)
                 let authorization = try await useCase.execute(workspaceID: workspaceID, directoryURL: url)
+                try await activateWorkspaceAccess(for: authorization)
                 workspaceURL = authorization.directoryURL
-                workspaceStatus = "Workspace: \(authorization.directoryURL.lastPathComponent)"
+                workspaceStatus = authorization.isStale
+                    ? "Workspace: \(authorization.directoryURL.lastPathComponent) (refreshed)"
+                    : "Workspace: \(authorization.directoryURL.lastPathComponent)"
             } catch {
                 workspaceStatus = "Workspace authorization failed"
                 lastError = error.localizedDescription
@@ -167,6 +172,12 @@ final class AppModel {
     }
 
     func chooseAndEnqueueImports() {
+        guard workspaceURL != nil else {
+            lastError = nil
+            searchStatus = "Choose workspace first, then import files."
+            return
+        }
+
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -186,6 +197,31 @@ final class AppModel {
             let useCase = EnqueueImportUseCase(queue: container.importQueue)
             await useCase.execute(fileURLs: urls)
         }
+    }
+
+    private func restoreWorkspaceIfAvailable() async {
+        do {
+            let authorization = try await container.bookmarkManager.resolveAuthorization(id: workspaceID)
+            try await activateWorkspaceAccess(for: authorization)
+            workspaceURL = authorization.directoryURL
+            workspaceStatus = authorization.isStale
+                ? "Workspace: \(authorization.directoryURL.lastPathComponent) (bookmark refreshed)"
+                : "Workspace: \(authorization.directoryURL.lastPathComponent)"
+        } catch FilesMindError.notFound {
+            workspaceStatus = "No workspace selected"
+        } catch {
+            workspaceStatus = "Workspace restore failed"
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func activateWorkspaceAccess(for authorization: WorkspaceAuthorization) async throws {
+        if let scopedWorkspaceHandle {
+            await container.bookmarkManager.stopScopedAccess(scopedWorkspaceHandle)
+            self.scopedWorkspaceHandle = nil
+        }
+        let handle = try await container.bookmarkManager.startScopedAccess(id: authorization.workspaceID)
+        self.scopedWorkspaceHandle = handle
     }
 
     func visibleGraphNodes(in viewport: Rect) -> [GraphNode] {
