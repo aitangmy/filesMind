@@ -85,12 +85,20 @@ public struct Chunk: Sendable, Equatable {
     public let documentID: UUID
     public let ordinal: Int
     public let text: String
+    public let sourcePageIndex: Int?
 
-    public init(id: UUID = UUID(), documentID: UUID, ordinal: Int, text: String) {
+    public init(
+        id: UUID = UUID(),
+        documentID: UUID,
+        ordinal: Int,
+        text: String,
+        sourcePageIndex: Int? = nil
+    ) {
         self.id = id
         self.documentID = documentID
         self.ordinal = ordinal
         self.text = text
+        self.sourcePageIndex = sourcePageIndex
     }
 }
 

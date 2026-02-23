@@ -22,6 +22,7 @@ public actor GRDBChunkRepository: ChunkRepository, EmbeddingSearchRepository, Im
                 table.column("document_id", .text).notNull()
                 table.column("ordinal", .integer).notNull()
                 table.column("text", .text).notNull()
+                table.column("source_page_index", .integer)
                 table.column("created_at", .datetime).notNull().defaults(sql: "CURRENT_TIMESTAMP")
                 table.column("updated_at", .datetime).notNull().defaults(sql: "CURRENT_TIMESTAMP")
             }
@@ -55,6 +56,15 @@ public actor GRDBChunkRepository: ChunkRepository, EmbeddingSearchRepository, Im
             }
         }
 
+        migrator.registerMigration("v3_add_chunk_source_page_index") { db in
+            let columns = try db.columns(in: "chunks").map(\.name)
+            if !columns.contains("source_page_index") {
+                try db.alter(table: "chunks") { table in
+                    table.add(column: "source_page_index", .integer)
+                }
+            }
+        }
+
         try migrator.migrate(dbQueue)
         telemetry.info("GRDB chunk repository initialized at: \(databaseURL.path)")
     }
@@ -66,15 +76,22 @@ public actor GRDBChunkRepository: ChunkRepository, EmbeddingSearchRepository, Im
             for chunk in chunks {
                 try db.execute(
                     sql: """
-                    INSERT INTO chunks (id, document_id, ordinal, text, updated_at)
-                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    INSERT INTO chunks (id, document_id, ordinal, text, source_page_index, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(id) DO UPDATE SET
                       document_id = excluded.document_id,
                       ordinal = excluded.ordinal,
                       text = excluded.text,
+                      source_page_index = excluded.source_page_index,
                       updated_at = CURRENT_TIMESTAMP
                     """,
-                    arguments: [chunk.id.uuidString, chunk.documentID.uuidString, chunk.ordinal, chunk.text]
+                    arguments: [
+                        chunk.id.uuidString,
+                        chunk.documentID.uuidString,
+                        chunk.ordinal,
+                        chunk.text,
+                        chunk.sourcePageIndex
+                    ]
                 )
             }
         }
@@ -92,7 +109,7 @@ public actor GRDBChunkRepository: ChunkRepository, EmbeddingSearchRepository, Im
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                SELECT id, document_id, ordinal, text
+                SELECT id, document_id, ordinal, text, source_page_index
                 FROM chunks
                 WHERE lower(text) LIKE ?
                 ORDER BY ordinal ASC
@@ -115,7 +132,7 @@ public actor GRDBChunkRepository: ChunkRepository, EmbeddingSearchRepository, Im
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                SELECT id, document_id, ordinal, text
+                SELECT id, document_id, ordinal, text, source_page_index
                 FROM chunks
                 ORDER BY ordinal ASC
                 LIMIT ?
@@ -223,8 +240,15 @@ public actor GRDBChunkRepository: ChunkRepository, EmbeddingSearchRepository, Im
 
         let ordinal: Int = row["ordinal"]
         let text: String = row["text"]
+        let sourcePageIndex: Int? = row["source_page_index"]
 
-        return Chunk(id: id, documentID: documentID, ordinal: ordinal, text: text)
+        return Chunk(
+            id: id,
+            documentID: documentID,
+            ordinal: ordinal,
+            text: text,
+            sourcePageIndex: sourcePageIndex
+        )
     }
 
     private static func makeSection(from row: Row) -> ParsedSection? {

@@ -119,7 +119,7 @@ private struct SidebarPane: View {
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: DesignCornerRadius.medium))
 
                 if let comparison = model.reparseComparison {
-                    ReparseComparisonCard(comparison: comparison)
+                    ReparseComparisonCard(model: model, comparison: comparison)
                 }
             }
 
@@ -193,8 +193,8 @@ private func reparseStatusColor(_ status: ReparseJobStatus) -> Color {
 }
 
 private struct ReparseComparisonCard: View {
+    @Bindable var model: AppModel
     let comparison: ReparseComparison
-    @State private var isExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: DesignSpacing.x3) {
@@ -240,11 +240,11 @@ private struct ReparseComparisonCard: View {
 
             Button {
                 withAnimation(.spring(response: DesignMotion.regular, dampingFraction: 0.9)) {
-                    isExpanded.toggle()
+                    model.toggleReparseDiffExpanded()
                 }
             } label: {
                 HStack(spacing: DesignSpacing.x2) {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    Image(systemName: model.reparseDiffExpanded ? "chevron.down" : "chevron.right")
                         .font(.system(size: 11, weight: .semibold))
                     Text("Page Diff")
                         .font(.system(size: DesignTypography.caption, weight: .semibold))
@@ -254,8 +254,57 @@ private struct ReparseComparisonCard: View {
             }
             .buttonStyle(.plain)
 
-            if isExpanded {
+            if model.reparseDiffExpanded {
                 VStack(alignment: .leading, spacing: DesignSpacing.x2) {
+                    HStack(spacing: DesignSpacing.x1) {
+                        ForEach(ReparseDiffScope.allCases, id: \.self) { scope in
+                            Button {
+                                model.selectReparseDiffScope(scope)
+                            } label: {
+                                Text(scopeTitle(scope))
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .padding(.horizontal, DesignSpacing.x2)
+                                    .padding(.vertical, DesignSpacing.x1)
+                                    .background(scopeBackground(scope), in: Capsule())
+                                    .overlay(
+                                        Capsule()
+                                            .strokeBorder(scopeBorder(scope), lineWidth: 1)
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.bottom, DesignSpacing.x1)
+
+                    if model.reparseDiffPages.isEmpty {
+                        Text("No pages in this scope.")
+                            .font(.system(size: DesignTypography.caption))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: DesignSpacing.x1) {
+                                ForEach(model.reparseDiffPages, id: \.self) { page in
+                                    Button {
+                                        model.togglePageFilter(page)
+                                    } label: {
+                                        Text("P\(page + 1)")
+                                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                                            .padding(.horizontal, DesignSpacing.x2)
+                                            .padding(.vertical, DesignSpacing.x1)
+                                            .background(pageChipBackground(page), in: Capsule())
+                                            .overlay(
+                                                Capsule()
+                                                    .strokeBorder(pageChipBorder(page), lineWidth: 1)
+                                            )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Filter search results by page \(page + 1)")
+                                }
+                            }
+                            .padding(.vertical, 1)
+                        }
+                    }
+
                     pageLine(
                         title: "Resolved",
                         pages: comparison.resolvedPages,
@@ -307,6 +356,45 @@ private struct ReparseComparisonCard: View {
                     )
             }
         }
+    }
+
+    private func scopeTitle(_ scope: ReparseDiffScope) -> String {
+        switch scope {
+        case .resolved:
+            return "Resolved"
+        case .remaining:
+            return "Remaining"
+        case .input:
+            return "Input"
+        }
+    }
+
+    private func scopeBackground(_ scope: ReparseDiffScope) -> Color {
+        if model.reparseDiffScope == scope {
+            return reparseStatusColor(comparison.status).opacity(0.18)
+        }
+        return Color.primary.opacity(0.04)
+    }
+
+    private func scopeBorder(_ scope: ReparseDiffScope) -> Color {
+        if model.reparseDiffScope == scope {
+            return reparseStatusColor(comparison.status).opacity(0.6)
+        }
+        return Color.primary.opacity(0.12)
+    }
+
+    private func pageChipBackground(_ page: Int) -> Color {
+        if model.activePageFilter == page {
+            return Color.accentColor.opacity(0.20)
+        }
+        return Color.primary.opacity(0.05)
+    }
+
+    private func pageChipBorder(_ page: Int) -> Color {
+        if model.activePageFilter == page {
+            return Color.accentColor.opacity(0.70)
+        }
+        return Color.primary.opacity(0.14)
     }
 
     private func metricBlock(value: String, label: String) -> some View {
@@ -391,6 +479,19 @@ private struct ImportQueuePane: View {
                 Text(model.searchStatus)
                     .font(.system(size: DesignTypography.caption))
                     .foregroundStyle(.secondary)
+
+                if let page = model.activePageFilter {
+                    HStack(spacing: DesignSpacing.x2) {
+                        Label("Page filter: \(page + 1)", systemImage: "line.3.horizontal.decrease.circle")
+                            .font(.system(size: DesignTypography.caption, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Button("Clear") {
+                            model.togglePageFilter(page)
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.system(size: DesignTypography.caption, weight: .semibold))
+                    }
+                }
             }
 
             if model.searchResults.isEmpty {
@@ -479,6 +580,11 @@ private struct SearchResultRow: View {
                         .font(.system(size: DesignTypography.caption, weight: .semibold))
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 8)
+                    if let page = ranked.chunk.sourcePageIndex {
+                        Text("P\(page + 1)")
+                            .font(.system(size: DesignTypography.caption, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
                     Text("#\(ranked.chunk.ordinal)")
                         .font(.system(size: DesignTypography.caption, weight: .medium, design: .monospaced))
                         .foregroundStyle(.secondary)

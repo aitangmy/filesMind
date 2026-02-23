@@ -36,9 +36,18 @@ public actor LowQualityReparseQueue {
         }
     }
 
-    public func enqueue(document: ImportedDocumentRecord) {
+    public func enqueue(document: ImportedDocumentRecord) -> Bool {
         let pages = Array(Set(document.lowQualityPages)).sorted()
-        guard !pages.isEmpty else { return }
+        guard !pages.isEmpty else { return false }
+
+        let hasActiveJob = jobs.values.contains { existing in
+            existing.documentID == document.id &&
+            (existing.status == .queued || existing.status == .running)
+        }
+        if hasActiveJob {
+            telemetry.warning("Skipped duplicate reparse enqueue for \(document.title)")
+            return false
+        }
 
         let job = ReparseJob(
             documentID: document.id,
@@ -57,6 +66,8 @@ public actor LowQualityReparseQueue {
         Task {
             await process(jobID: job.id, document: document)
         }
+
+        return true
     }
 
     private func process(jobID: UUID, document: ImportedDocumentRecord) async {

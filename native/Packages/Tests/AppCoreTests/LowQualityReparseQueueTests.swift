@@ -25,7 +25,8 @@ func lowQualityReparseQueueShouldUpdateDocumentStore() async throws {
         documentStore: store
     )
 
-    await queue.enqueue(document: initialDoc)
+    let didEnqueue = await queue.enqueue(document: initialDoc)
+    #expect(didEnqueue == true)
     try? await Task.sleep(for: .milliseconds(350))
 
     let jobs = await queue.currentJobs()
@@ -35,6 +36,36 @@ func lowQualityReparseQueueShouldUpdateDocumentStore() async throws {
     let recent = try await store.recentDocuments(limit: 10)
     #expect(recent.count == 1)
     #expect(recent.first?.lowQualityPages == [3])
+}
+
+@Test("LowQualityReparseQueue should reject duplicate active jobs")
+func lowQualityReparseQueueShouldRejectDuplicateActiveJobs() async throws {
+    let docID = UUID()
+    let initialDoc = ImportedDocumentRecord(
+        id: docID,
+        sourcePath: "/tmp/duplicate.pdf",
+        title: "duplicate",
+        sourceType: .pdf,
+        chunkCount: 8,
+        lowQualityPages: [1, 4],
+        importedAt: Date()
+    )
+
+    let store = MockDocumentStore(document: initialDoc, sections: [])
+    let queue = LowQualityReparseQueue(
+        reparser: MockLowQualityReparser(resolvedPages: [1]),
+        documentStore: store
+    )
+
+    let first = await queue.enqueue(document: initialDoc)
+    let second = await queue.enqueue(document: initialDoc)
+
+    #expect(first == true)
+    #expect(second == false)
+
+    try? await Task.sleep(for: .milliseconds(350))
+    let jobs = await queue.currentJobs().filter { $0.documentID == docID }
+    #expect(jobs.count == 1)
 }
 
 private actor MockLowQualityReparser: LowQualityPageReparsing {

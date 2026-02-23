@@ -92,7 +92,7 @@ public actor DefaultDocumentParser: DocumentParsing {
             throw FilesMindError.validationFailed("Unable to open PDF")
         }
 
-        var pageTexts: [String] = []
+        var pageTexts: [(pageIndex: Int, text: String)] = []
         var assessments: [ParsePageAssessment] = []
 
         for pageIndex in 0..<pdf.pageCount {
@@ -110,7 +110,7 @@ public actor DefaultDocumentParser: DocumentParsing {
 
             assessments.append(ParsePageAssessment(pageIndex: pageIndex, qualityScore: score))
             if !text.isEmpty {
-                pageTexts.append(text)
+                pageTexts.append((pageIndex: pageIndex, text: text))
             }
         }
 
@@ -130,9 +130,16 @@ public actor DefaultDocumentParser: DocumentParsing {
         var chunks: [Chunk] = []
         var ordinal = 0
 
-        for pageText in pageTexts {
-            for piece in split(pageText, limit: maxChunkCharacters) {
-                chunks.append(Chunk(documentID: documentID, ordinal: ordinal, text: piece))
+        for pageEntry in pageTexts {
+            for piece in split(pageEntry.text, limit: maxChunkCharacters) {
+                chunks.append(
+                    Chunk(
+                        documentID: documentID,
+                        ordinal: ordinal,
+                        text: piece,
+                        sourcePageIndex: pageEntry.pageIndex
+                    )
+                )
                 ordinal += 1
             }
         }

@@ -23,12 +23,15 @@ final class AppModel {
     var searchResults: [RankedChunk] = []
     var searchStatus = "Type keywords to search indexed chunks."
     var isSearching = false
+    var activePageFilter: Int?
 
     var importedDocuments: [ImportedDocumentRecord] = []
     var selectedDocumentID: UUID?
     var selectedDocumentSections: [ParsedSection] = []
     var selectedChunkPreview: String?
     var reparseJobs: [ReparseJob] = []
+    var reparseDiffExpanded = false
+    var reparseDiffScope: ReparseDiffScope = .remaining
 
     var lastError: String?
 
@@ -39,6 +42,7 @@ final class AppModel {
     private var queueObservationTask: Task<Void, Never>?
     private var reparseObservationTask: Task<Void, Never>?
     private var started = false
+    private var unfilteredSearchResults: [RankedChunk] = []
 
     init(container: AppContainer) {
         self.container = container
@@ -92,6 +96,18 @@ final class AppModel {
         )
     }
 
+    var reparseDiffPages: [Int] {
+        guard let comparison = reparseComparison else { return [] }
+        switch reparseDiffScope {
+        case .resolved:
+            return comparison.resolvedPages
+        case .remaining:
+            return comparison.remainingPages
+        case .input:
+            return comparison.beforePages
+        }
+    }
+
     func start() {
         guard !started else { return }
         started = true
@@ -103,6 +119,7 @@ final class AppModel {
             for await jobs in stream {
                 self.importJobs = jobs
                 await self.reloadImportedDocuments()
+                self.synchronizeReparseInteractionState()
             }
         }
 
@@ -112,6 +129,7 @@ final class AppModel {
             for await jobs in stream {
                 self.reparseJobs = jobs
                 await self.reloadImportedDocuments()
+                self.synchronizeReparseInteractionState()
             }
         }
 
@@ -177,10 +195,12 @@ final class AppModel {
     func selectImportedDocument(_ document: ImportedDocumentRecord) {
         selectedDocumentID = document.id
         selectedChunkPreview = nil
+        activePageFilter = nil
 
         Task {
             await loadSections(for: document.id)
             focusFirstSectionIfNeeded()
+            applySearchPageFilter()
         }
     }
 
@@ -205,10 +225,11 @@ final class AppModel {
                     keywordWeight: 1.0,
                     vectorWeight: 0.0
                 )
-                searchResults = results
-                searchStatus = "Found \(results.count) result(s)."
+                unfilteredSearchResults = results
+                applySearchPageFilter()
             } catch {
                 searchResults = []
+                unfilteredSearchResults = []
                 searchStatus = "Search failed."
                 lastError = error.localizedDescription
             }
@@ -219,6 +240,7 @@ final class AppModel {
     func selectSearchResult(_ ranked: RankedChunk) {
         let chunk = ranked.chunk
         selectedChunkPreview = chunk.text
+        activePageFilter = chunk.sourcePageIndex
 
         if selectedDocumentID != chunk.documentID {
             selectedDocumentID = chunk.documentID
@@ -226,6 +248,7 @@ final class AppModel {
 
         Task {
             await loadSections(for: chunk.documentID)
+            applySearchPageFilter()
             if let matchedSection = bestSection(forChunkOrdinal: chunk.ordinal, in: selectedDocumentSections) {
                 focusedGraphNodeID = sectionNodeIDs[matchedSection.id]
                 searchStatus = "Focused \(matchedSection.title) (chunk #\(chunk.ordinal))."
@@ -239,10 +262,35 @@ final class AppModel {
     func requestReparseLowQualityPages() {
         guard let doc = selectedDocument, !doc.lowQualityPages.isEmpty else { return }
         Task {
-            await container.lowQualityReparseQueue.enqueue(document: doc)
+            let enqueued = await container.lowQualityReparseQueue.enqueue(document: doc)
+            if enqueued {
+                let pageList = doc.lowQualityPages.map { String($0 + 1) }.joined(separator: ", ")
+                searchStatus = "Re-parse queued for pages [\(pageList)]."
+            } else {
+                searchStatus = "Re-parse already in progress for this document."
+            }
         }
-        let pageList = doc.lowQualityPages.map { String($0 + 1) }.joined(separator: ", ")
-        searchStatus = "Re-parse queued for pages [\(pageList)]."
+    }
+
+    func toggleReparseDiffExpanded() {
+        reparseDiffExpanded.toggle()
+    }
+
+    func selectReparseDiffScope(_ scope: ReparseDiffScope) {
+        reparseDiffScope = scope
+        if let activePageFilter, !reparseDiffPages.contains(activePageFilter) {
+            self.activePageFilter = nil
+        }
+        applySearchPageFilter()
+    }
+
+    func togglePageFilter(_ pageIndex: Int) {
+        if activePageFilter == pageIndex {
+            activePageFilter = nil
+        } else {
+            activePageFilter = pageIndex
+        }
+        applySearchPageFilter()
     }
 
     private func reloadImportedDocuments() async {
@@ -275,6 +323,8 @@ final class AppModel {
                 selectedDocumentSections = []
                 focusedGraphNodeID = nil
             }
+            synchronizeReparseInteractionState()
+            applySearchPageFilter()
         } catch {
             lastError = error.localizedDescription
         }
@@ -306,6 +356,37 @@ final class AppModel {
         sections
             .sorted(by: { $0.chunkStartOrdinal < $1.chunkStartOrdinal })
             .last(where: { $0.chunkStartOrdinal <= ordinal })
+    }
+
+    private func applySearchPageFilter() {
+        let filtered: [RankedChunk]
+        if let page = activePageFilter {
+            filtered = unfilteredSearchResults.filter { $0.chunk.sourcePageIndex == page }
+        } else {
+            filtered = unfilteredSearchResults
+        }
+        searchResults = filtered
+
+        let baseCount = unfilteredSearchResults.count
+        if let page = activePageFilter {
+            searchStatus = "Filtered \(filtered.count)/\(baseCount) results for page \(page + 1)."
+        } else if baseCount > 0 {
+            searchStatus = "Found \(filtered.count) result(s)."
+        } else if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isSearching {
+            searchStatus = "No results."
+        }
+    }
+
+    private func synchronizeReparseInteractionState() {
+        guard reparseComparison != nil else {
+            reparseDiffExpanded = false
+            activePageFilter = nil
+            return
+        }
+
+        if let activePageFilter, !reparseDiffPages.contains(activePageFilter) {
+            self.activePageFilter = nil
+        }
     }
 
     private func rebuildGraph(documents: [ImportedDocumentRecord], sectionsMap: [UUID: [ParsedSection]]) {
@@ -376,6 +457,12 @@ struct ReparseComparison: Sendable {
     let progress: Double
     let updatedAt: Date
     let message: String?
+}
+
+enum ReparseDiffScope: String, CaseIterable, Sendable {
+    case resolved
+    case remaining
+    case input
 }
 
 enum DemoGraphFactory {
