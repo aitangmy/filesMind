@@ -52,6 +52,8 @@ public enum AppBootstrap {
             telemetry: telemetry
         )
         let router = PipelineRouter(telemetry: telemetry)
+        let parser = DefaultDocumentParser(router: router, telemetry: telemetry)
+        let importer = DocumentImportService(parser: parser, chunkRepository: chunkRepository, telemetry: telemetry)
 
         let catalog = StaticModelCatalog(models: [])
         let validator = SHA256ArtifactValidator()
@@ -63,7 +65,7 @@ public enum AppBootstrap {
         )
 
         let engine = StubCognitiveEngine(telemetry: telemetry)
-        let importQueue = ImportQueue(telemetry: telemetry)
+        let importQueue = ImportQueue(importer: importer, telemetry: telemetry)
 
         return AppContainer(
             telemetry: telemetry,

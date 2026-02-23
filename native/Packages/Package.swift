@@ -57,6 +57,7 @@ let package = Package(
         ),
         .testTarget(name: "DomainTests", dependencies: ["Domain"]),
         .testTarget(name: "AppCoreTests", dependencies: ["AppCore", "Domain"]),
+        .testTarget(name: "DocumentPipelineTests", dependencies: ["DocumentPipeline", "Domain"]),
         .testTarget(name: "SecurityKitTests", dependencies: ["SecurityKit", "Domain"]),
         .testTarget(name: "GraphEngineTests", dependencies: ["GraphEngine", "Domain"])
     ]

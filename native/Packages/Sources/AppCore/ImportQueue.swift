@@ -6,9 +6,11 @@ public actor ImportQueue {
     private var jobs: [UUID: ImportJob] = [:]
     private var orderedIDs: [UUID] = []
     private var continuations: [UUID: AsyncStream<[ImportJob]>.Continuation] = [:]
+    private let importer: DocumentImporting
     private let telemetry: Telemetry
 
-    public init(telemetry: Telemetry = ConsoleTelemetry()) {
+    public init(importer: DocumentImporting, telemetry: Telemetry = ConsoleTelemetry()) {
+        self.importer = importer
         self.telemetry = telemetry
     }
 
@@ -41,13 +43,30 @@ public actor ImportQueue {
     }
 
     private func process(jobID: UUID) async {
-        update(jobID: jobID, status: .parsing, progress: 0.2, message: "Parsing")
-        try? await Task.sleep(for: .milliseconds(250))
+        guard let job = jobs[jobID] else { return }
 
-        update(jobID: jobID, status: .parsing, progress: 0.55, message: "Chunking")
-        try? await Task.sleep(for: .milliseconds(250))
+        update(jobID: jobID, status: .parsing, progress: 0.2, message: "Parsing \(job.fileURL.lastPathComponent)")
 
-        update(jobID: jobID, status: .indexed, progress: 1.0, message: "Indexed")
+        do {
+            let parsed = try await importer.importDocument(at: job.fileURL)
+
+            let fallbackHint: String
+            if parsed.fallbackPageCount > 0 {
+                fallbackHint = " (\(parsed.fallbackPageCount) pages flagged for VLM fallback)"
+            } else {
+                fallbackHint = ""
+            }
+
+            update(
+                jobID: jobID,
+                status: .indexed,
+                progress: 1.0,
+                message: "Indexed \(parsed.chunks.count) chunks\(fallbackHint)"
+            )
+        } catch {
+            telemetry.error("Import job failed: \(job.fileURL.lastPathComponent), error=\(error.localizedDescription)")
+            update(jobID: jobID, status: .failed, progress: 1.0, message: error.localizedDescription)
+        }
     }
 
     private func update(jobID: UUID, status: ImportJobStatus, progress: Double, message: String?) {

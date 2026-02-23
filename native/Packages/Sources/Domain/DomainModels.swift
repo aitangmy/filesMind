@@ -174,3 +174,33 @@ public struct ImportJob: Identifiable, Sendable, Equatable, Codable {
         self.message = message
     }
 }
+
+public enum DocumentSourceType: String, Sendable, Equatable, Codable {
+    case markdown
+    case pdf
+}
+
+public struct ParsedDocument: Sendable, Equatable {
+    public let documentID: UUID
+    public let sourceURL: URL
+    public let title: String
+    public let sourceType: DocumentSourceType
+    public let chunks: [Chunk]
+    public let fallbackPageCount: Int
+
+    public init(
+        documentID: UUID = UUID(),
+        sourceURL: URL,
+        title: String,
+        sourceType: DocumentSourceType,
+        chunks: [Chunk],
+        fallbackPageCount: Int = 0
+    ) {
+        self.documentID = documentID
+        self.sourceURL = sourceURL
+        self.title = title
+        self.sourceType = sourceType
+        self.chunks = chunks
+        self.fallbackPageCount = fallbackPageCount
+    }
+}

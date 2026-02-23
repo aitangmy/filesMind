@@ -25,6 +25,14 @@ public protocol ModelManaging: Sendable {
     func install(modelID: String) async throws -> URL
 }
 
+public protocol DocumentParsing: Sendable {
+    func parse(fileURL: URL) async throws -> ParsedDocument
+}
+
+public protocol DocumentImporting: Sendable {
+    func importDocument(at fileURL: URL) async throws -> ParsedDocument
+}
+
 public protocol ChunkRepository: Sendable {
     func upsert(_ chunks: [Chunk]) async throws
     func search(byKeyword keyword: String, limit: Int) async throws -> [Chunk]
