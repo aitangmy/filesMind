@@ -101,6 +101,23 @@ private struct SidebarPane: View {
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: DesignCornerRadius.medium))
             }
 
+            if let selectedDocument = model.selectedDocument, !selectedDocument.lowQualityPages.isEmpty {
+                let pageList = selectedDocument.lowQualityPages.map { String($0 + 1) }.joined(separator: ", ")
+                VStack(alignment: .leading, spacing: DesignSpacing.x2) {
+                    Text("PDF Quality")
+                        .font(.system(size: DesignTypography.title, weight: .semibold))
+                    Text("Low-quality pages: \(pageList)")
+                        .font(.system(size: DesignTypography.caption, weight: .regular, design: .monospaced))
+                        .foregroundStyle(.orange)
+                    Button("Re-parse Low-quality Pages") {
+                        model.requestReparseLowQualityPages()
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(DesignSpacing.x3)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: DesignCornerRadius.medium))
+            }
+
             Spacer(minLength: DesignSpacing.x3)
 
             VStack(alignment: .leading, spacing: DesignSpacing.x2) {
@@ -220,9 +237,25 @@ private struct ImportQueuePane: View {
                     .foregroundStyle(.secondary)
             } else {
                 List(model.searchResults, id: \.chunk.id) { ranked in
-                    SearchResultRow(ranked: ranked)
+                    SearchResultRow(ranked: ranked) {
+                        model.selectSearchResult(ranked)
+                    }
                 }
                 .listStyle(.inset)
+            }
+
+            if let selectedChunkPreview = model.selectedChunkPreview {
+                Divider()
+                VStack(alignment: .leading, spacing: DesignSpacing.x1) {
+                    Text("Focused Chunk")
+                        .font(.system(size: DesignTypography.caption, weight: .semibold))
+                    Text(selectedChunkPreview)
+                        .font(.system(size: DesignTypography.body))
+                        .lineLimit(5)
+                        .textSelection(.enabled)
+                }
+                .padding(DesignSpacing.x2)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: DesignCornerRadius.small))
             }
         }
         .padding(DesignSpacing.x4)
@@ -274,24 +307,28 @@ private struct ImportJobRow: View {
 
 private struct SearchResultRow: View {
     let ranked: RankedChunk
+    let onSelect: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: DesignSpacing.x1) {
-            HStack {
-                Text("Score \(String(format: "%.3f", ranked.score))")
-                    .font(.system(size: DesignTypography.caption, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 8)
-                Text("#\(ranked.chunk.ordinal)")
-                    .font(.system(size: DesignTypography.caption, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
+        Button(action: onSelect) {
+            VStack(alignment: .leading, spacing: DesignSpacing.x1) {
+                HStack {
+                    Text("Score \(String(format: "%.3f", ranked.score))")
+                        .font(.system(size: DesignTypography.caption, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    Text("#\(ranked.chunk.ordinal)")
+                        .font(.system(size: DesignTypography.caption, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
 
-            Text(ranked.chunk.text)
-                .font(.system(size: DesignTypography.body))
-                .lineLimit(4)
-                .textSelection(.enabled)
+                Text(ranked.chunk.text)
+                    .font(.system(size: DesignTypography.body))
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+            }
+            .padding(.vertical, DesignSpacing.x1)
         }
-        .padding(.vertical, DesignSpacing.x1)
+        .buttonStyle(.plain)
     }
 }

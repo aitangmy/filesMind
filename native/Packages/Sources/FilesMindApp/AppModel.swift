@@ -1,6 +1,5 @@
 import AppCore
 import AppKit
-import DesignSystem
 import Domain
 import Foundation
 import GraphEngine
@@ -16,28 +15,43 @@ final class AppModel {
     var workspaceURL: URL?
     var workspaceStatus = "No workspace selected"
     var importJobs: [ImportJob] = []
+
     var graphNodes: [GraphNode] = []
+    var focusedGraphNodeID: UUID?
+
     var searchQuery = ""
     var searchResults: [RankedChunk] = []
     var searchStatus = "Type keywords to search indexed chunks."
     var isSearching = false
+
     var importedDocuments: [ImportedDocumentRecord] = []
     var selectedDocumentID: UUID?
     var selectedDocumentSections: [ParsedSection] = []
+    var selectedChunkPreview: String?
+
     var lastError: String?
 
-    private let graphIndex: QuadTreeIndex
+    private let graphBoundary = Rect(x: -800, y: -800, width: 10000, height: 10000)
+    private var graphIndex: QuadTreeIndex
+    private var sectionNodeIDs: [UUID: UUID] = [:]
+
     private var queueObservationTask: Task<Void, Never>?
     private var started = false
 
     init(container: AppContainer) {
         self.container = container
-        self.graphNodes = DemoGraphFactory.makeNodes(count: 250)
-        let boundary = Rect(x: -500, y: -500, width: 6000, height: 6000)
-        self.graphIndex = QuadTreeIndex(boundary: boundary, capacity: 24)
-        for node in graphNodes {
+        self.graphIndex = QuadTreeIndex(boundary: graphBoundary, capacity: 24)
+
+        let placeholderNodes = DemoGraphFactory.makePlaceholderNodes()
+        self.graphNodes = placeholderNodes
+        for node in placeholderNodes {
             graphIndex.insert(node)
         }
+    }
+
+    var selectedDocument: ImportedDocumentRecord? {
+        guard let selectedDocumentID else { return nil }
+        return importedDocuments.first(where: { $0.id == selectedDocumentID })
     }
 
     func start() {
@@ -115,8 +129,11 @@ final class AppModel {
 
     func selectImportedDocument(_ document: ImportedDocumentRecord) {
         selectedDocumentID = document.id
+        selectedChunkPreview = nil
+
         Task {
             await loadSections(for: document.id)
+            focusFirstSectionIfNeeded()
         }
     }
 
@@ -152,11 +169,38 @@ final class AppModel {
         }
     }
 
+    func selectSearchResult(_ ranked: RankedChunk) {
+        let chunk = ranked.chunk
+        selectedChunkPreview = chunk.text
+
+        if selectedDocumentID != chunk.documentID {
+            selectedDocumentID = chunk.documentID
+        }
+
+        Task {
+            await loadSections(for: chunk.documentID)
+            if let matchedSection = bestSection(forChunkOrdinal: chunk.ordinal, in: selectedDocumentSections) {
+                focusedGraphNodeID = sectionNodeIDs[matchedSection.id]
+                searchStatus = "Focused \(matchedSection.title) (chunk #\(chunk.ordinal))."
+            } else {
+                focusedGraphNodeID = nil
+                searchStatus = "Focused chunk #\(chunk.ordinal), no section mapping."
+            }
+        }
+    }
+
+    func requestReparseLowQualityPages() {
+        guard let doc = selectedDocument, !doc.lowQualityPages.isEmpty else { return }
+        let pageList = doc.lowQualityPages.map { String($0 + 1) }.joined(separator: ", ")
+        searchStatus = "Re-parse requested for pages [\(pageList)] (VLM hook pending)."
+    }
+
     private func reloadImportedDocuments() async {
         guard let store = container.documentStore else {
             importedDocuments = []
             selectedDocumentSections = []
             selectedDocumentID = nil
+            rebuildGraph(documents: [], sectionsMap: [:])
             return
         }
 
@@ -164,13 +208,22 @@ final class AppModel {
             let docs = try await store.recentDocuments(limit: 80)
             importedDocuments = docs
 
+            var sectionsMap: [UUID: [ParsedSection]] = [:]
+            for doc in docs {
+                sectionsMap[doc.id] = try await store.sections(for: doc.id)
+            }
+            rebuildGraph(documents: docs, sectionsMap: sectionsMap)
+
             if let selectedDocumentID, docs.contains(where: { $0.id == selectedDocumentID }) {
-                await loadSections(for: selectedDocumentID)
+                selectedDocumentSections = sectionsMap[selectedDocumentID] ?? []
+                focusFirstSectionIfNeeded()
             } else if let first = docs.first {
                 selectedDocumentID = first.id
-                await loadSections(for: first.id)
+                selectedDocumentSections = sectionsMap[first.id] ?? []
+                focusFirstSectionIfNeeded()
             } else {
                 selectedDocumentSections = []
+                focusedGraphNodeID = nil
             }
         } catch {
             lastError = error.localizedDescription
@@ -190,27 +243,81 @@ final class AppModel {
             selectedDocumentSections = []
         }
     }
+
+    private func focusFirstSectionIfNeeded() {
+        if let first = selectedDocumentSections.first {
+            focusedGraphNodeID = sectionNodeIDs[first.id]
+        } else {
+            focusedGraphNodeID = nil
+        }
+    }
+
+    private func bestSection(forChunkOrdinal ordinal: Int, in sections: [ParsedSection]) -> ParsedSection? {
+        sections
+            .sorted(by: { $0.chunkStartOrdinal < $1.chunkStartOrdinal })
+            .last(where: { $0.chunkStartOrdinal <= ordinal })
+    }
+
+    private func rebuildGraph(documents: [ImportedDocumentRecord], sectionsMap: [UUID: [ParsedSection]]) {
+        sectionNodeIDs = [:]
+
+        if documents.isEmpty {
+            let placeholders = DemoGraphFactory.makePlaceholderNodes()
+            graphNodes = placeholders
+            graphIndex = QuadTreeIndex(boundary: graphBoundary, capacity: 24)
+            for node in placeholders {
+                graphIndex.insert(node)
+            }
+            return
+        }
+
+        var newNodes: [GraphNode] = []
+
+        for (docIndex, document) in documents.enumerated() {
+            let baseY = Double(docIndex) * 300 + 80
+
+            let rootNode = GraphNode(
+                title: document.title,
+                rect: Rect(x: 70, y: baseY, width: 260, height: 62)
+            )
+            newNodes.append(rootNode)
+
+            let sections = (sectionsMap[document.id] ?? []).sorted(by: { $0.chunkStartOrdinal < $1.chunkStartOrdinal })
+            if sections.isEmpty {
+                let orphanNode = GraphNode(
+                    title: "(no outline)",
+                    rect: Rect(x: 380, y: baseY + 80, width: 180, height: 52)
+                )
+                newNodes.append(orphanNode)
+                continue
+            }
+
+            for (sectionIndex, section) in sections.enumerated() {
+                let x = 380 + Double(max(0, section.level - 1)) * 220
+                let y = baseY + 82 + Double(sectionIndex) * 72
+                let sectionNode = GraphNode(
+                    title: section.title,
+                    rect: Rect(x: x, y: y, width: 210, height: 52)
+                )
+                newNodes.append(sectionNode)
+                sectionNodeIDs[section.id] = sectionNode.id
+            }
+        }
+
+        graphNodes = newNodes
+        graphIndex = QuadTreeIndex(boundary: graphBoundary, capacity: 24)
+        for node in newNodes {
+            graphIndex.insert(node)
+        }
+    }
 }
 
 enum DemoGraphFactory {
-    static func makeNodes(count: Int) -> [GraphNode] {
-        let width: Double = 140
-        let height: Double = 56
-
-        return (0..<count).map { index in
-            let col = index % 20
-            let row = index / 20
-            let jitterX = Double((index * 13) % 11) * 1.7
-            let jitterY = Double((index * 7) % 9) * 1.4
-            return GraphNode(
-                title: "Node \(index + 1)",
-                rect: Rect(
-                    x: Double(col) * 180 + jitterX,
-                    y: Double(row) * 92 + jitterY,
-                    width: width,
-                    height: height
-                )
-            )
-        }
+    static func makePlaceholderNodes() -> [GraphNode] {
+        [
+            GraphNode(title: "Import a document", rect: Rect(x: 120, y: 120, width: 260, height: 66)),
+            GraphNode(title: "Build local knowledge graph", rect: Rect(x: 430, y: 210, width: 280, height: 66)),
+            GraphNode(title: "Run semantic search", rect: Rect(x: 780, y: 300, width: 240, height: 66))
+        ]
     }
 }

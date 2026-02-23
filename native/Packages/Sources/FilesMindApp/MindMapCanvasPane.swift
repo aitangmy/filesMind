@@ -122,12 +122,20 @@ struct MindMapCanvasPane: View {
 
             let rounded = RoundedRectangle(cornerRadius: DesignCornerRadius.small)
             let path = rounded.path(in: rect)
-            context.fill(path, with: .color(Color.white.opacity(0.9)))
-            context.stroke(path, with: .color(Color.black.opacity(0.12)), lineWidth: 1)
+            let isFocused = node.id == model.focusedGraphNodeID
+            context.fill(
+                path,
+                with: .color(isFocused ? Color.accentColor.opacity(0.18) : Color.white.opacity(0.9))
+            )
+            context.stroke(
+                path,
+                with: .color(isFocused ? Color.accentColor.opacity(0.9) : Color.black.opacity(0.12)),
+                lineWidth: isFocused ? 2.2 : 1
+            )
 
             let title = Text(node.title)
                 .font(.system(size: max(11, DesignTypography.body * zoom * 0.8), weight: .medium))
-                .foregroundStyle(Color.primary)
+                .foregroundStyle(isFocused ? Color.accentColor : Color.primary)
             context.draw(title, at: CGPoint(x: rect.midX, y: rect.midY), anchor: .center)
         }
     }
