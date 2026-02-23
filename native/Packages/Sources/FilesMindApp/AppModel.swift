@@ -64,6 +64,25 @@ final class AppModel {
             .first
     }
 
+    var reparseComparison: ReparseComparison? {
+        guard let doc = selectedDocument, let job = selectedDocumentReparseJob else { return nil }
+        let beforeCount = max(job.pageIndices.count, doc.lowQualityPages.count)
+        let afterCount = doc.lowQualityPages.count
+        let resolvedCount = max(0, beforeCount - afterCount)
+        let resolvedRatio = beforeCount > 0 ? Double(resolvedCount) / Double(beforeCount) : 0
+
+        return ReparseComparison(
+            status: job.status,
+            beforeCount: beforeCount,
+            afterCount: afterCount,
+            resolvedCount: resolvedCount,
+            resolvedRatio: resolvedRatio,
+            progress: job.progress,
+            updatedAt: job.createdAt,
+            message: job.message
+        )
+    }
+
     func start() {
         guard !started else { return }
         started = true
@@ -297,9 +316,10 @@ final class AppModel {
 
         for (docIndex, document) in documents.enumerated() {
             let baseY = Double(docIndex) * 300 + 80
+            let qualityBadge = document.lowQualityPages.isEmpty ? "Clean" : "LQ \(document.lowQualityPages.count)"
 
             let rootNode = GraphNode(
-                title: document.title,
+                title: "\(document.title) • \(qualityBadge)",
                 rect: Rect(x: 70, y: baseY, width: 260, height: 62)
             )
             newNodes.append(rootNode)
@@ -332,6 +352,17 @@ final class AppModel {
             graphIndex.insert(node)
         }
     }
+}
+
+struct ReparseComparison: Sendable {
+    let status: ReparseJobStatus
+    let beforeCount: Int
+    let afterCount: Int
+    let resolvedCount: Int
+    let resolvedRatio: Double
+    let progress: Double
+    let updatedAt: Date
+    let message: String?
 }
 
 enum DemoGraphFactory {

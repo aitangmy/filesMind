@@ -114,24 +114,13 @@ private struct SidebarPane: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(model.selectedDocumentReparseJob?.status == .running)
-
-                    if let job = model.selectedDocumentReparseJob {
-                        HStack(spacing: DesignSpacing.x2) {
-                            Text(job.status.rawValue.uppercased())
-                                .font(.system(size: DesignTypography.caption, weight: .semibold))
-                                .foregroundStyle(reparseStatusColor(job.status))
-                            Text(job.message ?? "")
-                                .font(.system(size: DesignTypography.caption))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                        }
-
-                        ProgressView(value: job.progress)
-                            .tint(reparseStatusColor(job.status))
-                    }
                 }
                 .padding(DesignSpacing.x3)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: DesignCornerRadius.medium))
+
+                if let comparison = model.reparseComparison {
+                    ReparseComparisonCard(comparison: comparison)
+                }
             }
 
             Spacer(minLength: DesignSpacing.x3)
@@ -200,6 +189,96 @@ private func reparseStatusColor(_ status: ReparseJobStatus) -> Color {
         return .green
     case .failed:
         return .red
+    }
+}
+
+private struct ReparseComparisonCard: View {
+    let comparison: ReparseComparison
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DesignSpacing.x3) {
+            HStack {
+                Label("Reparse Comparison", systemImage: "waveform.path.ecg.rectangle")
+                    .font(.system(size: DesignTypography.bodyLarge, weight: .semibold))
+                Spacer(minLength: 8)
+                Text(comparison.status.rawValue.uppercased())
+                    .font(.system(size: DesignTypography.caption, weight: .semibold))
+                    .foregroundStyle(reparseStatusColor(comparison.status))
+            }
+
+            HStack(spacing: DesignSpacing.x4) {
+                metricBlock(value: "\(comparison.beforeCount)", label: "Before")
+                metricBlock(value: "\(comparison.afterCount)", label: "After")
+                metricBlock(value: "\(comparison.resolvedCount)", label: "Resolved")
+                metricBlock(value: "\(Int((comparison.resolvedRatio * 100).rounded()))%", label: "Rate")
+            }
+
+            HStack(spacing: DesignSpacing.x2) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .foregroundStyle(.secondary)
+                Text("Map synced")
+                    .font(.system(size: DesignTypography.caption, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 6)
+                Text(comparison.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                    .font(.system(size: DesignTypography.caption, weight: .regular, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            if comparison.status == .running || comparison.status == .queued {
+                ProgressView(value: comparison.progress)
+                    .tint(reparseStatusColor(comparison.status))
+            }
+
+            if let message = comparison.message, !message.isEmpty {
+                Text(message)
+                    .font(.system(size: DesignTypography.caption))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(DesignSpacing.x3)
+        .background {
+            ZStack {
+                RoundedRectangle(cornerRadius: DesignCornerRadius.medium)
+                    .fill(.ultraThinMaterial)
+                RoundedRectangle(cornerRadius: DesignCornerRadius.medium)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                reparseStatusColor(comparison.status).opacity(0.12),
+                                Color.cyan.opacity(0.08)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                RoundedRectangle(cornerRadius: DesignCornerRadius.medium)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                reparseStatusColor(comparison.status).opacity(0.60),
+                                Color.teal.opacity(0.45)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
+            }
+        }
+    }
+
+    private func metricBlock(value: String, label: String) -> some View {
+        VStack(alignment: .leading, spacing: DesignSpacing.x1) {
+            Text(value)
+                .font(.system(size: 20, weight: .semibold, design: .rounded))
+                .foregroundStyle(.primary)
+            Text(label)
+                .font(.system(size: DesignTypography.caption, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
