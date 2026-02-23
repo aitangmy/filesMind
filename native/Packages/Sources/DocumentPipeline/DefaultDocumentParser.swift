@@ -42,12 +42,25 @@ public actor DefaultDocumentParser: DocumentParsing {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
+        let documentID = UUID()
         var chunks: [Chunk] = []
+        var sections: [ParsedSection] = []
         var ordinal = 0
 
         for segment in segments {
+            if let heading = headingMetadata(from: segment) {
+                sections.append(
+                    ParsedSection(
+                        documentID: documentID,
+                        level: heading.level,
+                        title: heading.title,
+                        chunkStartOrdinal: ordinal
+                    )
+                )
+            }
+
             for piece in split(segment, limit: maxChunkCharacters) {
-                chunks.append(Chunk(documentID: UUID(), ordinal: ordinal, text: piece))
+                chunks.append(Chunk(documentID: documentID, ordinal: ordinal, text: piece))
                 ordinal += 1
             }
         }
@@ -57,22 +70,18 @@ public actor DefaultDocumentParser: DocumentParsing {
             guard !fallback.isEmpty else {
                 throw FilesMindError.validationFailed("Empty markdown document")
             }
-            chunks = [Chunk(documentID: UUID(), ordinal: 0, text: fallback)]
+            chunks = [Chunk(documentID: documentID, ordinal: 0, text: fallback)]
         }
 
-        let documentID = UUID()
-        let normalizedChunks = chunks.enumerated().map { index, chunk in
-            Chunk(documentID: documentID, ordinal: index, text: chunk.text)
-        }
-
-        telemetry.info("Markdown parsed: \(fileURL.lastPathComponent), chunks=\(normalizedChunks.count)")
+        telemetry.info("Markdown parsed: \(fileURL.lastPathComponent), chunks=\(chunks.count), sections=\(sections.count)")
 
         return ParsedDocument(
             documentID: documentID,
             sourceURL: fileURL,
             title: title,
             sourceType: .markdown,
-            chunks: normalizedChunks,
+            chunks: chunks,
+            sections: sections,
             fallbackPageCount: 0
         )
     }
@@ -110,9 +119,11 @@ public actor DefaultDocumentParser: DocumentParsing {
         }
 
         let decisions = await router.route(assessments: assessments, vlmFallbackThreshold: 0.65)
-        let fallbackPageCount = decisions.filter(\.requiresVLMFallback).count
-        if fallbackPageCount > 0 {
-            telemetry.warning("PDF low-quality pages requiring VLM fallback: \(fallbackPageCount)")
+        let lowQualityPages = decisions
+            .filter(\.requiresVLMFallback)
+            .map(\.pageIndex)
+        if !lowQualityPages.isEmpty {
+            telemetry.warning("PDF low-quality pages requiring VLM fallback: \(lowQualityPages.count)")
         }
 
         let documentID = UUID()
@@ -134,7 +145,15 @@ public actor DefaultDocumentParser: DocumentParsing {
             title: fileURL.deletingPathExtension().lastPathComponent,
             sourceType: .pdf,
             chunks: chunks,
-            fallbackPageCount: fallbackPageCount
+            sections: [
+                ParsedSection(
+                    documentID: documentID,
+                    level: 1,
+                    title: fileURL.deletingPathExtension().lastPathComponent,
+                    chunkStartOrdinal: 0
+                )
+            ],
+            lowQualityPages: lowQualityPages
         )
 #else
         throw FilesMindError.notSupported("PDF parsing not available on this build")
@@ -166,6 +185,21 @@ public actor DefaultDocumentParser: DocumentParsing {
             }
         }
         return nil
+    }
+
+    private func headingMetadata(from segment: String) -> (level: Int, title: String)? {
+        let trimmed = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("#") else {
+            return nil
+        }
+
+        let hashes = trimmed.prefix { $0 == "#" }.count
+        let title = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "# ")).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else {
+            return nil
+        }
+
+        return (level: max(1, hashes), title: title)
     }
 
     private func split(_ text: String, limit: Int) -> [String] {

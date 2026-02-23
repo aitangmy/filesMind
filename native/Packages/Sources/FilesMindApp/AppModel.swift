@@ -21,6 +21,9 @@ final class AppModel {
     var searchResults: [RankedChunk] = []
     var searchStatus = "Type keywords to search indexed chunks."
     var isSearching = false
+    var importedDocuments: [ImportedDocumentRecord] = []
+    var selectedDocumentID: UUID?
+    var selectedDocumentSections: [ParsedSection] = []
     var lastError: String?
 
     private let graphIndex: QuadTreeIndex
@@ -47,7 +50,12 @@ final class AppModel {
             let stream = await useCase.execute()
             for await jobs in stream {
                 self.importJobs = jobs
+                await self.reloadImportedDocuments()
             }
+        }
+
+        Task {
+            await self.reloadImportedDocuments()
         }
     }
 
@@ -105,6 +113,13 @@ final class AppModel {
         graphIndex.visibleNodes(in: viewport)
     }
 
+    func selectImportedDocument(_ document: ImportedDocumentRecord) {
+        selectedDocumentID = document.id
+        Task {
+            await loadSections(for: document.id)
+        }
+    }
+
     func runSearch() {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else {
@@ -134,6 +149,45 @@ final class AppModel {
                 lastError = error.localizedDescription
             }
             isSearching = false
+        }
+    }
+
+    private func reloadImportedDocuments() async {
+        guard let store = container.documentStore else {
+            importedDocuments = []
+            selectedDocumentSections = []
+            selectedDocumentID = nil
+            return
+        }
+
+        do {
+            let docs = try await store.recentDocuments(limit: 80)
+            importedDocuments = docs
+
+            if let selectedDocumentID, docs.contains(where: { $0.id == selectedDocumentID }) {
+                await loadSections(for: selectedDocumentID)
+            } else if let first = docs.first {
+                selectedDocumentID = first.id
+                await loadSections(for: first.id)
+            } else {
+                selectedDocumentSections = []
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func loadSections(for documentID: UUID) async {
+        guard let store = container.documentStore else {
+            selectedDocumentSections = []
+            return
+        }
+
+        do {
+            selectedDocumentSections = try await store.sections(for: documentID)
+        } catch {
+            lastError = error.localizedDescription
+            selectedDocumentSections = []
         }
     }
 }

@@ -2,8 +2,10 @@ import Domain
 import Foundation
 import TelemetryKit
 
-public actor InMemoryChunkRepository: ChunkRepository, EmbeddingSearchRepository {
+public actor InMemoryChunkRepository: ChunkRepository, EmbeddingSearchRepository, ImportedDocumentStore {
     private var chunksByID: [UUID: Chunk] = [:]
+    private var documentsByID: [UUID: ImportedDocumentRecord] = [:]
+    private var sectionsByDocumentID: [UUID: [ParsedSection]] = [:]
     private let telemetry: Telemetry
 
     public init(telemetry: Telemetry = ConsoleTelemetry()) {
@@ -39,5 +41,22 @@ public actor InMemoryChunkRepository: ChunkRepository, EmbeddingSearchRepository
             .sorted(by: { $0.ordinal < $1.ordinal })
             .prefix(max(limit, 0))
             .map { $0 }
+    }
+
+    public func upsertDocument(_ document: ImportedDocumentRecord, sections: [ParsedSection]) async throws {
+        documentsByID[document.id] = document
+        sectionsByDocumentID[document.id] = sections.sorted(by: { $0.chunkStartOrdinal < $1.chunkStartOrdinal })
+        telemetry.info("Upserted in-memory document metadata: \(document.title)")
+    }
+
+    public func recentDocuments(limit: Int) async throws -> [ImportedDocumentRecord] {
+        documentsByID.values
+            .sorted(by: { $0.importedAt > $1.importedAt })
+            .prefix(max(limit, 0))
+            .map { $0 }
+    }
+
+    public func sections(for documentID: UUID) async throws -> [ParsedSection] {
+        sectionsByDocumentID[documentID] ?? []
     }
 }

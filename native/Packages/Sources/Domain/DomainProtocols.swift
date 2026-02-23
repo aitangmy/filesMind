@@ -33,6 +33,12 @@ public protocol DocumentImporting: Sendable {
     func importDocument(at fileURL: URL) async throws -> ParsedDocument
 }
 
+public protocol ImportedDocumentStore: Sendable {
+    func upsertDocument(_ document: ImportedDocumentRecord, sections: [ParsedSection]) async throws
+    func recentDocuments(limit: Int) async throws -> [ImportedDocumentRecord]
+    func sections(for documentID: UUID) async throws -> [ParsedSection]
+}
+
 public protocol ChunkRepository: Sendable {
     func upsert(_ chunks: [Chunk]) async throws
     func search(byKeyword keyword: String, limit: Int) async throws -> [Chunk]

@@ -24,4 +24,27 @@ func grdbRepositoryPersistsAndSearches() async throws {
 
     #expect(hits.count == 2)
     #expect(hits.map(\.ordinal) == [0, 2])
+
+    let document = ImportedDocumentRecord(
+        id: documentID,
+        sourcePath: "/tmp/source.md",
+        title: "Source",
+        sourceType: .markdown,
+        chunkCount: 3,
+        lowQualityPages: [],
+        importedAt: Date()
+    )
+    let sections = [
+        ParsedSection(documentID: documentID, level: 1, title: "Heading 1", chunkStartOrdinal: 0),
+        ParsedSection(documentID: documentID, level: 2, title: "Heading 2", chunkStartOrdinal: 2)
+    ]
+
+    try await repository.upsertDocument(document, sections: sections)
+    let recent = try await repository.recentDocuments(limit: 5)
+    #expect(recent.count == 1)
+    #expect(recent.first?.id == documentID)
+
+    let loadedSections = try await repository.sections(for: documentID)
+    #expect(loadedSections.count == 2)
+    #expect(loadedSections.map(\.title) == ["Heading 1", "Heading 2"])
 }

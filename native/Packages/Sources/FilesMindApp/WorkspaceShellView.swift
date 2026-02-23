@@ -61,7 +61,47 @@ private struct SidebarPane: View {
             }
             .buttonStyle(.bordered)
 
-            Spacer(minLength: DesignSpacing.x6)
+            Divider()
+
+            Text("Imported Documents")
+                .font(.system(size: DesignTypography.title, weight: .semibold))
+
+            if model.importedDocuments.isEmpty {
+                Text("No imported documents yet.")
+                    .font(.system(size: DesignTypography.body))
+                    .foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: DesignSpacing.x2) {
+                        ForEach(model.importedDocuments) { document in
+                            ImportedDocumentRow(
+                                document: document,
+                                isSelected: document.id == model.selectedDocumentID
+                            ) {
+                                model.selectImportedDocument(document)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 220)
+            }
+
+            if !model.selectedDocumentSections.isEmpty {
+                VStack(alignment: .leading, spacing: DesignSpacing.x2) {
+                    Text("Outline")
+                        .font(.system(size: DesignTypography.title, weight: .semibold))
+                    ForEach(model.selectedDocumentSections.prefix(10)) { section in
+                        Text("\(String(repeating: "  ", count: max(0, section.level - 1)))• \(section.title)")
+                            .font(.system(size: DesignTypography.caption, weight: .regular, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(DesignSpacing.x3)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: DesignCornerRadius.medium))
+            }
+
+            Spacer(minLength: DesignSpacing.x3)
 
             VStack(alignment: .leading, spacing: DesignSpacing.x2) {
                 Text("Aesthetic Baseline")
@@ -75,6 +115,45 @@ private struct SidebarPane: View {
         }
         .padding(DesignSpacing.x4)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+private struct ImportedDocumentRow: View {
+    let document: ImportedDocumentRecord
+    let isSelected: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(alignment: .leading, spacing: DesignSpacing.x1) {
+                HStack {
+                    Text(document.title)
+                        .font(.system(size: DesignTypography.body, weight: .medium))
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text(document.sourceType.rawValue.uppercased())
+                        .font(.system(size: DesignTypography.caption, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: DesignSpacing.x2) {
+                    Text("\(document.chunkCount) chunks")
+                    if !document.lowQualityPages.isEmpty {
+                        Text("fallback pages: \(document.lowQualityPages.count)")
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .font(.system(size: DesignTypography.caption))
+            }
+            .padding(DesignSpacing.x2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(backgroundStyle, in: RoundedRectangle(cornerRadius: DesignCornerRadius.small))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var backgroundStyle: Color {
+        isSelected ? Color.accentColor.opacity(0.15) : Color(nsColor: .controlBackgroundColor)
     }
 }
 

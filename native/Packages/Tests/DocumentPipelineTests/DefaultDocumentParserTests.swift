@@ -24,4 +24,6 @@ func parseMarkdownIntoChunks() async throws {
     #expect(parsed.sourceType == .markdown)
     #expect(parsed.title == "Title")
     #expect(parsed.chunks.count >= 2)
+    #expect(parsed.sections.count == 1)
+    #expect(parsed.sections.first?.title == "Title")
 }

@@ -13,6 +13,7 @@ public struct AppContainer: Sendable {
     public let telemetry: Telemetry
     public let bookmarkManager: WorkspaceAuthorizationManaging
     public let chunkRepository: ChunkRepository & EmbeddingSearchRepository
+    public let documentStore: (any ImportedDocumentStore)?
     public let searchService: HybridSearchService
     public let pipelineRouter: PipelineRouter
     public let modelManager: ModelManaging
@@ -23,6 +24,7 @@ public struct AppContainer: Sendable {
         telemetry: Telemetry,
         bookmarkManager: WorkspaceAuthorizationManaging,
         chunkRepository: ChunkRepository & EmbeddingSearchRepository,
+        documentStore: (any ImportedDocumentStore)?,
         searchService: HybridSearchService,
         pipelineRouter: PipelineRouter,
         modelManager: ModelManaging,
@@ -32,6 +34,7 @@ public struct AppContainer: Sendable {
         self.telemetry = telemetry
         self.bookmarkManager = bookmarkManager
         self.chunkRepository = chunkRepository
+        self.documentStore = documentStore
         self.searchService = searchService
         self.pipelineRouter = pipelineRouter
         self.modelManager = modelManager
@@ -61,7 +64,13 @@ public enum AppBootstrap {
         )
         let router = PipelineRouter(telemetry: telemetry)
         let parser = DefaultDocumentParser(router: router, telemetry: telemetry)
-        let importer = DocumentImportService(parser: parser, chunkRepository: chunkRepository, telemetry: telemetry)
+        let documentStore = chunkRepository as? any ImportedDocumentStore
+        let importer = DocumentImportService(
+            parser: parser,
+            chunkRepository: chunkRepository,
+            documentStore: documentStore,
+            telemetry: telemetry
+        )
 
         let catalog = StaticModelCatalog(models: [])
         let validator = SHA256ArtifactValidator()
@@ -79,6 +88,7 @@ public enum AppBootstrap {
             telemetry: telemetry,
             bookmarkManager: bookmarkManager,
             chunkRepository: chunkRepository,
+            documentStore: documentStore,
             searchService: search,
             pipelineRouter: router,
             modelManager: modelManager,

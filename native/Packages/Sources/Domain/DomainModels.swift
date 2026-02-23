@@ -180,12 +180,36 @@ public enum DocumentSourceType: String, Sendable, Equatable, Codable {
     case pdf
 }
 
+public struct ParsedSection: Identifiable, Sendable, Equatable, Codable {
+    public let id: UUID
+    public let documentID: UUID
+    public let level: Int
+    public let title: String
+    public let chunkStartOrdinal: Int
+
+    public init(
+        id: UUID = UUID(),
+        documentID: UUID,
+        level: Int,
+        title: String,
+        chunkStartOrdinal: Int
+    ) {
+        self.id = id
+        self.documentID = documentID
+        self.level = level
+        self.title = title
+        self.chunkStartOrdinal = chunkStartOrdinal
+    }
+}
+
 public struct ParsedDocument: Sendable, Equatable {
     public let documentID: UUID
     public let sourceURL: URL
     public let title: String
     public let sourceType: DocumentSourceType
     public let chunks: [Chunk]
+    public let sections: [ParsedSection]
+    public let lowQualityPages: [Int]
     public let fallbackPageCount: Int
 
     public init(
@@ -194,13 +218,45 @@ public struct ParsedDocument: Sendable, Equatable {
         title: String,
         sourceType: DocumentSourceType,
         chunks: [Chunk],
-        fallbackPageCount: Int = 0
+        sections: [ParsedSection] = [],
+        lowQualityPages: [Int] = [],
+        fallbackPageCount: Int? = nil
     ) {
         self.documentID = documentID
         self.sourceURL = sourceURL
         self.title = title
         self.sourceType = sourceType
         self.chunks = chunks
-        self.fallbackPageCount = fallbackPageCount
+        self.sections = sections
+        self.lowQualityPages = lowQualityPages
+        self.fallbackPageCount = fallbackPageCount ?? lowQualityPages.count
+    }
+}
+
+public struct ImportedDocumentRecord: Identifiable, Sendable, Equatable, Codable {
+    public let id: UUID
+    public let sourcePath: String
+    public let title: String
+    public let sourceType: DocumentSourceType
+    public let chunkCount: Int
+    public let lowQualityPages: [Int]
+    public let importedAt: Date
+
+    public init(
+        id: UUID,
+        sourcePath: String,
+        title: String,
+        sourceType: DocumentSourceType,
+        chunkCount: Int,
+        lowQualityPages: [Int],
+        importedAt: Date
+    ) {
+        self.id = id
+        self.sourcePath = sourcePath
+        self.title = title
+        self.sourceType = sourceType
+        self.chunkCount = chunkCount
+        self.lowQualityPages = lowQualityPages
+        self.importedAt = importedAt
     }
 }
