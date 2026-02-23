@@ -1,1 +1,0 @@
-﻿"""FilesMind backend package."""
