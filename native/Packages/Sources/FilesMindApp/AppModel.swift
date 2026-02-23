@@ -28,6 +28,7 @@ final class AppModel {
     var selectedDocumentID: UUID?
     var selectedDocumentSections: [ParsedSection] = []
     var selectedChunkPreview: String?
+    var reparseJobs: [ReparseJob] = []
 
     var lastError: String?
 
@@ -36,6 +37,7 @@ final class AppModel {
     private var sectionNodeIDs: [UUID: UUID] = [:]
 
     private var queueObservationTask: Task<Void, Never>?
+    private var reparseObservationTask: Task<Void, Never>?
     private var started = false
 
     init(container: AppContainer) {
@@ -54,6 +56,14 @@ final class AppModel {
         return importedDocuments.first(where: { $0.id == selectedDocumentID })
     }
 
+    var selectedDocumentReparseJob: ReparseJob? {
+        guard let selectedDocumentID else { return nil }
+        return reparseJobs
+            .filter { $0.documentID == selectedDocumentID }
+            .sorted(by: { $0.createdAt > $1.createdAt })
+            .first
+    }
+
     func start() {
         guard !started else { return }
         started = true
@@ -64,6 +74,15 @@ final class AppModel {
             let stream = await useCase.execute()
             for await jobs in stream {
                 self.importJobs = jobs
+                await self.reloadImportedDocuments()
+            }
+        }
+
+        reparseObservationTask = Task { [weak self] in
+            guard let self else { return }
+            let stream = await self.container.lowQualityReparseQueue.subscribe()
+            for await jobs in stream {
+                self.reparseJobs = jobs
                 await self.reloadImportedDocuments()
             }
         }
@@ -191,8 +210,11 @@ final class AppModel {
 
     func requestReparseLowQualityPages() {
         guard let doc = selectedDocument, !doc.lowQualityPages.isEmpty else { return }
+        Task {
+            await container.lowQualityReparseQueue.enqueue(document: doc)
+        }
         let pageList = doc.lowQualityPages.map { String($0 + 1) }.joined(separator: ", ")
-        searchStatus = "Re-parse requested for pages [\(pageList)] (VLM hook pending)."
+        searchStatus = "Re-parse queued for pages [\(pageList)]."
     }
 
     private func reloadImportedDocuments() async {

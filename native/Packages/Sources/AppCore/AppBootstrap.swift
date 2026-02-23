@@ -15,6 +15,7 @@ public struct AppContainer: Sendable {
     public let chunkRepository: ChunkRepository & EmbeddingSearchRepository
     public let documentStore: (any ImportedDocumentStore)?
     public let searchService: HybridSearchService
+    public let lowQualityReparseQueue: LowQualityReparseQueue
     public let pipelineRouter: PipelineRouter
     public let modelManager: ModelManaging
     public let cognitiveEngine: CognitiveEngine
@@ -26,6 +27,7 @@ public struct AppContainer: Sendable {
         chunkRepository: ChunkRepository & EmbeddingSearchRepository,
         documentStore: (any ImportedDocumentStore)?,
         searchService: HybridSearchService,
+        lowQualityReparseQueue: LowQualityReparseQueue,
         pipelineRouter: PipelineRouter,
         modelManager: ModelManaging,
         cognitiveEngine: CognitiveEngine,
@@ -36,6 +38,7 @@ public struct AppContainer: Sendable {
         self.chunkRepository = chunkRepository
         self.documentStore = documentStore
         self.searchService = searchService
+        self.lowQualityReparseQueue = lowQualityReparseQueue
         self.pipelineRouter = pipelineRouter
         self.modelManager = modelManager
         self.cognitiveEngine = cognitiveEngine
@@ -71,6 +74,12 @@ public enum AppBootstrap {
             documentStore: documentStore,
             telemetry: telemetry
         )
+        let lowQualityReparser = DefaultLowQualityPageReparser(parser: parser, telemetry: telemetry)
+        let lowQualityReparseQueue = LowQualityReparseQueue(
+            reparser: lowQualityReparser,
+            documentStore: documentStore ?? InMemoryChunkRepository(telemetry: telemetry),
+            telemetry: telemetry
+        )
 
         let catalog = StaticModelCatalog(models: [])
         let validator = SHA256ArtifactValidator()
@@ -90,6 +99,7 @@ public enum AppBootstrap {
             chunkRepository: chunkRepository,
             documentStore: documentStore,
             searchService: search,
+            lowQualityReparseQueue: lowQualityReparseQueue,
             pipelineRouter: router,
             modelManager: modelManager,
             cognitiveEngine: engine,

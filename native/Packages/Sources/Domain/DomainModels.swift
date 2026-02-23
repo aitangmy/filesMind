@@ -260,3 +260,44 @@ public struct ImportedDocumentRecord: Identifiable, Sendable, Equatable, Codable
         self.importedAt = importedAt
     }
 }
+
+public enum ReparseJobStatus: String, Sendable, Equatable, Codable {
+    case queued
+    case running
+    case completed
+    case failed
+}
+
+public struct ReparseJob: Identifiable, Sendable, Equatable, Codable {
+    public let id: UUID
+    public let documentID: UUID
+    public let documentTitle: String
+    public let sourcePath: String
+    public let pageIndices: [Int]
+    public let createdAt: Date
+    public var status: ReparseJobStatus
+    public var progress: Double
+    public var message: String?
+
+    public init(
+        id: UUID = UUID(),
+        documentID: UUID,
+        documentTitle: String,
+        sourcePath: String,
+        pageIndices: [Int],
+        createdAt: Date = Date(),
+        status: ReparseJobStatus,
+        progress: Double,
+        message: String? = nil
+    ) {
+        self.id = id
+        self.documentID = documentID
+        self.documentTitle = documentTitle
+        self.sourcePath = sourcePath
+        self.pageIndices = pageIndices
+        self.createdAt = createdAt
+        self.status = status
+        self.progress = progress
+        self.message = message
+    }
+}

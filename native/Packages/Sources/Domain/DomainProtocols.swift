@@ -33,6 +33,10 @@ public protocol DocumentImporting: Sendable {
     func importDocument(at fileURL: URL) async throws -> ParsedDocument
 }
 
+public protocol LowQualityPageReparsing: Sendable {
+    func reparse(document: ImportedDocumentRecord, pages: [Int]) async throws -> [Int]
+}
+
 public protocol ImportedDocumentStore: Sendable {
     func upsertDocument(_ document: ImportedDocumentRecord, sections: [ParsedSection]) async throws
     func recentDocuments(limit: Int) async throws -> [ImportedDocumentRecord]

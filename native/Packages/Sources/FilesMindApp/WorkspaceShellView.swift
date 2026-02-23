@@ -113,6 +113,22 @@ private struct SidebarPane: View {
                         model.requestReparseLowQualityPages()
                     }
                     .buttonStyle(.bordered)
+                    .disabled(model.selectedDocumentReparseJob?.status == .running)
+
+                    if let job = model.selectedDocumentReparseJob {
+                        HStack(spacing: DesignSpacing.x2) {
+                            Text(job.status.rawValue.uppercased())
+                                .font(.system(size: DesignTypography.caption, weight: .semibold))
+                                .foregroundStyle(reparseStatusColor(job.status))
+                            Text(job.message ?? "")
+                                .font(.system(size: DesignTypography.caption))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+
+                        ProgressView(value: job.progress)
+                            .tint(reparseStatusColor(job.status))
+                    }
                 }
                 .padding(DesignSpacing.x3)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: DesignCornerRadius.medium))
@@ -171,6 +187,19 @@ private struct ImportedDocumentRow: View {
 
     private var backgroundStyle: Color {
         isSelected ? Color.accentColor.opacity(0.15) : Color(nsColor: .controlBackgroundColor)
+    }
+}
+
+private func reparseStatusColor(_ status: ReparseJobStatus) -> Color {
+    switch status {
+    case .queued:
+        return .gray
+    case .running:
+        return .orange
+    case .completed:
+        return .green
+    case .failed:
+        return .red
     }
 }
 
