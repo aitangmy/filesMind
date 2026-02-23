@@ -194,6 +194,7 @@ private func reparseStatusColor(_ status: ReparseJobStatus) -> Color {
 
 private struct ReparseComparisonCard: View {
     let comparison: ReparseComparison
+    @State private var isExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: DesignSpacing.x3) {
@@ -235,6 +236,45 @@ private struct ReparseComparisonCard: View {
                     .font(.system(size: DesignTypography.caption))
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+            }
+
+            Button {
+                withAnimation(.spring(response: DesignMotion.regular, dampingFraction: 0.9)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: DesignSpacing.x2) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("Page Diff")
+                        .font(.system(size: DesignTypography.caption, weight: .semibold))
+                    Spacer(minLength: 8)
+                }
+                .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: DesignSpacing.x2) {
+                    pageLine(
+                        title: "Resolved",
+                        pages: comparison.resolvedPages,
+                        color: .green
+                    )
+                    pageLine(
+                        title: "Remaining",
+                        pages: comparison.remainingPages,
+                        color: .orange
+                    )
+                    pageLine(
+                        title: "Input",
+                        pages: comparison.beforePages,
+                        color: .secondary
+                    )
+                }
+                .padding(DesignSpacing.x2)
+                .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: DesignCornerRadius.small))
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
             }
         }
         .padding(DesignSpacing.x3)
@@ -279,6 +319,20 @@ private struct ReparseComparisonCard: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func pageLine(title: String, pages: [Int], color: Color) -> some View {
+        let rendered = pages.isEmpty ? "none" : pages.map { String($0 + 1) }.joined(separator: ", ")
+        return HStack(alignment: .top, spacing: DesignSpacing.x2) {
+            Text(title)
+                .font(.system(size: DesignTypography.caption, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 74, alignment: .leading)
+            Text(rendered)
+                .font(.system(size: DesignTypography.caption, weight: .regular, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+        }
     }
 }
 

@@ -66,8 +66,13 @@ final class AppModel {
 
     var reparseComparison: ReparseComparison? {
         guard let doc = selectedDocument, let job = selectedDocumentReparseJob else { return nil }
-        let beforeCount = max(job.pageIndices.count, doc.lowQualityPages.count)
-        let afterCount = doc.lowQualityPages.count
+        let beforePages = Array(Set(job.pageIndices)).sorted()
+        let afterPages = Array(Set(doc.lowQualityPages)).sorted()
+        let resolvedPages = beforePages.filter { !Set(afterPages).contains($0) }
+        let remainingPages = afterPages
+
+        let beforeCount = max(beforePages.count, afterPages.count)
+        let afterCount = afterPages.count
         let resolvedCount = max(0, beforeCount - afterCount)
         let resolvedRatio = beforeCount > 0 ? Double(resolvedCount) / Double(beforeCount) : 0
 
@@ -77,6 +82,10 @@ final class AppModel {
             afterCount: afterCount,
             resolvedCount: resolvedCount,
             resolvedRatio: resolvedRatio,
+            beforePages: beforePages,
+            afterPages: afterPages,
+            resolvedPages: resolvedPages,
+            remainingPages: remainingPages,
             progress: job.progress,
             updatedAt: job.createdAt,
             message: job.message
@@ -360,6 +369,10 @@ struct ReparseComparison: Sendable {
     let afterCount: Int
     let resolvedCount: Int
     let resolvedRatio: Double
+    let beforePages: [Int]
+    let afterPages: [Int]
+    let resolvedPages: [Int]
+    let remainingPages: [Int]
     let progress: Double
     let updatedAt: Date
     let message: String?
