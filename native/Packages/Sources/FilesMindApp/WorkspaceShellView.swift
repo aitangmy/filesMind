@@ -1,5 +1,6 @@
 import DesignSystem
 import Domain
+import SearchKit
 import SwiftUI
 
 struct WorkspaceShellView: View {
@@ -85,23 +86,65 @@ private struct ImportQueuePane: View {
             Text("Import Queue")
                 .font(.system(size: DesignTypography.hero, weight: .semibold))
 
-            if model.importJobs.isEmpty {
-                VStack(alignment: .leading, spacing: DesignSpacing.x2) {
-                    Text("No jobs yet")
-                        .font(.system(size: DesignTypography.bodyLarge, weight: .medium))
-                    Text("Use \"Import Files\" to enqueue Markdown/PDF documents.")
-                        .font(.system(size: DesignTypography.body))
-                        .foregroundStyle(.secondary)
+            Group {
+                if model.importJobs.isEmpty {
+                    VStack(alignment: .leading, spacing: DesignSpacing.x2) {
+                        Text("No jobs yet")
+                            .font(.system(size: DesignTypography.bodyLarge, weight: .medium))
+                        Text("Use \"Import Files\" to enqueue Markdown/PDF documents.")
+                            .font(.system(size: DesignTypography.body))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.top, DesignSpacing.x2)
+                } else {
+                    List(model.importJobs) { job in
+                        ImportJobRow(job: job)
+                    }
+                    .listStyle(.inset)
                 }
-                .padding(.top, DesignSpacing.x2)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: DesignSpacing.x2) {
+                Text("Search")
+                    .font(.system(size: DesignTypography.title, weight: .semibold))
+                HStack(spacing: DesignSpacing.x2) {
+                    TextField("Search indexed chunks", text: $model.searchQuery)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            model.runSearch()
+                        }
+
+                    Button {
+                        model.runSearch()
+                    } label: {
+                        if model.isSearching {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("Run")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isSearching)
+                }
+
+                Text(model.searchStatus)
+                    .font(.system(size: DesignTypography.caption))
+                    .foregroundStyle(.secondary)
+            }
+
+            if model.searchResults.isEmpty {
+                Text("No results to display.")
+                    .font(.system(size: DesignTypography.body))
+                    .foregroundStyle(.secondary)
             } else {
-                List(model.importJobs) { job in
-                    ImportJobRow(job: job)
+                List(model.searchResults, id: \.chunk.id) { ranked in
+                    SearchResultRow(ranked: ranked)
                 }
                 .listStyle(.inset)
             }
-
-            Spacer(minLength: 0)
         }
         .padding(DesignSpacing.x4)
         .background(Color(nsColor: .controlBackgroundColor))
@@ -147,5 +190,29 @@ private struct ImportJobRow: View {
         case .failed:
             return .red
         }
+    }
+}
+
+private struct SearchResultRow: View {
+    let ranked: RankedChunk
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DesignSpacing.x1) {
+            HStack {
+                Text("Score \(String(format: "%.3f", ranked.score))")
+                    .font(.system(size: DesignTypography.caption, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Text("#\(ranked.chunk.ordinal)")
+                    .font(.system(size: DesignTypography.caption, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(ranked.chunk.text)
+                .font(.system(size: DesignTypography.body))
+                .lineLimit(4)
+                .textSelection(.enabled)
+        }
+        .padding(.vertical, DesignSpacing.x1)
     }
 }

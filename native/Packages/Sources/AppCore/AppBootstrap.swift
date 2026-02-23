@@ -45,7 +45,15 @@ public enum AppBootstrap {
         let telemetry = ConsoleTelemetry()
         let bookmarkStore = UserDefaultsBookmarkStore()
         let bookmarkManager = SecurityScopedBookmarkManager(store: bookmarkStore, telemetry: telemetry)
-        let chunkRepository = InMemoryChunkRepository(telemetry: telemetry)
+        let chunkRepository: any ChunkRepository & EmbeddingSearchRepository
+        let storageRoot = installRoot.deletingLastPathComponent().appendingPathComponent("Storage", isDirectory: true)
+        let databaseURL = storageRoot.appendingPathComponent("filesmind.sqlite", isDirectory: false)
+        if let repository = try? GRDBChunkRepository(databaseURL: databaseURL, telemetry: telemetry) {
+            chunkRepository = repository
+        } else {
+            telemetry.warning("Falling back to InMemoryChunkRepository")
+            chunkRepository = InMemoryChunkRepository(telemetry: telemetry)
+        }
         let search = HybridSearchService(
             chunkRepository: chunkRepository,
             embeddingRepository: chunkRepository,

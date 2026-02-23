@@ -21,6 +21,9 @@ let package = Package(
         .library(name: "DesignSystem", targets: ["DesignSystem"]),
         .library(name: "AppCore", targets: ["AppCore"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0")
+    ],
     targets: [
         .executableTarget(
             name: "FilesMindApp",
@@ -34,7 +37,14 @@ let package = Package(
         .target(name: "Domain"),
         .target(name: "TelemetryKit", dependencies: ["Domain"]),
         .target(name: "SecurityKit", dependencies: ["Domain", "TelemetryKit"]),
-        .target(name: "StorageKit", dependencies: ["Domain", "TelemetryKit"]),
+        .target(
+            name: "StorageKit",
+            dependencies: [
+                "Domain",
+                "TelemetryKit",
+                .product(name: "GRDB", package: "GRDB.swift")
+            ]
+        ),
         .target(name: "DocumentPipeline", dependencies: ["Domain", "TelemetryKit"]),
         .target(name: "InferenceKit", dependencies: ["Domain", "TelemetryKit"]),
         .target(name: "SearchKit", dependencies: ["Domain", "StorageKit", "TelemetryKit"]),
@@ -58,6 +68,7 @@ let package = Package(
         .testTarget(name: "DomainTests", dependencies: ["Domain"]),
         .testTarget(name: "AppCoreTests", dependencies: ["AppCore", "Domain"]),
         .testTarget(name: "DocumentPipelineTests", dependencies: ["DocumentPipeline", "Domain"]),
+        .testTarget(name: "StorageKitTests", dependencies: ["StorageKit", "Domain"]),
         .testTarget(name: "SecurityKitTests", dependencies: ["SecurityKit", "Domain"]),
         .testTarget(name: "GraphEngineTests", dependencies: ["GraphEngine", "Domain"])
     ]

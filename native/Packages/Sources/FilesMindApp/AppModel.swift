@@ -5,6 +5,7 @@ import Domain
 import Foundation
 import GraphEngine
 import Observation
+import SearchKit
 
 @MainActor
 @Observable
@@ -16,6 +17,10 @@ final class AppModel {
     var workspaceStatus = "No workspace selected"
     var importJobs: [ImportJob] = []
     var graphNodes: [GraphNode] = []
+    var searchQuery = ""
+    var searchResults: [RankedChunk] = []
+    var searchStatus = "Type keywords to search indexed chunks."
+    var isSearching = false
     var lastError: String?
 
     private let graphIndex: QuadTreeIndex
@@ -98,6 +103,38 @@ final class AppModel {
 
     func visibleGraphNodes(in viewport: Rect) -> [GraphNode] {
         graphIndex.visibleNodes(in: viewport)
+    }
+
+    func runSearch() {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            searchResults = []
+            searchStatus = "Type keywords to search indexed chunks."
+            return
+        }
+
+        isSearching = true
+        searchStatus = "Searching..."
+        lastError = nil
+
+        Task {
+            do {
+                let results = try await container.searchService.search(
+                    keyword: query,
+                    embedding: [],
+                    limit: 30,
+                    keywordWeight: 1.0,
+                    vectorWeight: 0.0
+                )
+                searchResults = results
+                searchStatus = "Found \(results.count) result(s)."
+            } catch {
+                searchResults = []
+                searchStatus = "Search failed."
+                lastError = error.localizedDescription
+            }
+            isSearching = false
+        }
     }
 }
 
